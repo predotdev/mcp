@@ -135,7 +135,7 @@ export function createSetup(ctx) {
       await signIn();
       ok(`Signed in. Your key is saved in ${credentialsFile.replace(home, '~')} for every agent.`);
     } catch (error) {
-      bad(`${error.message} Plain-words actions stay off until you run: npx -y github:predotdev/chrome-mcp login`);
+      bad(`${error.message} Plain-words actions stay off until you run: npx -y @predotdev/chrome-mcp login`);
     }
   }
 
@@ -340,8 +340,28 @@ export function createSetup(ctx) {
 
   // ------------------------------------------------------------------ commands
 
+  // npx reuses a cached copy without checking for a newer one.
+  async function newerVersion() {
+    const latest = await fetch('https://registry.npmjs.org/@predotdev/chrome-mcp/latest', { signal: AbortSignal.timeout(5000) })
+      .then(r => (r.ok ? r.json() : null)).then(d => d?.version).catch(() => null);
+    const parts = v => String(v || '0').split('.').map(Number);
+    const [a, b] = [parts(latest), parts(pkg.version)];
+    for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0) ? latest : null;
+    return null;
+  }
+
   async function setup() {
     console.log(`pre.dev Browser Agents Local ${pkg.version || ''} setup`);
+    // Re-running setup is how people update, so run the newest published version when this one is older.
+    const latest = process.env.CHROME_MCP_NO_SELF_UPDATE ? null : await newerVersion();
+    if (latest) {
+      console.log(`  Version ${latest} is out; switching to it.`);
+      const next = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['-y', '@predotdev/chrome-mcp@latest', 'setup'], {
+        stdio: 'inherit', env: { ...process.env, CHROME_MCP_NO_SELF_UPDATE: '1' },
+      });
+      if (next.status !== null) process.exit(next.status);
+      console.log('  Could not switch; continuing with this version.');
+    }
     step(1, 'Sign in to pre.dev');
     await ensureSignedIn();
     step(2, 'Install');

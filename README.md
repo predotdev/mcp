@@ -18,6 +18,7 @@
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black"></a>
   <img alt="Node 22+" src="https://img.shields.io/badge/node-22%2B-black">
   <img alt="macOS" src="https://img.shields.io/badge/macOS-supported-black">
+  <a href="https://www.npmjs.com/package/@predotdev/chrome-mcp"><img alt="npm" src="https://img.shields.io/npm/v/@predotdev/chrome-mcp?color=black"></a>
   <img alt="Zero dependencies" src="https://img.shields.io/badge/dependencies-0-black">
   <a href="https://pre.dev/browser-agents"><img alt="pre.dev Browser Agents" src="https://img.shields.io/badge/pre.dev-Browser%20Agents-black"></a>
 </p>
@@ -35,7 +36,7 @@ Built with the [pre.dev CLI](https://docs.pre.dev/cli/overview).
 You need **macOS**, **Google Chrome** and **Node.js 22 or newer** (check with `node --version`). Run one command:
 
 ```bash
-npx -y github:predotdev/chrome-mcp setup
+npx -y @predotdev/chrome-mcp setup
 ```
 
 It walks you through everything:
@@ -50,9 +51,9 @@ Then restart your agent and try:
 
 > [!TIP]
 > **Or let your agent do it.** Paste this into Claude Code (or any coding agent):
-> *Run `npx -y github:predotdev/chrome-mcp setup` with a 10 minute timeout and tell me what to click.*
+> *Run `npx -y @predotdev/chrome-mcp setup` with a 10 minute timeout and tell me what to click.*
 
-The command is safe to run again at any time, and running it again also updates to the latest version. `npx -y github:predotdev/chrome-mcp check` shows the state of everything, and `uninstall` removes it from every agent.
+The command is safe to run again at any time, and running it again updates to the latest version. `npx -y @predotdev/chrome-mcp check` shows the state of everything, and `uninstall` removes it from every agent.
 
 ## Local or cloud?
 
@@ -115,17 +116,17 @@ Once you are signed in to pre.dev (`setup` or `login` does it, or set `PREDEV_AP
 
 ## Setup for every agent
 
-`setup` does this for you. To add it by hand instead (for example to an agent `setup` doesn't know), every agent runs the same command. Sign in once with `npx -y github:predotdev/chrome-mcp login` and leave the key out, or put your key from [Integrations → Built-in](https://pre.dev/projects/integrations) in the agent's environment:
+`setup` does this for you. To add it by hand instead (for example to an agent `setup` doesn't know), every agent runs the same command. Sign in once with `npx -y @predotdev/chrome-mcp login` and leave the key out, or put your key from [Integrations → Built-in](https://pre.dev/projects/integrations) in the agent's environment:
 
 ```
-npx -y github:predotdev/chrome-mcp        env: PREDEV_API_KEY=your_key   (optional after login)
+npx -y @predotdev/chrome-mcp        env: PREDEV_API_KEY=your_key   (optional after login)
 ```
 
 <details>
 <summary><b>Claude Code</b></summary>
 
 ```bash
-claude mcp add --scope user chrome -e PREDEV_API_KEY=your_key -- npx -y github:predotdev/chrome-mcp
+claude mcp add --scope user chrome -e PREDEV_API_KEY=your_key -- npx -y @predotdev/chrome-mcp
 ```
 
 </details>
@@ -134,7 +135,7 @@ claude mcp add --scope user chrome -e PREDEV_API_KEY=your_key -- npx -y github:p
 <summary><b>Codex</b></summary>
 
 ```bash
-codex mcp add chrome --env PREDEV_API_KEY=your_key -- npx -y github:predotdev/chrome-mcp
+codex mcp add chrome --env PREDEV_API_KEY=your_key -- npx -y @predotdev/chrome-mcp
 ```
 
 Or add this to `~/.codex/config.toml`. The longer timeout gives slow pages time to load:
@@ -142,7 +143,7 @@ Or add this to `~/.codex/config.toml`. The longer timeout gives slow pages time 
 ```toml
 [mcp_servers.chrome]
 command = "npx"
-args = ["-y", "github:predotdev/chrome-mcp"]
+args = ["-y", "@predotdev/chrome-mcp"]
 env = { PREDEV_API_KEY = "your_key" }
 tool_timeout_sec = 120
 ```
@@ -159,7 +160,7 @@ Add to `~/.cursor/mcp.json`, then restart Cursor:
   "mcpServers": {
     "chrome": {
       "command": "npx",
-      "args": ["-y", "github:predotdev/chrome-mcp"],
+      "args": ["-y", "@predotdev/chrome-mcp"],
       "env": { "PREDEV_API_KEY": "your_key" }
     }
   }
@@ -178,7 +179,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`, then restart Windsurf:
   "mcpServers": {
     "chrome": {
       "command": "npx",
-      "args": ["-y", "github:predotdev/chrome-mcp"],
+      "args": ["-y", "@predotdev/chrome-mcp"],
       "env": { "PREDEV_API_KEY": "your_key" }
     }
   }
@@ -198,7 +199,7 @@ Add to `.vscode/mcp.json` in your project, or run **MCP: Open User Configuration
     "chrome": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "github:predotdev/chrome-mcp"],
+      "args": ["-y", "@predotdev/chrome-mcp"],
       "env": { "PREDEV_API_KEY": "your_key" }
     }
   }
@@ -217,7 +218,7 @@ Add to `~/.gemini/settings.json`:
   "mcpServers": {
     "chrome": {
       "command": "npx",
-      "args": ["-y", "github:predotdev/chrome-mcp"],
+      "args": ["-y", "@predotdev/chrome-mcp"],
       "env": { "PREDEV_API_KEY": "your_key" }
     }
   }
@@ -236,7 +237,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "chrome": {
       "type": "local",
-      "command": ["npx", "-y", "github:predotdev/chrome-mcp"],
+      "command": ["npx", "-y", "@predotdev/chrome-mcp"],
       "environment": { "PREDEV_API_KEY": "your_key" },
       "enabled": true
     }
@@ -252,7 +253,7 @@ Add to `~/.config/opencode/opencode.json`:
 Desktop apps don't load your shell's `PATH`, so give them full paths. Install once:
 
 ```bash
-npm install -g github:predotdev/chrome-mcp
+npm install -g @predotdev/chrome-mcp
 ```
 
 Then print the exact entry to paste:
@@ -268,7 +269,7 @@ Put that entry inside `"mcpServers"` in `~/Library/Application Support/Claude/cl
 <details>
 <summary><b>Any other MCP client</b></summary>
 
-Add a local (stdio) server with command `npx`, arguments `-y github:predotdev/chrome-mcp`, and the environment variable `PREDEV_API_KEY`. If the client can't find `npx`, use the full-path setup from the Claude Desktop section.
+Add a local (stdio) server with command `npx`, arguments `-y @predotdev/chrome-mcp`, and the environment variable `PREDEV_API_KEY`. If the client can't find `npx`, use the full-path setup from the Claude Desktop section.
 
 </details>
 
@@ -297,7 +298,7 @@ This tool drives your real, logged-in Chrome. Read this before you turn it on.
 - **Passwords stay with you.** It refuses to type into password fields (except on `localhost` and `.test` dev sites) and masks password values in snapshots. The agent is told never to enter passwords, payment details or government ID numbers.
 - **It only listens on your machine.** The background process binds to `127.0.0.1` only and rejects requests without a random per-run token, which is stored in a file only you can read. It also rejects any request that comes from a web page.
 - **What leaves your machine.** Only plain-words actions send anything to pre.dev: the page's interactive elements and visible text for that one action. Every other tool runs locally.
-- **Off switch.** Run `npx -y github:predotdev/chrome-mcp stop` to stop the background process, or turn remote debugging off at `chrome://inspect/#remote-debugging`.
+- **Off switch.** Run `npx -y @predotdev/chrome-mcp stop` to stop the background process, or turn remote debugging off at `chrome://inspect/#remote-debugging`.
 
 ## Configuration
 
@@ -314,12 +315,12 @@ State, logs, the stable copy `setup` installs and the key saved by `login` (read
 ## Commands
 
 ```bash
-npx -y github:predotdev/chrome-mcp setup      # sign in, add to every agent, connect to Chrome (also updates)
-npx -y github:predotdev/chrome-mcp check      # check your setup, list your Chrome profiles, check your key
-npx -y github:predotdev/chrome-mcp login      # sign in to pre.dev again
-npx -y github:predotdev/chrome-mcp logout     # forget the saved key
-npx -y github:predotdev/chrome-mcp stop       # stop the background process (it restarts on the next tool call)
-npx -y github:predotdev/chrome-mcp uninstall  # remove it from every agent and delete its files
+npx -y @predotdev/chrome-mcp setup      # sign in, add to every agent, connect to Chrome (also updates)
+npx -y @predotdev/chrome-mcp check      # check your setup, list your Chrome profiles, check your key
+npx -y @predotdev/chrome-mcp login      # sign in to pre.dev again
+npx -y @predotdev/chrome-mcp logout     # forget the saved key
+npx -y @predotdev/chrome-mcp stop       # stop the background process (it restarts on the next tool call)
+npx -y @predotdev/chrome-mcp uninstall  # remove it from every agent and delete its files
 ```
 
 ## Troubleshooting
@@ -329,13 +330,13 @@ npx -y github:predotdev/chrome-mcp uninstall  # remove it from every agent and d
 | `Chrome remote debugging is off` | Open `chrome://inspect/#remote-debugging` in Chrome and turn it on. |
 | `Chrome is asking "Allow remote debugging?"` | Click **Allow** in Chrome, then ask your agent to try again. |
 | Chrome asks to allow again | Normal after Chrome restarts, or after this tool updates to a new version. |
-| `Plain-words actions need a pre.dev account` | Run `npx -y github:predotdev/chrome-mcp login`. No restart needed. |
-| `pre.dev rejected the saved key` | Run `npx -y github:predotdev/chrome-mcp login` again. |
+| `Plain-words actions need a pre.dev account` | Run `npx -y @predotdev/chrome-mcp login`. No restart needed. |
+| `pre.dev rejected the saved key` | Run `npx -y @predotdev/chrome-mcp login` again. |
 | A message about credits or subscribing | Your workspace is out of trial credits. Subscribe or top up at [pre.dev/billing](https://pre.dev/billing). |
 | A tool you added by hand named `chrome` already exists | `setup` leaves it alone and registers this one as `predev-chrome`. |
 | The agent can't start the server, or `npx`/`node` not found | Run `setup`: it registers full paths that work in desktop apps. |
 | Codex says a tool call timed out | Set `tool_timeout_sec = 120` (see the Codex setup). |
-| Anything else | Run `npx -y github:predotdev/chrome-mcp check`, and look at `~/.predev/chrome-mcp/chrome-mcp.log`. |
+| Anything else | Run `npx -y @predotdev/chrome-mcp check`, and look at `~/.predev/chrome-mcp/chrome-mcp.log`. |
 
 ## Platform support
 

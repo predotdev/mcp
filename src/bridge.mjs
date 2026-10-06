@@ -392,9 +392,9 @@ const HELP = `pre.dev Browser Agents Local ${PKG.version || ''}
 Lets any coding agent drive the Chrome you already use: every profile, your logins, your tabs.
 
 Set it up in one go (signs you in to pre.dev, adds it to every coding agent on this computer,
-and connects to Chrome):
+and connects to Chrome). Run it again any time to update:
 
-  npx -y github:predotdev/chrome-mcp setup
+  npx -y @predotdev/chrome-mcp setup
 
 Commands:
   chrome-mcp setup      sign in, add to your agents, connect to Chrome (safe to repeat; also updates)
@@ -441,7 +441,7 @@ async function runCheck() {
   const { apiKey, apiUrl } = shimCtx();
   if (!apiKey) {
     console.log('  · Plain-words actions (chrome_act) are off: sign in to pre.dev (free) with');
-    console.log('    npx -y github:predotdev/chrome-mcp login');
+    console.log('    npx -y @predotdev/chrome-mcp login');
   } else {
     let usage = null;
     const status = await fetch(`${apiUrl.replace(/\/+$/, '')}/v1/usage?days=30`, {
@@ -453,7 +453,7 @@ async function runCheck() {
       ok(`Signed in to pre.dev${plan ? ` (plan: ${plan})` : ''}: plain-words actions are on, ${actions} used in the last 30 days`);
       if (/^(trial|free)$/i.test(usage?.tier || '')) console.log('    The free plan includes a limited number of them. More: https://pre.dev/billing?from=browser-agents-local');
     }
-    else if (status === 401 || status === 403) bad('pre.dev rejected your key. Sign in again with: npx -y github:predotdev/chrome-mcp login');
+    else if (status === 401 || status === 403) bad('pre.dev rejected your key. Sign in again with: npx -y @predotdev/chrome-mcp login');
     else bad(`Could not check PREDEV_API_KEY with ${apiUrl} (${status ? `HTTP ${status}` : 'no answer'}).`);
   }
   console.log(failed ? '\nFix the ✗ items above, then run this again.' : '\nAll set. Add the server to your agent and ask it to use Chrome.');
