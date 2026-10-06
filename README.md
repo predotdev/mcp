@@ -95,7 +95,7 @@ Both editions of pre.dev Browser Agents are in this server, and your agent picks
 | `chrome_show` | Bring a tab to the front so you can see it or take over |
 | `chrome_close` | Close a tab |
 
-**In pre.dev's cloud** (need you to be signed in):
+**In pre.dev's cloud** (need a pre.dev plan; on the free plan your agent sees them and can open the subscribe page for you):
 
 | Tool | What it does |
 | --- | --- |
