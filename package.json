@@ -1,10 +1,10 @@
 {
-  "name": "@predotdev/chrome-mcp",
-  "version": "1.3.0",
-  "description": "pre.dev Browser Agents Local: let any coding agent use the Chrome you already have open, with your profiles and logins. Free and open source.",
+  "name": "@predotdev/mcp",
+  "version": "2.0.0",
+  "description": "pre.dev in any coding agent: Browser Agents in the Chrome you already use and in the cloud, plus specs and plans. One command to set up. Free and open source.",
   "type": "module",
   "bin": {
-    "chrome-mcp": "src/bridge.mjs"
+    "predev-mcp": "src/bridge.mjs"
   },
   "files": [
     "src",
@@ -20,21 +20,23 @@
     "chrome",
     "browser",
     "browser-automation",
-    "predev-browser-agents",
     "browser-agents",
     "coding-agent",
     "claude-code",
     "codex",
     "cursor",
-    "pre.dev"
+    "pre.dev",
+    "predev",
+    "specs",
+    "cloud-browser"
   ],
-  "homepage": "https://github.com/predotdev/chrome-mcp#readme",
+  "homepage": "https://github.com/predotdev/mcp#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/predotdev/chrome-mcp.git"
+    "url": "git+https://github.com/predotdev/mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/predotdev/chrome-mcp/issues"
+    "url": "https://github.com/predotdev/mcp/issues"
   },
   "author": "pre.dev (https://pre.dev)",
   "license": "MIT",

@@ -1,10 +1,10 @@
-// One-command setup for pre.dev Browser Agents Local, plus login, logout and uninstall.
+// One-command setup for the pre.dev MCP, plus login, logout and uninstall.
 //
-//   chrome-mcp setup      sign in to pre.dev, install a stable copy, add it to every coding agent
+//   predev-mcp setup      sign in to pre.dev, install a stable copy, add it to every coding agent
 //                         found on this computer, and connect to Chrome
-//   chrome-mcp login      sign in again (saves the key for every agent)
-//   chrome-mcp logout     forget the saved key
-//   chrome-mcp uninstall  remove it from every agent, stop it, and delete its files
+//   predev-mcp login      sign in again (saves the key for every agent)
+//   predev-mcp logout     forget the saved key
+//   predev-mcp uninstall  remove it from every agent, stop it, and delete its files
 //
 // Agents are registered with absolute paths (this Node and the stable copy), so desktop apps that
 // don't load your shell's PATH start it too, and no agent config holds the key: the server reads
@@ -17,8 +17,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 const CLIENT_ID = 'predev-chrome-mcp';
-const OWN = /chrome-mcp/; // every way of running this package has it in its command or args
-const NAMES = ['chrome', 'predev-chrome'];
+// pre.dev's own servers: the hosted one, this package under either name, or its installed copy.
+const OWN = /api\.pre\.dev\/mcp|predotdev\/(chrome-)?mcp|\.predev\/(chrome-)?mcp\b/;
+const NAMES = ['predev', 'pre-dev'];
+/** Names pre.dev servers were registered under before (hosted install, or this one as Browser Agents Local). */
+const LEGACY_NAMES = ['predotdev', 'pre.dev', 'chrome', 'predev-chrome'];
 
 export function createSetup(ctx) {
   const { baseStateDir, stateDir, chromeDir, customChromeDir, pkg, sleep, ensureDaemon, request, readCredentials, credentialsFile, packageRoot } = ctx;
@@ -87,7 +90,7 @@ export function createSetup(ctx) {
       body: JSON.stringify({
         client_id: CLIENT_ID, code_challenge: challenge, code_challenge_method: 'S256', state, scope: 'mcp',
         device_os: { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }[process.platform] || process.platform,
-        device_host: os.hostname(), cli_version: `chrome-mcp ${pkg.version || ''}`.trim(),
+        device_host: os.hostname(), cli_version: `predev-mcp ${pkg.version || ''}`.trim(),
       }),
     }).then(async r => (r.ok ? r.json() : Promise.reject(new Error(`pre.dev answered ${r.status}`))));
     const link = start.verification_uri_complete;
@@ -135,7 +138,7 @@ export function createSetup(ctx) {
       await signIn();
       ok(`Signed in. Your key is saved in ${credentialsFile.replace(home, '~')} for every agent.`);
     } catch (error) {
-      bad(`${error.message} Plain-words actions stay off until you run: npx -y @predotdev/chrome-mcp login`);
+      bad(`${error.message} Plain-words actions stay off until you run: npx -y @predotdev/mcp login`);
     }
   }
 
@@ -157,45 +160,49 @@ export function createSetup(ctx) {
 
   // ------------------------------------------------------------------ agents
 
-  // Picks "chrome", or "predev-chrome" when another tool already uses "chrome". Never touches others.
+  // Registers as "predev" ("pre-dev" when another tool already uses "predev"). Every other entry
+  // that is pre.dev's (the hosted server at api.pre.dev/mcp, or an older install of this one) is
+  // removed, since this server carries all of their tools; nothing else is ever touched.
   function pickName(entries) {
-    const mine = NAMES.find(name => entries[name] && OWN.test(JSON.stringify(entries[name])));
-    if (mine) return mine;
-    return NAMES.find(name => !entries[name]) || null;
+    return NAMES.find(name => !entries[name] || OWN.test(JSON.stringify(entries[name]))) || null;
   }
 
   function jsonAgent(label, file, key, entry, detect) {
+    const read = () => {
+      if (!fs.existsSync(file)) return { config: {}, existed: false };
+      return { config: JSON.parse(fs.readFileSync(file, 'utf8') || '{}'), existed: true };
+    };
+    const write = (config, existed) => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      if (existed && !fs.existsSync(`${file}.bak-predev`)) fs.copyFileSync(file, `${file}.bak-predev`);
+      const tmp = `${file}.${process.pid}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
+      fs.renameSync(tmp, file);
+    };
     return {
       label, detect,
       register() {
-        let config = {};
-        const existed = fs.existsSync(file);
-        if (existed) {
-          try { config = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); } catch {
-            return { manual: `couldn't read ${file.replace(home, '~')} (comments or invalid JSON); add the server by hand` };
-          }
+        let state;
+        try { state = read(); } catch {
+          return { manual: `couldn't read ${file.replace(home, '~')} (comments or invalid JSON); add the server by hand` };
         }
+        const { config, existed } = state;
         config[key] ??= {};
         const name = pickName(config[key]);
-        if (!name) return { manual: `"chrome" and "predev-chrome" are taken in ${file.replace(home, '~')}` };
+        if (!name) return { manual: `"predev" and "pre-dev" are taken in ${file.replace(home, '~')}` };
+        const replaced = Object.keys(config[key]).filter(other => other !== name && OWN.test(JSON.stringify(config[key][other])));
+        for (const other of replaced) delete config[key][other];
         config[key][name] = entry();
-        fs.mkdirSync(path.dirname(file), { recursive: true });
-        if (existed && !fs.existsSync(`${file}.bak-chrome-mcp`)) fs.copyFileSync(file, `${file}.bak-chrome-mcp`);
-        const tmp = `${file}.${process.pid}`;
-        fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
-        fs.renameSync(tmp, file);
-        return { name };
+        write(config, existed);
+        return { name, replaced };
       },
       unregister() {
-        if (!fs.existsSync(file)) return 0;
-        let config;
-        try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return 0; }
-        let removed = 0;
-        for (const name of NAMES) {
-          if (config?.[key]?.[name] && OWN.test(JSON.stringify(config[key][name]))) { delete config[key][name]; removed++; }
-        }
-        if (removed) fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
-        return removed;
+        let state;
+        try { state = read(); } catch { return 0; }
+        const mine = Object.keys(state.config[key] || {}).filter(name => OWN.test(JSON.stringify(state.config[key][name])));
+        for (const name of mine) delete state.config[key][name];
+        if (mine.length) write(state.config, true);
+        return mine.length;
       },
     };
   }
@@ -204,46 +211,50 @@ export function createSetup(ctx) {
   const appSupport = process.platform === 'darwin' ? path.join(home, 'Library/Application Support') : null;
   const exists = p => fs.existsSync(p);
 
-  // What a CLI-managed agent already has under our names (its own description of each entry).
-  const cliEntries = bin => {
+  // CLI-managed agents: what they hold under names pre.dev has used (its own description of each).
+  const claudeEntries = () => {
     const entries = {};
-    for (const name of NAMES) {
-      const got = run(bin, bin === 'codex' ? ['mcp', 'get', name, '--json'] : ['mcp', 'get', name]);
+    for (const name of [...NAMES, ...LEGACY_NAMES]) {
+      const got = run('claude', ['mcp', 'get', name]);
       if (got.status === 0) entries[name] = got.stdout;
     }
     return entries;
   };
+  const codexEntries = () => {
+    const out = run('codex', ['mcp', 'list', '--json']);
+    try { return Object.fromEntries(JSON.parse(out.stdout).map(server => [server.name, server])); } catch { return {}; }
+  };
 
-  const AGENTS = [
-    {
-      label: 'Claude Code', detect: () => has('claude'),
+  function cliAgent(label, bin, entries, remove, add) {
+    return {
+      label, detect: () => has(bin),
       register() {
-        const entries = cliEntries('claude');
-        const name = pickName(entries);
-        if (!name) return { manual: '"chrome" and "predev-chrome" are taken' };
-        if (entries[name]) run('claude', ['mcp', 'remove', name, '-s', 'user']);
-        const added = run('claude', ['mcp', 'add', '--scope', 'user', name, '--', NODE, APP_ENTRY]);
-        return added.status === 0 ? { name } : { manual: (added.stderr || added.stdout || 'claude mcp add failed').trim().split('\n')[0] };
+        const current = entries();
+        const name = pickName(current);
+        if (!name) return { manual: '"predev" and "pre-dev" are taken' };
+        const replaced = Object.keys(current).filter(other => other !== name && OWN.test(JSON.stringify(current[other])));
+        for (const other of [...replaced, ...(current[name] ? [name] : [])]) remove(other);
+        const added = add(name);
+        return added.status === 0 ? { name, replaced } : { manual: (added.stderr || added.stdout || `${bin} mcp add failed`).trim().split('\n')[0] };
       },
       unregister() {
-        let removed = 0;
-        for (const name of NAMES) {
-          const got = run('claude', ['mcp', 'get', name]);
-          if (got.status === 0 && OWN.test(got.stdout)) { run('claude', ['mcp', 'remove', name, '-s', 'user']); removed++; }
-        }
-        return removed;
+        const current = entries();
+        const mine = Object.keys(current).filter(name => OWN.test(JSON.stringify(current[name])));
+        for (const name of mine) remove(name);
+        return mine.length;
       },
-    },
-    {
-      label: 'Codex', detect: () => has('codex'),
-      register() {
-        const entries = cliEntries('codex');
-        const name = pickName(entries);
-        if (!name) return { manual: '"chrome" and "predev-chrome" are taken' };
-        if (entries[name]) run('codex', ['mcp', 'remove', name]);
+    };
+  }
+
+  const AGENTS = [
+    cliAgent('Claude Code', 'claude', claudeEntries,
+      name => run('claude', ['mcp', 'remove', name, '-s', 'user']),
+      name => run('claude', ['mcp', 'add', '--scope', 'user', name, '--', NODE, APP_ENTRY])),
+    cliAgent('Codex', 'codex', codexEntries,
+      name => run('codex', ['mcp', 'remove', name]),
+      name => {
         const added = run('codex', ['mcp', 'add', name, '--', NODE, APP_ENTRY]);
-        if (added.status !== 0) return { manual: (added.stderr || added.stdout || 'codex mcp add failed').trim().split('\n')[0] };
-        // Slow pages need more than Codex's default tool timeout.
+        // Specs and cloud browser runs need more than Codex's default tool timeout.
         const file = path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'config.toml');
         try {
           const lines = fs.readFileSync(file, 'utf8').split('\n');
@@ -251,21 +262,12 @@ export function createSetup(ctx) {
           let end = lines.findIndex((line, i) => i > at && /^\s*\[/.test(line));
           if (end < 0) end = lines.length;
           if (at >= 0 && !lines.slice(at, end).some(line => /^\s*tool_timeout_sec\s*=/.test(line))) {
-            lines.splice(at + 1, 0, 'tool_timeout_sec = 120');
+            lines.splice(at + 1, 0, 'tool_timeout_sec = 900');
             fs.writeFileSync(file, lines.join('\n'));
           }
         } catch {}
-        return { name };
-      },
-      unregister() {
-        let removed = 0;
-        for (const name of NAMES) {
-          const got = run('codex', ['mcp', 'get', name, '--json']);
-          if (got.status === 0 && OWN.test(got.stdout)) { run('codex', ['mcp', 'remove', name]); removed++; }
-        }
-        return removed;
-      },
-    },
+        return added;
+      }),
     jsonAgent('Cursor', path.join(home, '.cursor/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.cursor'))),
     jsonAgent('Windsurf', path.join(home, '.codeium/windsurf/mcp_config.json'), 'mcpServers', stdio, () => exists(path.join(home, '.codeium/windsurf'))),
     jsonAgent('Gemini CLI', path.join(home, '.gemini/settings.json'), 'mcpServers', stdio, () => exists(path.join(home, '.gemini')) || has('gemini')),
@@ -288,13 +290,18 @@ export function createSetup(ctx) {
       if (!found) continue;
       try {
         const result = agent.register();
-        if (result.name) { added.push(agent.label); ok(`${agent.label}${result.name === 'chrome' ? '' : ` (as "${result.name}", since "chrome" is taken)`}`); }
-        else skip(`${agent.label}: ${result.manual}. See https://github.com/predotdev/chrome-mcp#setup-for-every-agent`);
+        if (!result.name) { skip(`${agent.label}: ${result.manual}. See https://github.com/predotdev/mcp#setup-for-every-agent`); continue; }
+        added.push(agent.label);
+        const notes = [
+          result.name === 'predev' ? '' : `as "${result.name}", since "predev" is taken`,
+          result.replaced?.length ? `replaced ${result.replaced.map(n => `"${n}"`).join(', ')}` : '',
+        ].filter(Boolean);
+        ok(`${agent.label}${notes.length ? ` (${notes.join('; ')})` : ''}`);
       } catch (error) {
         skip(`${agent.label}: ${error.message}`);
       }
     }
-    if (!added.length) skip('No coding agents found. Add it by hand: https://github.com/predotdev/chrome-mcp#setup-for-every-agent');
+    if (!added.length) skip('No coding agents found. Add it by hand: https://github.com/predotdev/mcp#setup-for-every-agent');
     return added;
   }
 
@@ -342,7 +349,7 @@ export function createSetup(ctx) {
 
   // npx reuses a cached copy without checking for a newer one.
   async function newerVersion() {
-    const latest = await fetch('https://registry.npmjs.org/@predotdev/chrome-mcp/latest', { signal: AbortSignal.timeout(5000) })
+    const latest = await fetch('https://registry.npmjs.org/@predotdev/mcp/latest', { signal: AbortSignal.timeout(5000) })
       .then(r => (r.ok ? r.json() : null)).then(d => d?.version).catch(() => null);
     const parts = v => String(v || '0').split('.').map(Number);
     const [a, b] = [parts(latest), parts(pkg.version)];
@@ -351,12 +358,12 @@ export function createSetup(ctx) {
   }
 
   async function setup() {
-    console.log(`pre.dev Browser Agents Local ${pkg.version || ''} setup`);
+    console.log(`pre.dev MCP ${pkg.version || ''} setup`);
     // Re-running setup is how people update, so run the newest published version when this one is older.
     const latest = process.env.CHROME_MCP_NO_SELF_UPDATE ? null : await newerVersion();
     if (latest) {
       console.log(`  Version ${latest} is out; switching to it.`);
-      const next = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['-y', '@predotdev/chrome-mcp@latest', 'setup'], {
+      const next = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['-y', '@predotdev/mcp@latest', 'setup'], {
         stdio: 'inherit', env: { ...process.env, CHROME_MCP_NO_SELF_UPDATE: '1' },
       });
       if (next.status !== null) process.exit(next.status);
@@ -387,7 +394,7 @@ export function createSetup(ctx) {
   }
 
   async function uninstall() {
-    console.log('Removing pre.dev Browser Agents Local');
+    console.log('Removing the pre.dev MCP');
     for (const agent of AGENTS) {
       let found = false;
       try { found = agent.detect(); } catch {}

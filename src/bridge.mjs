@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-// pre.dev Chrome MCP: lets any local coding agent drive the Chrome you already run, across every
-// profile, through one shared debugging connection.
+// pre.dev MCP: pre.dev in any local coding agent. Browser Agents Local drives the Chrome you
+// already run, across every profile, through one shared debugging connection; pre.dev's hosted
+// tools (cloud Browser Agents, specs, plans) come through on the same key (remote.mjs).
 //
-//   chrome-mcp          stdio MCP server (what agents launch); starts the daemon on demand
-//   chrome-mcp setup    signs in to pre.dev, adds it to every coding agent, connects to Chrome
+//   predev-mcp          stdio MCP server (what agents launch); starts the daemon on demand
+//   predev-mcp setup    signs in to pre.dev, adds it to every coding agent, connects to Chrome
 //                       (also login, logout, uninstall; see setup.mjs)
-//   chrome-mcp check    checks your setup and lists your Chrome profiles
-//   chrome-mcp stop     stops the background daemon
-//   chrome-mcp daemon   (internal) holds the single Chrome connection and serves the MCP shims
+//   predev-mcp check    checks your setup and lists your Chrome profiles
+//   predev-mcp stop     stops the background daemon
+//   predev-mcp daemon   (internal) holds the single Chrome connection and serves the MCP shims
 //                       over localhost HTTP with a per-run token. Tools live in tools.mjs and
 //                       hot-reload, so editing them never drops the approved connection.
 //
@@ -21,6 +22,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRemote } from './remote.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TOOLS_FILE = path.join(path.dirname(SELF), 'tools.mjs');
@@ -40,15 +42,15 @@ function defaultChromeDir() {
 const CUSTOM_DIR = (process.env.CHROME_MCP_USER_DATA_DIR || '').trim();
 const CHROME_DIR = CUSTOM_DIR ? path.resolve(CUSTOM_DIR.replace(/^~(?=[/\\]|$)/, os.homedir())) : defaultChromeDir();
 // One daemon per Chrome: a custom user data dir gets its own daemon and state.
-const BASE_STATE_DIR = path.join(os.homedir(), '.predev', 'chrome-mcp');
+const BASE_STATE_DIR = path.join(os.homedir(), '.predev', 'mcp');
 const STATE_DIR = CUSTOM_DIR
   ? path.join(BASE_STATE_DIR, crypto.createHash('sha1').update(CHROME_DIR).digest('hex').slice(0, 10))
   : BASE_STATE_DIR;
 const STATE_FILE = path.join(STATE_DIR, 'daemon.json');
 const LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const MAP_FILE = path.join(STATE_DIR, 'profiles.json');
-const LOG_FILE = path.join(STATE_DIR, 'chrome-mcp.log');
-/** Saved by `chrome-mcp login` / `setup`, shared by every agent and every Chrome. */
+const LOG_FILE = path.join(STATE_DIR, 'predev-mcp.log');
+/** Saved by `predev-mcp login` / `setup`, shared by every agent and every Chrome. */
 const CREDENTIALS_FILE = path.join(BASE_STATE_DIR, 'credentials.json');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -341,6 +343,8 @@ async function ensureDaemon() {
   throw new Error(`Could not start the Chrome MCP daemon; see ${LOG_FILE}.`);
 }
 
+const remote = createRemote({ version: PKG.version || '0.0.0' });
+
 function runMcp() {
   const write = message => process.stdout.write(`${JSON.stringify(message)}\n`);
   const handle = async message => {
@@ -351,14 +355,23 @@ function runMcp() {
           return reply({
             protocolVersion: message.params?.protocolVersion || '2025-06-18',
             capabilities: { tools: {} },
-            serverInfo: { name: 'predev-chrome-mcp', version: PKG.version || '0.0.0' },
+            serverInfo: { name: 'predev', version: PKG.version || '0.0.0' },
             instructions: (await loadTools()).instructions(shimCtx()),
           });
-        case 'tools/list':
-          return reply({ tools: (await loadTools()).toolList(shimCtx()) });
+        case 'tools/list': {
+          const ctx = shimCtx();
+          return reply({ tools: [...(await loadTools()).toolList(ctx), ...(await remote.listTools(ctx))] });
+        }
         case 'tools/call': {
+          const ctx = shimCtx();
+          const { name, arguments: args } = message.params;
+          // pre.dev's hosted tools go straight to pre.dev; they don't need Chrome.
+          if (await remote.isRemote(ctx, name)) {
+            if (!ctx.apiKey) return reply({ content: [{ type: 'text', text: 'pre.dev tools need a free pre.dev account. Sign in by running `npx -y @predotdev/mcp login` in a terminal (no restart needed).' }], isError: true });
+            return reply(await remote.callTool(ctx, name, args));
+          }
           const state = await ensureDaemon();
-          return reply(await request(state, 'POST', '/call', { name: message.params.name, args: message.params.arguments }));
+          return reply(await request(state, 'POST', '/call', { name, args }));
         }
         case 'ping':
           return reply({});
@@ -388,23 +401,24 @@ function runMcp() {
 
 // ---------------------------------------------------------------- terminal commands
 
-const HELP = `pre.dev Browser Agents Local ${PKG.version || ''}
-Lets any coding agent drive the Chrome you already use: every profile, your logins, your tabs.
+const HELP = `pre.dev MCP ${PKG.version || ''}
+pre.dev in any coding agent: Browser Agents in the Chrome you already use (every profile, your
+logins, your tabs) and in pre.dev's cloud, plus specs and plans.
 
 Set it up in one go (signs you in to pre.dev, adds it to every coding agent on this computer,
 and connects to Chrome). Run it again any time to update:
 
-  npx -y @predotdev/chrome-mcp setup
+  npx -y @predotdev/mcp setup
 
 Commands:
-  chrome-mcp setup      sign in, add to your agents, connect to Chrome (safe to repeat; also updates)
-  chrome-mcp check      check your setup and list your Chrome profiles
-  chrome-mcp login      sign in to pre.dev again
-  chrome-mcp logout     forget the saved pre.dev key
-  chrome-mcp stop       stop the background daemon (it restarts on the next tool call)
-  chrome-mcp uninstall  remove it from every agent and delete its files
-  chrome-mcp            run the MCP server (what your agent launches)
-  chrome-mcp --version
+  predev-mcp setup      sign in, add to your agents, connect to Chrome (safe to repeat; also updates)
+  predev-mcp check      check your setup and list your Chrome profiles
+  predev-mcp login      sign in to pre.dev again
+  predev-mcp logout     forget the saved pre.dev key
+  predev-mcp stop       stop the background daemon (it restarts on the next tool call)
+  predev-mcp uninstall  remove it from every agent and delete its files
+  predev-mcp            run the MCP server (what your agent launches)
+  predev-mcp --version
 
 Docs: https://docs.pre.dev/browser-agents/local
 `;
@@ -413,7 +427,7 @@ async function runCheck() {
   let failed = false;
   const ok = text => console.log(`  ✓ ${text}`);
   const bad = text => { failed = true; console.log(`  ✗ ${text}`); };
-  console.log(`pre.dev Browser Agents Local ${PKG.version || ''} setup check\n`);
+  console.log(`pre.dev MCP ${PKG.version || ''} setup check\n`);
   ok(`Node ${process.versions.node}`);
   if (fs.existsSync(path.join(CHROME_DIR, 'Local State'))) ok(`Chrome data found: ${CHROME_DIR}`);
   else bad(`No Chrome data at ${CHROME_DIR}. Install Google Chrome, or set CHROME_MCP_USER_DATA_DIR.`);
@@ -441,7 +455,7 @@ async function runCheck() {
   const { apiKey, apiUrl } = shimCtx();
   if (!apiKey) {
     console.log('  · Plain-words actions (chrome_act) are off: sign in to pre.dev (free) with');
-    console.log('    npx -y @predotdev/chrome-mcp login');
+    console.log('    npx -y @predotdev/mcp login');
   } else {
     let usage = null;
     const status = await fetch(`${apiUrl.replace(/\/+$/, '')}/v1/usage?days=30`, {
@@ -453,7 +467,7 @@ async function runCheck() {
       ok(`Signed in to pre.dev${plan ? ` (plan: ${plan})` : ''}: plain-words actions are on, ${actions} used in the last 30 days`);
       if (/^(trial|free)$/i.test(usage?.tier || '')) console.log('    The free plan includes a limited number of them. More: https://pre.dev/billing?from=browser-agents-local');
     }
-    else if (status === 401 || status === 403) bad('pre.dev rejected your key. Sign in again with: npx -y @predotdev/chrome-mcp login');
+    else if (status === 401 || status === 403) bad('pre.dev rejected your key. Sign in again with: npx -y @predotdev/mcp login');
     else bad(`Could not check PREDEV_API_KEY with ${apiUrl} (${status ? `HTTP ${status}` : 'no answer'}).`);
   }
   console.log(failed ? '\nFix the ✗ items above, then run this again.' : '\nAll set. Add the server to your agent and ask it to use Chrome.');
