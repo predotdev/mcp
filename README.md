@@ -150,7 +150,7 @@ claude mcp add --scope user predev -e PREDEV_API_KEY=your_key -- npx -y @predotd
 <details>
 <summary><b>pre.dev CLI</b></summary>
 
-The pre.dev CLI has pre.dev's cloud tools built in, so it only needs the Chrome tools. `setup` adds this to `~/.predev/mcp.json`, and the server uses your pre.dev CLI login:
+In the pre.dev CLI, type `/chrome` (and `/chrome off` to turn it off). The CLI has pre.dev's cloud tools built in, so it only needs the Chrome tools, and the server uses your pre.dev CLI login. `/chrome` and `setup` both add this to `~/.predev/mcp.json`:
 
 ```json
 {
@@ -165,6 +165,8 @@ The pre.dev CLI has pre.dev's cloud tools built in, so it only needs the Chrome 
 ```
 
 The agent sees the tools as `predev_chrome_open`, `predev_chrome_act` and so on.
+
+From the pre.dev CLI, `predev mcp setup` runs this package's `setup` for your other agents.
 
 </details>
 
