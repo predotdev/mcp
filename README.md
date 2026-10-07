@@ -31,7 +31,7 @@ One MCP server gives your coding agent everything pre.dev does:
 - **Browser Agents in the cloud.** Send a URL and a task to pre.dev's browsers and get structured data back, many runs in parallel.
 - **Specs and plans.** Plan an app or feature before building it: architecture, tech stack, milestones and user stories.
 
-It works with **any coding agent that runs MCP servers locally**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop and more. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
+It works with **any coding agent that runs MCP servers locally**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop, the [pre.dev CLI](https://pre.dev) and more. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
 
 Built with the [pre.dev CLI](https://docs.pre.dev/cli/overview).
 
@@ -45,8 +45,8 @@ npx -y @predotdev/mcp setup
 
 It walks you through everything:
 
-1. **Signs you in to pre.dev** in your browser (or creates a free account). Approve, and your key is saved for every agent. Nothing to copy.
-2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode and Claude Desktop. Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
+1. **Signs you in to pre.dev** in your browser (or creates a free account). Approve, and your key is saved for every agent. Nothing to copy. Already signed in to the pre.dev CLI? It uses that login.
+2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop and the pre.dev CLI. Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
 3. **Connects to Chrome.** The first time, it asks you to turn on remote debugging at `chrome://inspect/#remote-debugging` (it copies the address for you), and Chrome asks **"Allow remote debugging?"**: click **Allow**.
 
 Then restart your agent and try:
@@ -144,6 +144,27 @@ npx -y @predotdev/mcp        env: PREDEV_API_KEY=your_key   (optional after logi
 ```bash
 claude mcp add --scope user predev -e PREDEV_API_KEY=your_key -- npx -y @predotdev/mcp
 ```
+
+</details>
+
+<details>
+<summary><b>pre.dev CLI</b></summary>
+
+The pre.dev CLI has pre.dev's cloud tools built in, so it only needs the Chrome tools. `setup` adds this to `~/.predev/mcp.json`, and the server uses your pre.dev CLI login:
+
+```json
+{
+  "mcpServers": {
+    "predev": {
+      "command": "npx",
+      "args": ["-y", "@predotdev/mcp"],
+      "env": { "PREDEV_MCP_CLOUD": "off" }
+    }
+  }
+}
+```
+
+The agent sees the tools as `predev_chrome_open`, `predev_chrome_act` and so on.
 
 </details>
 
@@ -323,7 +344,8 @@ Set these in your agent's MCP config (`env`).
 
 | Variable | What it does |
 | --- | --- |
-| `PREDEV_API_KEY` | Your pre.dev API key. Overrides the key saved by `login`. |
+| `PREDEV_API_KEY` | Your pre.dev API key. Overrides the key saved by `login`, which overrides your pre.dev CLI login. |
+| `PREDEV_MCP_CLOUD` | `off` lists only the Chrome tools, without pre.dev's cloud tools. |
 | `PREDEV_API_URL` | The pre.dev API to call. Default `https://api.pre.dev`. |
 | `CHROME_MCP_USER_DATA_DIR` | Use a different Chrome data folder, for example Chrome Beta or a separate Chrome you started yourself. Each folder gets its own background process. |
 

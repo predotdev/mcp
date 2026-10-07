@@ -24,7 +24,7 @@ const NAMES = ['predev', 'pre-dev'];
 const LEGACY_NAMES = ['predotdev', 'pre.dev', 'chrome', 'predev-chrome'];
 
 export function createSetup(ctx) {
-  const { baseStateDir, stateDir, chromeDir, customChromeDir, pkg, sleep, ensureDaemon, request, readCredentials, credentialsFile, packageRoot } = ctx;
+  const { baseStateDir, stateDir, chromeDir, customChromeDir, pkg, sleep, ensureDaemon, request, readCredentials, credentialsFile, cliLogin, packageRoot } = ctx;
   const APP_DIR = path.join(baseStateDir, 'app');
   const APP_ENTRY = path.join(APP_DIR, 'src', 'bridge.mjs');
   const NODE = process.execPath;
@@ -133,6 +133,8 @@ export function createSetup(ctx) {
       }
       const saved = readCredentials();
       if (saved.apiKey && await keyWorks(saved.apiKey, saved.apiUrl || url)) return ok('Already signed in to pre.dev');
+      // Signed in to the pre.dev CLI: the server uses that login as it is, nothing new is saved.
+      if (await keyWorks(cliLogin(), url)) return ok('Signed in with your pre.dev CLI login');
     }
     try {
       await signIn();
@@ -177,8 +179,11 @@ export function createSetup(ctx) {
     const write = (config, existed) => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       if (existed && !fs.existsSync(`${file}.bak-predev`)) fs.copyFileSync(file, `${file}.bak-predev`);
+      // Configs can hold other servers' keys: keep the file's permissions (a new one is private).
+      const mode = existed ? fs.statSync(file).mode & 0o777 : 0o600;
       const tmp = `${file}.${process.pid}`;
-      fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
+      fs.writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode });
+      fs.chmodSync(tmp, mode);
       fs.renameSync(tmp, file);
     };
     return {
@@ -270,6 +275,10 @@ export function createSetup(ctx) {
         } catch {}
         return added;
       }),
+    // The pre.dev CLI runs the chrome_* tools only: it has pre.dev's cloud tools built in.
+    jsonAgent('pre.dev CLI', path.join(home, '.predev/mcp.json'), 'mcpServers',
+      () => ({ type: 'stdio', ...stdio(), env: { PREDEV_MCP_CLOUD: 'off' } }),
+      () => exists(path.join(home, '.predev/bin')) || exists(path.join(home, '.predev/auth.json'))),
     jsonAgent('Cursor', path.join(home, '.cursor/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.cursor'))),
     jsonAgent('Windsurf', path.join(home, '.codeium/windsurf/mcp_config.json'), 'mcpServers', stdio, () => exists(path.join(home, '.codeium/windsurf'))),
     jsonAgent('Gemini CLI', path.join(home, '.gemini/settings.json'), 'mcpServers', stdio, () => exists(path.join(home, '.gemini')) || has('gemini')),
@@ -392,7 +401,9 @@ export function createSetup(ctx) {
 
   function logout() {
     fs.rmSync(credentialsFile, { force: true });
-    console.log('Signed out: the saved pre.dev key is deleted. Plain-words actions are off until you run login again.');
+    console.log(cliLogin()
+      ? 'Deleted the saved pre.dev key. You are still signed in through the pre.dev CLI; run `predev logout` to sign out there too.'
+      : 'Signed out: the saved pre.dev key is deleted. Plain-words actions are off until you run login again.');
   }
 
   async function uninstall() {

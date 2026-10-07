@@ -290,13 +290,23 @@ const DEFAULT_API_URL = 'https://api.pre.dev';
 function readCredentials() {
   try { return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, 'utf8')) || {}; } catch { return {}; }
 }
+// The pre.dev CLI's own login (~/.predev/auth.json), so someone signed in there never signs in twice.
+function cliLogin() {
+  try {
+    const auth = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.predev', 'auth.json'), 'utf8'));
+    return typeof auth.token === 'string' && !(Number(auth.expiresAt) && Date.now() >= Number(auth.expiresAt)) ? auth.token : '';
+  } catch { return ''; }
+}
+/** PREDEV_MCP_CLOUD=off lists only the chrome_* tools (the pre.dev CLI has its own cloud tools). */
+const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
-// PREDEV_API_KEY wins over the saved key.
+// PREDEV_API_KEY wins over the saved key, which wins over the pre.dev CLI's login.
 function shimCtx() {
   const saved = process.env.PREDEV_API_KEY ? {} : readCredentials();
   return {
-    apiKey: String(process.env.PREDEV_API_KEY || saved.apiKey || '').trim(),
+    apiKey: String(process.env.PREDEV_API_KEY || saved.apiKey || cliLogin() || '').trim(),
     apiUrl: String(process.env.PREDEV_API_URL || saved.apiUrl || DEFAULT_API_URL).trim(),
+    cloud: CLOUD,
   };
 }
 
@@ -360,13 +370,13 @@ function runMcp() {
           });
         case 'tools/list': {
           const ctx = shimCtx();
-          return reply({ tools: [...(await loadTools()).toolList(ctx), ...(await remote.listTools(ctx))] });
+          return reply({ tools: [...(await loadTools()).toolList(ctx), ...(CLOUD ? await remote.listTools(ctx) : [])] });
         }
         case 'tools/call': {
           const ctx = shimCtx();
           const { name, arguments: args } = message.params;
           // pre.dev's hosted tools go straight to pre.dev; they don't need Chrome.
-          if (await remote.isRemote(ctx, name)) {
+          if (CLOUD && await remote.isRemote(ctx, name)) {
             if (!ctx.apiKey) return reply({ content: [{ type: 'text', text: 'pre.dev tools need a free pre.dev account. Sign in by running `npx -y @predotdev/mcp login` in a terminal (no restart needed).' }], isError: true });
             return reply(await remote.callTool(ctx, name, args));
           }
@@ -489,7 +499,7 @@ async function runSetupCommand(name) {
   const { createSetup } = await import(pathToFileURL(path.join(path.dirname(SELF), 'setup.mjs')).href);
   const setup = createSetup({
     baseStateDir: BASE_STATE_DIR, stateDir: STATE_DIR, chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR),
-    pkg: PKG, sleep, ensureDaemon, request, readCredentials, credentialsFile: CREDENTIALS_FILE,
+    pkg: PKG, sleep, ensureDaemon, request, readCredentials, credentialsFile: CREDENTIALS_FILE, cliLogin,
     packageRoot: path.join(path.dirname(SELF), '..'),
   });
   await setup[name]();
