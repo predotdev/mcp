@@ -59,7 +59,8 @@ export function createSetup(ctx) {
   }
 
   const has = bin => spawnSync(process.platform === 'win32' ? 'where' : 'which', [bin], { stdio: 'ignore' }).status === 0;
-  const run = (bin, args) => spawnSync(bin, args, { encoding: 'utf8', timeout: 30000 });
+  // `input` answers a CLI's own confirmation prompts (Hermes asks before it adds or removes a server).
+  const run = (bin, args, input, timeout = 30000) => spawnSync(bin, args, { encoding: 'utf8', timeout, ...(input ? { input } : {}) });
 
   // ------------------------------------------------------------------ sign in
 
@@ -232,6 +233,22 @@ export function createSetup(ctx) {
     try { return Object.fromEntries(JSON.parse(out.stdout).map(server => [server.name, server])); } catch { return {}; }
   };
 
+  // Hermes keeps its servers in config.yaml (under mcp_servers); each entry's block of lines, by name.
+  const hermesHome = process.env.HERMES_HOME || path.join(home, '.hermes');
+  const hermesEntries = () => {
+    let lines;
+    try { lines = fs.readFileSync(path.join(hermesHome, 'config.yaml'), 'utf8').split('\n'); } catch { return {}; }
+    const at = lines.findIndex(line => /^mcp_servers:\s*$/.test(line));
+    const entries = {};
+    let name = null;
+    for (const line of at < 0 ? [] : lines.slice(at + 1)) {
+      if (/^\S/.test(line)) break;
+      const key = /^ {2}([A-Za-z0-9_.-]+):\s*$/.exec(line);
+      if (key) { name = key[1]; entries[name] = ''; } else if (name) entries[name] += `${line}\n`;
+    }
+    return entries;
+  };
+
   function cliAgent(label, bin, entries, remove, add) {
     return {
       label, detect: () => has(bin),
@@ -276,6 +293,19 @@ export function createSetup(ctx) {
         return added;
       }),
     // The pre.dev CLI runs the chrome_* tools only: it has pre.dev's cloud tools built in.
+    // Hermes registers it with its own CLI, which checks the server and asks to enable its tools.
+    cliAgent('Hermes', 'hermes', hermesEntries,
+      name => run('hermes', ['mcp', 'remove', name], 'y\n', 90000),
+      name => {
+        const added = run('hermes', ['mcp', 'add', name, '--command', NODE, '--args', APP_ENTRY], 'Y\nY\n', 90000);
+        // Specs and cloud browser runs need more than Hermes's default tool timeout.
+        if (added.status === 0) run('hermes', ['config', 'set', `mcp_servers.${name}.timeout`, '900']);
+        return added;
+      }),
+    // Pi's built-in MCP (and the pi-mcp-adapter extension) read ~/.pi/agent/mcp.json.
+    jsonAgent('Pi', path.join(process.env.PI_CODING_AGENT_DIR || path.join(home, '.pi/agent'), 'mcp.json'), 'mcpServers',
+      () => ({ ...stdio(), timeout: 900 }),
+      () => exists(process.env.PI_CODING_AGENT_DIR || path.join(home, '.pi')) || has('pi')),
     jsonAgent('pre.dev CLI', path.join(home, '.predev/mcp.json'), 'mcpServers',
       () => ({ type: 'stdio', ...stdio(), env: { PREDEV_MCP_CLOUD: 'off' } }),
       () => exists(path.join(home, '.predev/bin')) || exists(path.join(home, '.predev/auth.json'))),

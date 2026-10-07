@@ -31,7 +31,7 @@ One MCP server gives your coding agent everything pre.dev does:
 - **Browser Agents in the cloud.** Send a URL and a task to pre.dev's browsers and get structured data back, many runs in parallel.
 - **Specs and plans.** Plan an app or feature before building it: architecture, tech stack, milestones and user stories.
 
-It works with **any coding agent that runs MCP servers locally**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop, the [pre.dev CLI](https://pre.dev) and more. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
+It works with **any coding agent that runs MCP servers locally**: Claude Code, Codex, Hermes, Pi, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop, the [pre.dev CLI](https://pre.dev) and more. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
 
 Built with the [pre.dev CLI](https://docs.pre.dev/cli/overview).
 
@@ -46,7 +46,7 @@ npx -y @predotdev/mcp setup
 It walks you through everything:
 
 1. **Signs you in to pre.dev** in your browser (or creates a free account). Approve, and your key is saved for every agent. Nothing to copy. Already signed in to the pre.dev CLI? It uses that login.
-2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop and the pre.dev CLI. Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
+2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Hermes, Pi, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop and the pre.dev CLI. Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
 3. **Connects to Chrome.** The first time, it asks you to turn on remote debugging at `chrome://inspect/#remote-debugging` (it copies the address for you), and Chrome asks **"Allow remote debugging?"**: click **Allow**.
 
 Then restart your agent and try:
@@ -144,6 +144,30 @@ npx -y @predotdev/mcp        env: PREDEV_API_KEY=your_key   (optional after logi
 ```bash
 claude mcp add --scope user predev -e PREDEV_API_KEY=your_key -- npx -y @predotdev/mcp
 ```
+
+</details>
+
+<details>
+<summary><b>Hermes</b></summary>
+
+```bash
+hermes mcp add predev --command npx --args -y @predotdev/mcp
+hermes config set mcp_servers.predev.timeout 900
+```
+
+Answer `Y` to turn on its tools. The longer timeout gives specs and cloud runs time to finish. In a running chat, `/reload-mcp` picks it up.
+
+</details>
+
+<details>
+<summary><b>Pi</b></summary>
+
+```bash
+pi mcp add predev -- npx -y @predotdev/mcp
+pi mcp list
+```
+
+`pi mcp list` should say `predev: connected`. Pi versions without built-in MCP need `pi install npm:pi-mcp-adapter` first; it reads the same `~/.pi/agent/mcp.json`.
 
 </details>
 
