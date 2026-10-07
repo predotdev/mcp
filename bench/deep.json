@@ -1,0 +1,60 @@
+{
+  "claude-in-chrome": {
+    "first_call_context_median": 15283.5,
+    "api_calls": 107,
+    "per_call_context_median": 16173,
+    "images_returned": 6,
+    "tool_mix": {
+      "navigate": 25,
+      "tabs_context_mcp": 24,
+      "javascript_tool": 18,
+      "get_page_text": 11,
+      "find": 9,
+      "browser_batch": 8,
+      "computer.left_click": 6,
+      "computer.screenshot": 5,
+      "read_page": 4,
+      "left_click": 1
+    },
+    "result_chars_median": {
+      "navigate": 497,
+      "tabs_context_mcp": 438.0,
+      "javascript_tool": 304.0,
+      "get_page_text": 1510,
+      "find": 411,
+      "browser_batch": 878.0,
+      "computer.left_click": 420.0,
+      "computer.screenshot": 267,
+      "read_page": 597.0,
+      "left_click": 97
+    }
+  },
+  "predev-mcp": {
+    "first_call_context_median": 6587.5,
+    "api_calls": 107,
+    "per_call_context_median": 6991,
+    "images_returned": 0,
+    "tool_mix": {
+      "chrome_click": 28,
+      "chrome_open": 24,
+      "chrome_eval": 23,
+      "chrome_type": 15,
+      "chrome_wait": 13,
+      "chrome_read": 5,
+      "chrome_navigate": 4,
+      "chrome_snapshot": 4,
+      "chrome_act": 1
+    },
+    "result_chars_median": {
+      "chrome_click": 187.0,
+      "chrome_open": 155.0,
+      "chrome_eval": 95,
+      "chrome_type": 157,
+      "chrome_wait": 203,
+      "chrome_read": 1574,
+      "chrome_navigate": 94.0,
+      "chrome_snapshot": 542.0,
+      "chrome_act": 273
+    }
+  }
+}

@@ -1,0 +1,227 @@
+{
+  "runs": 48,
+  "tasks": [
+    "hn_top5",
+    "wiki_infobox",
+    "gh_release",
+    "dynamic_wait",
+    "table_read",
+    "form_fill",
+    "multi_page",
+    "search_flow"
+  ],
+  "per_task": {
+    "hn_top5": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 14.3,
+        "tokens": 47113,
+        "cost_usd": 0.0211614,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 523
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 7.3,
+        "tokens": 20476,
+        "cost_usd": 0.010157800000000002,
+        "tool_calls": 2,
+        "screenshots": 0,
+        "output_tokens": 400
+      }
+    },
+    "wiki_infobox": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 13.1,
+        "tokens": 47137,
+        "cost_usd": 0.0178128,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 440
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 8.4,
+        "tokens": 20477,
+        "cost_usd": 0.009883800000000002,
+        "tool_calls": 2,
+        "screenshots": 0,
+        "output_tokens": 351
+      }
+    },
+    "gh_release": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 15.8,
+        "tokens": 62916,
+        "cost_usd": 0.0204818,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 424
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 6.8,
+        "tokens": 20422,
+        "cost_usd": 0.0091968,
+        "tool_calls": 2,
+        "screenshots": 0,
+        "output_tokens": 337
+      }
+    },
+    "dynamic_wait": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 33.7,
+        "tokens": 82476,
+        "cost_usd": 0.0353976,
+        "tool_calls": 5,
+        "screenshots": 1,
+        "output_tokens": 817
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 23.1,
+        "tokens": 64604,
+        "cost_usd": 0.0414582,
+        "tool_calls": 10,
+        "screenshots": 0,
+        "output_tokens": 956
+      }
+    },
+    "table_read": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 13.4,
+        "tokens": 47071,
+        "cost_usd": 0.016679799999999998,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 369
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 8.1,
+        "tokens": 20385,
+        "cost_usd": 0.0082506,
+        "tool_calls": 2,
+        "screenshots": 0,
+        "output_tokens": 258
+      }
+    },
+    "form_fill": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 28.6,
+        "tokens": 120909,
+        "cost_usd": 0.057874199999999994,
+        "tool_calls": 8,
+        "screenshots": 1,
+        "output_tokens": 1391
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 17.4,
+        "tokens": 58582,
+        "cost_usd": 0.039431400000000005,
+        "tool_calls": 13,
+        "screenshots": 0,
+        "output_tokens": 1393
+      }
+    },
+    "multi_page": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 29.7,
+        "tokens": 99247,
+        "cost_usd": 0.040209999999999996,
+        "tool_calls": 8,
+        "screenshots": 0,
+        "output_tokens": 778
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 10.6,
+        "tokens": 27798,
+        "cost_usd": 0.0124366,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 332
+      }
+    },
+    "search_flow": {
+      "claude-in-chrome": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 19.3,
+        "tokens": 84031,
+        "cost_usd": 0.037858199999999995,
+        "tool_calls": 4,
+        "screenshots": 0,
+        "output_tokens": 553
+      },
+      "predev-mcp": {
+        "n": 3,
+        "passed": 3,
+        "wall_s": 9.7,
+        "tokens": 27610,
+        "cost_usd": 0.0136164,
+        "tool_calls": 3,
+        "screenshots": 0,
+        "output_tokens": 439
+      }
+    }
+  },
+  "per_arm": {
+    "claude-in-chrome": {
+      "runs": 24,
+      "passed": 24,
+      "pass_rate": 1.0,
+      "timed_out": 0,
+      "total_wall_s": 536.5,
+      "total_cost_usd": 0.742686,
+      "total_tokens": 1761947,
+      "total_tool_calls": 111,
+      "total_screenshots": 6,
+      "median_task_wall_s": 17.55,
+      "median_task_tokens": 72696.0,
+      "median_task_cost_usd": 0.0282795,
+      "median_task_tool_calls": 3.5,
+      "median_task_screenshots": 0.0,
+      "median_task_output_tokens": 538.0
+    },
+    "predev-mcp": {
+      "runs": 24,
+      "passed": 24,
+      "pass_rate": 1.0,
+      "timed_out": 0,
+      "total_wall_s": 314.8,
+      "total_cost_usd": 0.45188540000000005,
+      "total_tokens": 804202,
+      "total_tool_calls": 117,
+      "total_screenshots": 0,
+      "median_task_wall_s": 9.05,
+      "median_task_tokens": 24043.5,
+      "median_task_cost_usd": 0.0112972,
+      "median_task_tool_calls": 2.5,
+      "median_task_screenshots": 0.0,
+      "median_task_output_tokens": 375.5
+    }
+  }
+}
