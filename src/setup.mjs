@@ -73,8 +73,14 @@ export function createSetup(ctx) {
     return status === 200;
   }
 
-  function saveKey(apiKey, url) {
+  // ~/.predev/mcp holds the key, the daemon's token and its log: private to this user.
+  function privateBaseDir() {
     fs.mkdirSync(baseStateDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(baseStateDir, 0o700); } catch {}
+  }
+
+  function saveKey(apiKey, url) {
+    privateBaseDir();
     const tmp = `${credentialsFile}.${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify({ apiKey, apiUrl: url, savedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
     fs.renameSync(tmp, credentialsFile);
@@ -149,6 +155,7 @@ export function createSetup(ctx) {
 
   function installApp() {
     if (path.resolve(packageRoot) === path.resolve(APP_DIR)) return ok(`Installed in ${APP_DIR.replace(home, '~')}`);
+    privateBaseDir();
     fs.mkdirSync(path.join(APP_DIR, 'src'), { recursive: true });
     // Every module in src/, so a new one can never be left out of the installed copy.
     const modules = fs.readdirSync(path.join(packageRoot, 'src')).filter(name => name.endsWith('.mjs')).map(name => `src/${name}`);
@@ -487,7 +494,8 @@ export function createSetup(ctx) {
     const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
     for (const dir of new Set([stateDir, baseStateDir, ...subdirs])) {
       const state = (() => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8')); } catch { return null; } })();
-      if (!state) continue;
+      // A stopped daemon's port may belong to something else now.
+      if (!state || !state.pid || !alive(state.pid)) continue;
       await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {});
       // It exits just after answering; wait, so its last log line can't recreate the folder.
       for (let i = 0; i < 30 && state.pid && alive(state.pid); i++) await sleep(100);

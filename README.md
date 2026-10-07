@@ -472,10 +472,10 @@ flowchart LR
 
 This tool drives your real, logged-in Chrome. Read this before you turn it on.
 
-- **Anything you can do in a tab, the agent can do.** Only connect agents you trust, and keep an eye on what they do on sensitive sites. `chrome_eval` runs JavaScript in the page.
-- **Passwords stay with you.** It refuses to type into password fields (except on `localhost` and `.test` dev sites) and masks password values in snapshots. The agent is told never to enter passwords, payment details or government ID numbers.
+- **Anything you can do in a tab, the agent can do.** Only connect agents you trust, and keep an eye on what they do on sensitive sites. `chrome_eval` runs JavaScript in the page. A page can contain text written to steer an agent; the agent is told to treat page content as data, not instructions, but watch what it does after reading sites you don't trust.
+- **Passwords stay with you.** It refuses to type into password fields (except on `localhost` and `.test` dev sites) and masks the values of password, card number, security code, one-time code and other secret-looking fields in snapshots. It won't attach or open SSH keys, cloud credentials, `.env` files, your saved pre.dev key or Chrome's own data files. The agent is told never to enter passwords, payment details or government ID numbers.
 - **It only listens on your machine.** The background process binds to `127.0.0.1` only and rejects requests without a random per-run token, which is stored in a file only you can read. It also rejects any request that comes from a web page.
-- **What leaves your machine.** Plain-words actions send pre.dev the page's interactive elements and visible text for that one action, and the cloud tools send what you ask them to do. The other Chrome tools run locally.
+- **What leaves your machine.** Plain-words actions send pre.dev what that one action needs, and pre.dev's AI model reads it to answer: `chrome_act` sends your description, the page's headings and its interactive elements (role, name and field value, with the secret fields above masked); a plain-words `chrome_wait` sends the condition, the page title, its URL (with token-like query values removed), the interactive elements and up to about 8,000 characters of the page's visible text. The cloud tools send what you ask them to do. Every other Chrome tool runs locally, though your agent's own AI model sees what the tools return.
 - **Off switch.** Run `npx -y @predotdev/mcp stop` to stop the background process, or turn remote debugging off at `chrome://inspect/#remote-debugging`.
 
 ## Configuration

@@ -54,8 +54,19 @@ const LOG_FILE = path.join(STATE_DIR, 'predev-mcp.log');
 const CREDENTIALS_FILE = path.join(BASE_STATE_DIR, 'credentials.json');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// Everything here is private to this user: the log names the Chrome debugging address and profile
+// emails, and the state file holds the daemon's token.
 function log(...parts) {
-  try { fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${parts.join(' ')}\n`); } catch {}
+  try { fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${parts.join(' ')}\n`, { mode: 0o600 }); } catch {}
+}
+
+function privateStateDir() {
+  for (const dir of new Set([BASE_STATE_DIR, STATE_DIR])) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch {}
+  }
+  // Files an older version created with the default (world-readable) mode.
+  for (const file of [LOG_FILE, MAP_FILE, LOCK_FILE]) try { fs.chmodSync(file, 0o600); } catch {}
 }
 
 // ---------------------------------------------------------------- CDP connection
@@ -177,7 +188,7 @@ function loadProfileMap() {
 }
 
 function saveProfileMap() {
-  try { fs.writeFileSync(MAP_FILE, JSON.stringify({ wsUrl: chrome.wsUrl, map: Object.fromEntries(contextDirs) })); } catch {}
+  try { fs.writeFileSync(MAP_FILE, JSON.stringify({ wsUrl: chrome.wsUrl, map: Object.fromEntries(contextDirs) }), { mode: 0o600 }); } catch {}
 }
 
 // Mapping attempts that failed are not retried on the same connection, so tabs never flash twice.
@@ -219,7 +230,7 @@ function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { retu
 function takeLock() {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const fd = fs.openSync(LOCK_FILE, 'wx');
+      const fd = fs.openSync(LOCK_FILE, 'wx', 0o600);
       fs.writeSync(fd, String(process.pid));
       fs.closeSync(fd);
       return true;
@@ -233,10 +244,12 @@ function takeLock() {
 }
 
 function runDaemon() {
-  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  privateStateDir();
   if (!takeLock()) { log('another daemon holds the lock; exiting'); process.exit(0); }
   const release = () => {
     try { if (fs.readFileSync(LOCK_FILE, 'utf8') === String(process.pid)) fs.rmSync(LOCK_FILE); } catch {}
+    // A state file left behind names a port another program could take after this one exits.
+    try { if (JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).pid === process.pid) fs.rmSync(STATE_FILE); } catch {}
   };
   process.on('exit', release);
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(0));
@@ -311,7 +324,8 @@ function shimCtx() {
 }
 
 function request(state, method, route, body, timeout = 180000) {
-  const { apiKey, apiUrl } = shimCtx();
+  // The key goes only with tool calls, never with the health and shutdown probes.
+  const { apiKey, apiUrl } = route === '/call' ? shimCtx() : {};
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: '127.0.0.1', port: state.port, path: route, method, timeout,
@@ -331,8 +345,13 @@ function request(state, method, route, body, timeout = 180000) {
   });
 }
 
+// Only a daemon that is still running as this user counts: a stale file's port may now belong to
+// another program (or another user), which must never get the token or a key.
 function readState() {
-  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; }
+  try {
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return state && Number(state.pid) && pidAlive(Number(state.pid)) ? state : null;
+  } catch { return null; }
 }
 
 async function ensureDaemon() {
@@ -341,9 +360,11 @@ async function ensureDaemon() {
     const health = state && await request(state, 'GET', '/health', null, 3000).catch(() => null);
     if (health?.ok && health.version === VERSION) return state;
     if (health?.ok) { await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {}); await sleep(300); }
-    fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-    const out = fs.openSync(LOG_FILE, 'a');
-    spawn(process.execPath, [SELF, 'daemon'], { detached: true, stdio: ['ignore', out, out], windowsHide: true }).unref();
+    privateStateDir();
+    const out = fs.openSync(LOG_FILE, 'a', 0o600);
+    // The daemon never uses an agent's key from its environment (each call brings its own).
+    const { PREDEV_API_KEY: _key, ...env } = process.env;
+    spawn(process.execPath, [SELF, 'daemon'], { detached: true, stdio: ['ignore', out, out], windowsHide: true, env }).unref();
     for (let i = 0; i < 50; i++) {
       await sleep(100);
       const fresh = readState();
@@ -538,8 +559,8 @@ async function runCall(name, raw) {
     if (part.type === 'text') console.log(part.text);
     else if (part.type === 'image' && part.data) {
       const ext = /png/.test(part.mimeType || '') ? 'png' : 'jpg';
-      const file = path.join(os.tmpdir(), `predev-${name}-${Date.now()}.${ext}`);
-      fs.writeFileSync(file, Buffer.from(part.data, 'base64'), { mode: 0o600 });
+      const file = path.join(os.tmpdir(), `predev-${name}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${ext}`);
+      fs.writeFileSync(file, Buffer.from(part.data, 'base64'), { mode: 0o600, flag: 'wx' });
       console.log(`Image saved to ${file}`);
     }
   }
