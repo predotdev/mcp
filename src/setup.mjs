@@ -481,10 +481,18 @@ export function createSetup(ctx) {
       if (!found) continue;
       try { if (agent.unregister()) ok(`Removed from ${agent.label}`); } catch (error) { skip(`${agent.label}: ${error.message}`); }
     }
-    const state = (() => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, 'daemon.json'), 'utf8')); } catch { return null; } })();
-    if (state) await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {});
-    fs.rmSync(APP_DIR, { recursive: true, force: true });
-    fs.rmSync(credentialsFile, { force: true });
+    // Every daemon it runs (one per Chrome data dir), then everything it keeps in ~/.predev/mcp:
+    // the stable copy, the saved key, logs and the cached profile list (names and emails).
+    const subdirs = (() => { try { return fs.readdirSync(baseStateDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => path.join(baseStateDir, d.name)); } catch { return []; } })();
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    for (const dir of new Set([stateDir, baseStateDir, ...subdirs])) {
+      const state = (() => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8')); } catch { return null; } })();
+      if (!state) continue;
+      await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {});
+      // It exits just after answering; wait, so its last log line can't recreate the folder.
+      for (let i = 0; i < 30 && state.pid && alive(state.pid); i++) await sleep(100);
+    }
+    fs.rmSync(baseStateDir, { recursive: true, force: true });
     ok('Stopped it and deleted its files and saved key');
     console.log('\nDone. Restart your agents. To also turn off remote debugging, open chrome://inspect/#remote-debugging.');
   }
