@@ -169,7 +169,7 @@ pi mcp add predev -- npx -y @predotdev/mcp
 pi mcp list
 ```
 
-`pi mcp list` should say `predev: connected`. Pi versions without built-in MCP need `pi install npm:pi-mcp-adapter` first; it reads the same `~/.pi/agent/mcp.json`.
+`pi mcp list` should say `predev: connected`. `pi mcp add` needs Pi 0.99 or newer. On an older Pi, run `pi install npm:pi-mcp-adapter` and add the `predev` entry to `~/.pi/agent/mcp.json` by hand (`setup` writes it for you).
 
 </details>
 
