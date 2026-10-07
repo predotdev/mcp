@@ -180,10 +180,15 @@ async function pageLine(info, session) {
   return `Tab ${tabId(info)} · ${label(profileOf(info))} · ${(title || '(untitled)').slice(0, 100)}\n${shortUrl}`;
 }
 
+// Dev servers on this computer or the local network, which rarely speak https.
+const LOCAL_HOST = /^(localhost|127(\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}|[^\s/:?#@]+\.(localhost|test))(:\d+)?([/?#]|$)/i;
+
 function normalizeUrl(url) {
   const value = String(url || '').trim();
   if (!value) throw new Error('Pass a url.');
-  return /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : `https://${value}`;
+  // "https:", "about:", "chrome:"... is a scheme, but "localhost:3000/app" is a host and port.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[^\s/:?#@]+:\d+([/?#]|$)/.test(value)) return value;
+  return `${LOCAL_HOST.test(value) ? 'http' : 'https'}://${value}`;
 }
 
 const isLocalDev = url => {
@@ -274,9 +279,10 @@ function shortHref(href) {
     return s.length > 70 ? s.slice(0, 69) + '…' : s;
   } catch (e) { return ''; }
 }
-function snapshot(max) {
+// peek: list the elements without replacing the refs the agent got from its last snapshot.
+function snapshot(max, peek) {
   const refs = new Map();
-  window.__agentRefs = refs;
+  if (!peek) window.__agentRefs = refs;
   const found = new Set();
   collect(document, found);
   const all = [...found];
@@ -382,7 +388,7 @@ function point(q) {
     while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
     if (hit && !contains(el, hit) && !contains(hit, el)) covered = describe(hit);
   }
-  return { x, y, desc: describe(el), covered };
+  return { x, y, desc: describe(el), covered, select: el.tagName === 'SELECT' };
 }
 function focus(q, clear) {
   const f = find(q);
@@ -548,11 +554,17 @@ async function matchElement(session, description, ctx) {
   return { ref: answer.ref || null, desc: answer.text, p: Number(answer.confidence) || 0, list };
 }
 
+// What a plain-words wait checks: the page's text and its interactive elements, since an empty field
+// or an icon button has no text of its own. Elements go first: pre.dev reads the first 12,000 characters.
 async function pageState(session) {
-  return evaluate(session, `(() => {
+  const [head, text] = await evaluate(session, `(() => {
     const dialog = [...document.querySelectorAll('[role=dialog],[aria-modal=true],dialog[open],[role=alert]')].map(d => d.innerText).join('\\n').slice(0, 1500);
-    return 'Title: ' + document.title + '\\nURL: ' + location.href + (dialog ? '\\nDialog/alert: ' + dialog : '') + '\\n\\n' + (document.body ? document.body.innerText : '').slice(0, 8000);
+    return ['Title: ' + document.title + '\\nURL: ' + location.href + (dialog ? '\\nDialog/alert: ' + dialog : ''), document.body ? document.body.innerText : ''];
   })()`, 10000);
+  const snap = await inPage(session, 'snapshot(150, true)', 10000).catch(() => '');
+  const elements = String(snap).split('\n').filter(line => /^\[e\d+\] /.test(line)).map(line => line.replace(/^\[e\d+\] /, '- ')).join('\n').slice(0, 3000);
+  const room = Math.min(8000, Math.max(2000, 11500 - head.length - elements.length));
+  return `${head}${elements ? `\nInteractive elements:\n${elements}` : ''}\n\nText:\n${text.slice(0, room)}`;
 }
 
 // ---------------------------------------------------------------- tools
@@ -681,6 +693,8 @@ const TOOLS = [
         ({ x, y } = hit);
         what = hit.desc;
         if (hit.covered) note = `\nNote: ${hit.covered} was on top of it at that point; the click went there.`;
+        // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
+        if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
       await click(session, x, y, args.double ? 2 : 1);
       await settle(session, before);

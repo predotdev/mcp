@@ -516,6 +516,7 @@ npx -y @predotdev/mcp uninstall  # remove it from every agent and delete its fil
 | You had the hosted pre.dev MCP or an older `chrome` install | `setup` replaced it; this server has all of its tools. |
 | The agent can't start the server, or `npx`/`node` not found | Run `setup`: it registers full paths that work in desktop apps. |
 | Codex says a tool call timed out | Set `tool_timeout_sec = 900` (see the Codex setup). |
+| `codex exec` says a tool call `requires approval, but approval policy is never` | Non-interactive Codex can't ask you, so allow the tools for that run: `codex exec -c 'mcp_servers.predev.default_tools_approval_mode="approve"' "..."`. |
 | Anything else | Run `npx -y @predotdev/mcp check`, and look at `~/.predev/mcp/predev-mcp.log`. |
 
 ## Platform support
