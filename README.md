@@ -31,7 +31,7 @@ One MCP server gives your coding agent everything pre.dev does:
 - **Browser Agents in the cloud.** Send a URL and a task to pre.dev's browsers and get structured data back, many runs in parallel.
 - **Specs and plans.** Plan an app or feature before building it: architecture, tech stack, milestones and user stories.
 
-It works with **any coding agent that runs MCP servers locally**: Claude Code, Codex, Hermes, Pi, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop, the [pre.dev CLI](https://pre.dev) and more. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
+It works with **any coding agent**: Claude Code, Codex, Hermes, Pi, OpenClaw, Cursor, GitHub Copilot, Cline, Gemini CLI and Antigravity, OpenCode, Zed, Goose, the [pre.dev CLI](https://pre.dev) and 20 more, and any agent that can run a shell command. Run as many agents as you like at the same time. They all share one connection to Chrome, so Chrome only asks you to allow it once.
 
 Built with the [pre.dev CLI](https://docs.pre.dev/cli/overview).
 
@@ -46,7 +46,7 @@ npx -y @predotdev/mcp setup
 It walks you through everything:
 
 1. **Signs you in to pre.dev** in your browser (or creates a free account). Approve, and your key is saved for every agent. Nothing to copy. Already signed in to the pre.dev CLI? It uses that login.
-2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Hermes, Pi, Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, Claude Desktop and the pre.dev CLI. Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
+2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Hermes, Pi, OpenClaw, Cursor, Copilot CLI, Cline, Antigravity, Gemini CLI, OpenCode, VS Code, Claude Desktop, the pre.dev CLI and more (28 in all; [list](#setup-for-every-agent)). Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
 3. **Connects to Chrome.** The first time, it asks you to turn on remote debugging at `chrome://inspect/#remote-debugging` (it copies the address for you), and Chrome asks **"Allow remote debugging?"**: click **Allow**.
 
 Then restart your agent and try:
@@ -137,6 +137,8 @@ Once you are signed in to pre.dev (`setup` or `login` does it, or set `PREDEV_AP
 ```
 npx -y @predotdev/mcp        env: PREDEV_API_KEY=your_key   (optional after login)
 ```
+
+`setup` finds and configures each of these that is installed: Claude Code, Codex, Hermes, Pi, OpenClaw, Cursor (editor and CLI), Windsurf, GitHub Copilot CLI, Antigravity, Gemini CLI, Cline, Kiro, Qwen Code, Factory Droid, Augment, Amp, Kilo Code, Kimi Code, Junie, Warp, Rovo Dev, OpenHands, LM Studio, OpenCode, VS Code, VS Code Insiders, Claude Desktop and the pre.dev CLI. Devin CLI, Grok Build and Warp also read Claude Code's or Cursor's config, so they pick it up from there. Zed's settings file usually has comments, so `setup` leaves it to you (below).
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -326,6 +328,114 @@ echo "\"predev\": {\"command\": \"$(which node)\", \"args\": [\"$(npm root -g)/@
 ```
 
 Put that entry inside `"mcpServers"` in `~/Library/Application Support/Claude/claude_desktop_config.json`, replace `your_key`, then restart Claude Desktop. The same trick works for any app that says it can't find `npx` or `node`.
+
+</details>
+
+<details>
+<summary><b>More agents, by hand</b></summary>
+
+Every entry below is the same server: command `npx`, arguments `-y @predotdev/mcp`.
+
+| Agent | Command, or file and key |
+| --- | --- |
+| GitHub Copilot CLI | `copilot mcp add predev -- npx -y @predotdev/mcp`, or `~/.copilot/mcp-config.json` under `mcpServers` (add `"type": "local", "tools": ["*"]`) |
+| Antigravity (`agy`) | `~/.gemini/config/mcp_config.json` under `mcpServers` |
+| Cline | `cline mcp add predev --yes -- npx -y @predotdev/mcp`, or `~/.cline/data/settings/cline_mcp_settings.json` under `mcpServers` |
+| Kiro | `kiro-cli mcp add --name predev --command "npx -y @predotdev/mcp" --scope global`, or `~/.kiro/settings/mcp.json` |
+| Qwen Code | `qwen mcp add --scope user predev npx -y @predotdev/mcp` |
+| Factory Droid | `droid mcp add predev "npx -y @predotdev/mcp"` |
+| Augment (Auggie) | `auggie mcp add predev --command npx --args "-y @predotdev/mcp"` |
+| Amp | `amp mcp add predev -- npx -y @predotdev/mcp` |
+| OpenClaw | `openclaw mcp set predev '{"command":"npx","args":["-y","@predotdev/mcp"]}'` |
+| Grok Build | `grok mcp add predev -- npx -y @predotdev/mcp` |
+| Devin CLI | `devin mcp add -s user predev -- npx -y @predotdev/mcp` |
+| OpenHands | `openhands mcp add predev --transport stdio npx -- -y @predotdev/mcp` |
+| Kilo Code | `~/.config/kilo/kilo.jsonc` under `mcp`: `"predev": {"type": "local", "command": ["npx", "-y", "@predotdev/mcp"], "enabled": true}` |
+| Kimi Code | `~/.kimi-code/mcp.json` under `mcpServers` |
+| Junie | `~/.junie/mcp/mcp.json` under `mcpServers` |
+| Warp | `~/.warp/.mcp.json` under `mcpServers` |
+| Rovo Dev | `~/.rovodev/mcp.json` under `mcpServers` (add `"transport": "stdio"`) |
+| LM Studio | `~/.lmstudio/mcp.json` under `mcpServers` |
+| JetBrains AI Assistant | Settings → MCP → Import from Claude (after `setup` adds it to Claude Desktop) |
+
+</details>
+
+<details>
+<summary><b>Zed</b></summary>
+
+In `~/.config/zed/settings.json`:
+
+```json
+"context_servers": {
+  "predev": { "command": "npx", "args": ["-y", "@predotdev/mcp"], "env": {} }
+}
+```
+
+</details>
+
+<details>
+<summary><b>Goose</b></summary>
+
+In `~/.config/goose/config.yaml`, under `extensions:`:
+
+```yaml
+  predev:
+    type: stdio
+    name: predev
+    enabled: true
+    cmd: npx
+    args: [-y, "@predotdev/mcp"]
+    envs: {}
+    timeout: 900
+```
+
+For one session only: `goose session --with-extension "npx -y @predotdev/mcp"`.
+
+</details>
+
+<details>
+<summary><b>Continue, Crush and Mistral Vibe</b></summary>
+
+Continue, in `~/.continue/config.yaml`:
+
+```yaml
+mcpServers:
+  - name: predev
+    command: npx
+    args: ["-y", "@predotdev/mcp"]
+```
+
+Crush, one line in `~/.config/crush/crushrc`:
+
+```bash
+mcp add predev --command npx --args -y --args @predotdev/mcp
+```
+
+Mistral Vibe, in `~/.vibe/config.toml`:
+
+```toml
+[[mcp_servers]]
+name = "predev"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@predotdev/mcp"]
+```
+
+</details>
+
+<details>
+<summary><b>Agents without MCP (Aider, scripts, anything with a shell)</b></summary>
+
+Every tool also runs from a shell, so any agent that can run commands can drive your Chrome:
+
+```bash
+npx -y @predotdev/mcp tools                       # list the tools and their arguments
+npx -y @predotdev/mcp call chrome_open '{"profile":"Personal","url":"https://example.com"}'
+npx -y @predotdev/mcp call chrome_snapshot '{"tab":"A1B2C3"}'
+npx -y @predotdev/mcp call chrome_click '{"tab":"A1B2C3","ref":"e4"}'
+```
+
+Text goes to stdout, a screenshot is saved to a file and its path is printed, and the exit code is 1 when the tool failed. Point your agent at this section, or paste `npx -y @predotdev/mcp tools` into its instructions.
 
 </details>
 

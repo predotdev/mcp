@@ -428,6 +428,10 @@ Commands:
   predev-mcp stop       stop the background daemon (it restarts on the next tool call)
   predev-mcp uninstall  remove it from every agent and delete its files
   predev-mcp            run the MCP server (what your agent launches)
+  predev-mcp tools      list the tools and their arguments
+  predev-mcp call <tool> '<json args>'
+                        run one tool from a shell, for agents without MCP; e.g.
+                        predev-mcp call chrome_open '{"profile":"Default","url":"https://example.com"}'
   predev-mcp --version
 
 Docs: https://docs.pre.dev/browser-agents/local
@@ -495,6 +499,53 @@ if (typeof WebSocket === 'undefined') {
   process.exit(1);
 }
 
+// `tools` and `call`: the same tools from a shell, for agents that run commands but don't speak MCP.
+// Text goes to stdout; an image (a screenshot) is saved to a private temp file and its path printed.
+async function runTools() {
+  const ctx = shimCtx();
+  const tools = [...(await loadTools()).toolList(ctx), ...(CLOUD ? await remote.listTools(ctx).catch(() => []) : [])];
+  for (const tool of tools) {
+    const props = Object.keys(tool.inputSchema?.properties || {});
+    const required = tool.inputSchema?.required || [];
+    console.log(`${tool.name}(${props.map(p => (required.includes(p) ? p : `${p}?`)).join(', ')})`);
+    console.log(`  ${String(tool.description || '').split('\n')[0]}`);
+  }
+}
+
+async function runCall(name, raw) {
+  if (!name) {
+    process.stderr.write(`Usage: predev-mcp call <tool> '<json args>'   (predev-mcp tools lists them)\n`);
+    process.exit(2);
+  }
+  let args = {};
+  try { args = raw ? JSON.parse(raw) : {}; } catch {
+    process.stderr.write('The arguments must be one JSON object, e.g. \'{"tab":"A1B2C3"}\'.\n');
+    process.exit(2);
+  }
+  const ctx = shimCtx();
+  let result;
+  try {
+    if (CLOUD && await remote.isRemote(ctx, name)) {
+      result = ctx.apiKey ? await remote.callTool(ctx, name, args)
+        : { content: [{ type: 'text', text: 'pre.dev tools need a free pre.dev account. Sign in with: npx -y @predotdev/mcp login' }], isError: true };
+    } else {
+      result = await request(await ensureDaemon(), 'POST', '/call', { name, args });
+    }
+  } catch (error) {
+    result = { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+  }
+  for (const part of result.content || []) {
+    if (part.type === 'text') console.log(part.text);
+    else if (part.type === 'image' && part.data) {
+      const ext = /png/.test(part.mimeType || '') ? 'png' : 'jpg';
+      const file = path.join(os.tmpdir(), `predev-${name}-${Date.now()}.${ext}`);
+      fs.writeFileSync(file, Buffer.from(part.data, 'base64'), { mode: 0o600 });
+      console.log(`Image saved to ${file}`);
+    }
+  }
+  process.exit(result.isError ? 1 : 0);
+}
+
 async function runSetupCommand(name) {
   const { createSetup } = await import(pathToFileURL(path.join(path.dirname(SELF), 'setup.mjs')).href);
   const setup = createSetup({
@@ -509,6 +560,8 @@ const command = process.argv[2] || '';
 if (command === 'daemon') runDaemon();
 else if (['setup', 'install', 'login', 'logout', 'uninstall'].includes(command)) runSetupCommand(command === 'install' ? 'setup' : command);
 else if (command === 'check') runCheck();
+else if (command === 'tools') runTools();
+else if (command === 'call') runCall(process.argv[3], process.argv[4]);
 else if (command === 'stop') runStop();
 else if (command === '--version' || command === '-v') console.log(PKG.version || '0.0.0');
 else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HELP);

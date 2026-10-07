@@ -306,10 +306,43 @@ export function createSetup(ctx) {
     jsonAgent('Pi', path.join(process.env.PI_CODING_AGENT_DIR || path.join(home, '.pi/agent'), 'mcp.json'), 'mcpServers',
       () => ({ ...stdio(), timeout: 900 }),
       () => exists(process.env.PI_CODING_AGENT_DIR || path.join(home, '.pi')) || has('pi')),
+    // OpenClaw keeps its servers in JSON5; its CLI edits them (set replaces, unset removes) and `show` prints JSON.
+    cliAgent('OpenClaw', 'openclaw', () => {
+      const out = String(run('openclaw', ['mcp', 'show'], null, 60000).stdout || '');
+      try { return JSON.parse(out.slice(out.indexOf('{'))); } catch { return {}; }
+    },
+      name => run('openclaw', ['mcp', 'unset', name], null, 60000),
+      name => run('openclaw', ['mcp', 'set', name, JSON.stringify({ ...stdio(), requestTimeoutMs: 900000 })], null, 60000)),
     jsonAgent('pre.dev CLI', path.join(home, '.predev/mcp.json'), 'mcpServers',
       () => ({ type: 'stdio', ...stdio(), env: { PREDEV_MCP_CLOUD: 'off' } }),
       () => exists(path.join(home, '.predev/bin')) || exists(path.join(home, '.predev/auth.json'))),
     jsonAgent('Cursor', path.join(home, '.cursor/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.cursor'))),
+    // Copilot CLI's file, which VS Code's agent host reads too.
+    jsonAgent('GitHub Copilot CLI', path.join(process.env.COPILOT_HOME || path.join(home, '.copilot'), 'mcp-config.json'), 'mcpServers',
+      () => ({ type: 'local', ...stdio(), tools: ['*'] }), () => exists(process.env.COPILOT_HOME || path.join(home, '.copilot')) || has('copilot')),
+    jsonAgent('Antigravity', path.join(home, '.gemini/config/mcp_config.json'), 'mcpServers', stdio,
+      () => exists(path.join(home, '.gemini/config')) || has('agy')),
+    jsonAgent('Cline', path.join(home, '.cline/data/settings/cline_mcp_settings.json'), 'mcpServers',
+      () => ({ ...stdio(), timeout: 900 }), () => exists(path.join(home, '.cline')) || has('cline')),
+    jsonAgent('Kiro', path.join(home, '.kiro/settings/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.kiro')) || has('kiro-cli')),
+    jsonAgent('Qwen Code', path.join(home, '.qwen/settings.json'), 'mcpServers', () => ({ ...stdio(), timeout: 900000 }),
+      () => exists(path.join(home, '.qwen')) || has('qwen')),
+    jsonAgent('Factory Droid', path.join(home, '.factory/mcp.json'), 'mcpServers', () => ({ type: 'stdio', ...stdio() }),
+      () => exists(path.join(home, '.factory')) || has('droid')),
+    jsonAgent('Augment', path.join(home, '.augment/settings.json'), 'mcpServers', stdio, () => exists(path.join(home, '.augment')) || has('auggie')),
+    jsonAgent('Amp', path.join(home, '.config/amp/settings.json'), 'amp.mcpServers', stdio, () => exists(path.join(home, '.config/amp')) || has('amp')),
+    jsonAgent('Kilo Code', path.join(home, '.config/kilo/kilo.jsonc'), 'mcp', () => ({ type: 'local', command: [NODE, APP_ENTRY], enabled: true }),
+      () => exists(path.join(home, '.config/kilo'))),
+    jsonAgent('Zed', path.join(home, '.config/zed/settings.json'), 'context_servers', () => ({ ...stdio(), env: {} }),
+      () => exists(path.join(home, '.config/zed'))),
+    jsonAgent('Kimi Code', path.join(home, '.kimi-code/mcp.json'), 'mcpServers', () => ({ ...stdio(), toolTimeoutMs: 900000 }),
+      () => exists(path.join(home, '.kimi-code'))),
+    jsonAgent('Junie', path.join(home, '.junie/mcp/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.junie'))),
+    jsonAgent('Warp', path.join(home, '.warp/.mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.warp'))),
+    jsonAgent('Rovo Dev', path.join(home, '.rovodev/mcp.json'), 'mcpServers', () => ({ ...stdio(), transport: 'stdio' }),
+      () => exists(path.join(home, '.rovodev'))),
+    jsonAgent('OpenHands', path.join(home, '.openhands/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.openhands'))),
+    jsonAgent('LM Studio', path.join(home, '.lmstudio/mcp.json'), 'mcpServers', stdio, () => exists(path.join(home, '.lmstudio'))),
     jsonAgent('Windsurf', path.join(home, '.codeium/windsurf/mcp_config.json'), 'mcpServers', stdio, () => exists(path.join(home, '.codeium/windsurf'))),
     jsonAgent('Gemini CLI', path.join(home, '.gemini/settings.json'), 'mcpServers', stdio, () => exists(path.join(home, '.gemini')) || has('gemini')),
     jsonAgent('OpenCode', path.join(home, '.config/opencode/opencode.json'), 'mcp',
@@ -318,6 +351,10 @@ export function createSetup(ctx) {
     ...(appSupport ? [
       jsonAgent('VS Code', path.join(appSupport, 'Code/User/mcp.json'), 'servers',
         () => ({ type: 'stdio', ...stdio() }), () => exists(path.join(appSupport, 'Code/User'))),
+      jsonAgent('VS Code Insiders', path.join(appSupport, 'Code - Insiders/User/mcp.json'), 'servers',
+        () => ({ type: 'stdio', ...stdio() }), () => exists(path.join(appSupport, 'Code - Insiders/User'))),
+      jsonAgent('Cline in VS Code', path.join(appSupport, 'Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json'), 'mcpServers',
+        () => ({ ...stdio(), timeout: 900 }), () => exists(path.join(appSupport, 'Code/User/globalStorage/saoudrizwan.claude-dev'))),
       jsonAgent('Claude Desktop', path.join(appSupport, 'Claude/claude_desktop_config.json'), 'mcpServers', stdio,
         () => exists(path.join(appSupport, 'Claude'))),
     ] : []),
@@ -419,7 +456,7 @@ export function createSetup(ctx) {
     step(4, 'Connect to Chrome');
     await connectChrome();
     console.log(failed ? '\nFix the ✗ items above, then run this again (it is safe to repeat).'
-      : `\nAll set.${added.length ? ` Restart ${added.join(', ')} so ${added.length === 1 ? 'it loads' : 'they load'} the new server,` : ''} then ask your agent:\n  "List my Chrome profiles and the tabs I have open."`);
+      : `\nAll set.${added.length ? ` Restart ${added.length > 4 ? `your agents (${added.length} set up above)` : added.join(', ')} so ${added.length === 1 ? 'it loads' : 'they load'} the new server,` : ''} then ask your agent:\n  "List my Chrome profiles and the tabs I have open."`);
     process.exit(failed ? 1 : 0);
   }
 
