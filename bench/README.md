@@ -1,6 +1,6 @@
 # Benchmark: Claude in Chrome vs the pre.dev MCP
 
-The harness and results behind the post *Claude in Chrome vs the pre.dev MCP: same agent, same model, twice as fast* on [pre.dev/blog](https://pre.dev/blog).
+The harness and results behind the post *Claude Code, twice as fast in Chrome* on [pre.dev/blog](https://pre.dev/blog).
 
 One agent, two sets of browser tools. Every run is a `claude -p` session on Claude Sonnet 5.5 with no CLAUDE.md or user settings (`--setting-sources local`) and exactly one set of browser tools. The prompt is identical for both sides and names no Chrome profile: `Use only your browser tools.` followed by the task.
 
