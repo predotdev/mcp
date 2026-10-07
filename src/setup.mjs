@@ -147,7 +147,9 @@ export function createSetup(ctx) {
   function installApp() {
     if (path.resolve(packageRoot) === path.resolve(APP_DIR)) return ok(`Installed in ${APP_DIR.replace(home, '~')}`);
     fs.mkdirSync(path.join(APP_DIR, 'src'), { recursive: true });
-    for (const file of ['src/bridge.mjs', 'src/tools.mjs', 'src/setup.mjs', 'package.json', 'LICENSE', 'README.md']) {
+    // Every module in src/, so a new one can never be left out of the installed copy.
+    const modules = fs.readdirSync(path.join(packageRoot, 'src')).filter(name => name.endsWith('.mjs')).map(name => `src/${name}`);
+    for (const file of [...modules, 'package.json', 'LICENSE', 'README.md']) {
       const from = path.join(packageRoot, file);
       if (!fs.existsSync(from)) continue;
       const tmp = path.join(APP_DIR, `${file}.${process.pid}`);
