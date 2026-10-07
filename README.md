@@ -59,6 +59,10 @@ Then restart your agent and try:
 
 The command is safe to run again at any time, and running it again updates to the latest version. `npx -y @predotdev/mcp check` shows the state of everything, and `uninstall` removes it from every agent.
 
+### Coming from Claude in Chrome?
+
+Run the setup command above, then type `/chrome` in Claude Code and turn off **Enabled by default** (or start a session with `claude --no-chrome`). Your Chrome profiles and logins carry over, because this server drives the Chrome you already use. The [switching guide](https://docs.pre.dev/browser-agents/switch-from-claude-in-chrome) maps each Claude in Chrome tool to its pre.dev tool and has a line you can paste into `CLAUDE.md`.
+
 ## Local or cloud?
 
 Both editions of pre.dev Browser Agents are in this server, and your agent picks per task.
