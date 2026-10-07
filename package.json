@@ -1,6 +1,6 @@
 {
   "name": "@predotdev/mcp",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "pre.dev in any coding agent: Browser Agents in the Chrome you already use and in the cloud, plus specs and plans. One command to set up. Free and open source.",
   "type": "module",
   "bin": {
