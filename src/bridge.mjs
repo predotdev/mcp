@@ -9,8 +9,9 @@
 //   predev-mcp check    checks your setup and lists your Chrome profiles
 //   predev-mcp stop     stops the background daemon
 //   predev-mcp daemon   (internal) holds the single Chrome connection and serves the MCP shims
-//                       over localhost HTTP with a per-run token. Tools live in tools.mjs and
-//                       hot-reload, so editing them never drops the approved connection.
+//                       over localhost HTTP with a per-run token. Each call runs the calling
+//                       copy's tools.mjs (reloaded when it changes), so tool updates never drop
+//                       the approved connection; the daemon is replaced only when PROTOCOL changes.
 //
 // Chrome asks "Allow remote debugging?" once per connection, so the daemon keeps one
 // connection for every agent instead of each agent opening its own.
@@ -25,12 +26,15 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRemote } from './remote.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
-const TOOLS_FILE = path.join(path.dirname(SELF), 'tools.mjs');
+const TOOLS_FILE = (file => { try { return fs.realpathSync(file); } catch { return file; } })(path.join(path.dirname(SELF), 'tools.mjs'));
 const PKG = (() => {
   try { return JSON.parse(fs.readFileSync(path.join(path.dirname(SELF), '../package.json'), 'utf8')); } catch { return {}; }
 })();
-// Content hash, not mtime: reinstalling the same version must not restart the daemon (and re-ask Allow).
-const VERSION = crypto.createHash('sha1').update(fs.readFileSync(SELF)).digest('hex').slice(0, 12);
+// What a shim and a running daemon must agree on. Chrome asks "Allow remote debugging?" for every new
+// connection, so a release keeps the running daemon unless this changes: bump it only when the
+// daemon's HTTP API, the core it hands tools.mjs, or its Chrome connection code changes in a way the
+// running daemon can't serve. Tool changes need no bump: each call names the caller's tools.mjs.
+const PROTOCOL = 1;
 
 function defaultChromeDir() {
   const home = os.homedir();
@@ -202,20 +206,43 @@ const core = {
   get daemonPort() { return daemonPort; },
 };
 
-let loaded = { mtime: 0, api: null };
-async function loadTools() {
+// Tools modules by real path, re-imported when the file's mtime changes.
+const loadedTools = new Map();
+async function loadTools(file = TOOLS_FILE, version = PKG.version) {
+  const cached = loadedTools.get(file);
   let mtime;
-  try { mtime = fs.statSync(TOOLS_FILE).mtimeMs; } catch (error) { if (loaded.api) return loaded.api; throw error; }
-  if (!loaded.api || loaded.mtime !== mtime) {
-    const module = await import(`${pathToFileURL(TOOLS_FILE).href}?v=${mtime}`);
-    loaded = { mtime, api: module.createTools(core) };
-    log('tools loaded', Math.round(mtime));
-  }
-  return loaded.api;
+  try { mtime = fs.statSync(file).mtimeMs; } catch (error) { if (cached) return cached.api; throw error; }
+  if (cached?.mtime === mtime) return cached.api;
+  const module = await import(`${pathToFileURL(file).href}?v=${mtime}`);
+  // The daemon's one shared core; only the version (sent to pre.dev) is the calling copy's own.
+  const api = module.createTools(Object.create(core, { version: { value: version || '0.0.0' } }));
+  loadedTools.set(file, { mtime, api });
+  log('tools loaded', file, Math.round(mtime));
+  return api;
 }
 
-async function callTool(name, args, ctx) {
-  const { TOOLS } = await loadTools();
+// The tools.mjs a call names, so an update that changes only tools reaches the running daemon
+// without a new Chrome connection. Only a copy of this package's tools.mjs that belongs to this
+// user is loaded; anything else gets the daemon's own copy.
+function callerTools(header) {
+  const own = { file: TOOLS_FILE, version: PKG.version };
+  if (!header) return own;
+  let file = '';
+  try {
+    file = fs.realpathSync(decodeURIComponent(String(header)));
+    const stat = fs.statSync(file);
+    const mine = typeof process.getuid !== 'function' || stat.uid === process.getuid();
+    if (path.basename(file) === 'tools.mjs' && stat.isFile() && mine) {
+      const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(file), '..', 'package.json'), 'utf8'));
+      if (pkg?.name === '@predotdev/mcp') return { file, version: pkg.version };
+    }
+  } catch {}
+  log('ignored tools path', file || String(header).slice(0, 300));
+  return own;
+}
+
+async function callTool(name, args, ctx, tools = {}) {
+  const { TOOLS } = await loadTools(tools.file, tools.version);
   const tool = TOOLS.find(t => t.name === name);
   if (!tool) throw new Error(`Unknown tool ${name}`);
   await chrome.connect();
@@ -264,7 +291,7 @@ function runDaemon() {
     // A browser page could reach localhost; it can't know the token, and it would send Origin.
     if (req.headers['x-bridge-token'] !== token || req.headers.origin) { res.writeHead(403); res.end(); return; }
     const reply = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
-    if (req.method === 'GET' && req.url === '/health') return reply({ ok: true, version: VERSION, chrome: chrome.connected });
+    if (req.method === 'GET' && req.url === '/health') return reply({ ok: true, protocol: PROTOCOL, version: PKG.version || '0.0.0', chrome: chrome.connected });
     if (req.method === 'POST' && req.url === '/shutdown') { reply({ ok: true }); setTimeout(() => process.exit(0), 50); return; }
     if (req.method === 'POST' && req.url === '/call') {
       let body = '';
@@ -275,9 +302,10 @@ function runDaemon() {
         apiKey: String(req.headers['x-predev-api-key'] || '').trim(),
         apiUrl: String(req.headers['x-predev-api-url'] || DEFAULT_API_URL).trim(),
       };
+      const tools = callerTools(req.headers['x-predev-tools']);
       const started = Date.now();
       try {
-        const result = await callTool(name, args, ctx);
+        const result = await callTool(name, args, ctx, tools);
         log('call', name, 'ok', `${Date.now() - started}ms`);
         reply(result);
       } catch (error) {
@@ -291,9 +319,9 @@ function runDaemon() {
   server.listen(0, '127.0.0.1', () => {
     daemonPort = server.address().port;
     const tmp = `${STATE_FILE}.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token, pid: process.pid, version: VERSION }), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token, pid: process.pid, protocol: PROTOCOL, version: PKG.version || '0.0.0' }), { mode: 0o600 });
     fs.renameSync(tmp, STATE_FILE);
-    log('daemon listening on', server.address().port, 'version', VERSION);
+    log('daemon listening on', server.address().port, 'protocol', PROTOCOL, 'version', PKG.version || '0.0.0');
   });
 }
 
@@ -331,6 +359,8 @@ function request(state, method, route, body, timeout = 180000) {
       host: '127.0.0.1', port: state.port, path: route, method, timeout,
       headers: {
         'x-bridge-token': state.token, 'content-type': 'application/json',
+        // The daemon runs this copy's tools (see callerTools).
+        ...(route === '/call' ? { 'x-predev-tools': encodeURIComponent(TOOLS_FILE) } : {}),
         ...(apiKey ? { 'x-predev-api-key': apiKey, 'x-predev-api-url': apiUrl } : {}),
       },
     }, res => {
@@ -358,7 +388,8 @@ async function ensureDaemon() {
   for (let attempt = 0; attempt < 3; attempt++) {
     const state = readState();
     const health = state && await request(state, 'GET', '/health', null, 3000).catch(() => null);
-    if (health?.ok && health.version === VERSION) return state;
+    if (health?.ok && health.protocol === PROTOCOL) return state;
+    // A daemon from before PROTOCOL (2.1.4 and older) or with another one is replaced: a new connection.
     if (health?.ok) { await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {}); await sleep(300); }
     privateStateDir();
     const out = fs.openSync(LOG_FILE, 'a', 0o600);
@@ -368,7 +399,7 @@ async function ensureDaemon() {
     for (let i = 0; i < 50; i++) {
       await sleep(100);
       const fresh = readState();
-      if (fresh && fresh.version === VERSION && await request(fresh, 'GET', '/health', null, 1000).then(h => h.ok).catch(() => false)) return fresh;
+      if (fresh && fresh.protocol === PROTOCOL && await request(fresh, 'GET', '/health', null, 1000).then(h => h.ok).catch(() => false)) return fresh;
     }
   }
   throw new Error(`Could not start the Chrome MCP daemon; see ${LOG_FILE}.`);

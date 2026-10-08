@@ -593,6 +593,15 @@ async function predev(ctx, route, body) {
   throw new Error('pre.dev is busy right now. Retry in a few seconds, or use chrome_snapshot refs.');
 }
 
+// A plain-words argument under the documented name or one agents often reach for instead.
+function plainWords(args, names) {
+  for (const name of names) {
+    const value = args?.[name];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
 // Picks the element a plain-words description refers to from the page's interactive elements.
 async function matchElement(session, description, ctx) {
   if (!ctx.apiKey) throw new Error(KEY_HELP);
@@ -796,7 +805,10 @@ const TOOLS = [
         submit: { type: 'boolean' }, clear: { type: 'boolean' },
       },
     },
-    async run({ tab, target: description, action = 'click', text, submit, clear }, ctx = {}) {
+    async run(args, ctx = {}) {
+      const { tab, action = 'click', text, submit, clear } = args;
+      const description = plainWords(args, ['target', 'description', 'instruction', 'element', 'query']);
+      if (!description) throw new Error('chrome_act needs "target": the element in plain words, e.g. {"tab":"AB12CD","target":"the Search button"}.');
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
       const match = await matchElement(session, description, ctx);
@@ -901,7 +913,12 @@ const TOOLS = [
         gone: { type: 'boolean' }, timeout: { type: 'number', description: 'Seconds.' },
       },
     },
-    async run({ tab, text, selector, url, condition, gone = false, timeout = 15 }, ctx = {}) {
+    async run(args, ctx = {}) {
+      const { tab, text, selector, url, gone = false, timeout = 15 } = args;
+      const condition = plainWords(args, ['condition', 'description', 'instruction', 'query', 'until']);
+      if (!condition && !text && !selector && !url) {
+        throw new Error('chrome_wait needs "condition" (plain words, e.g. {"tab":"AB12CD","condition":"the search results have loaded"}), or "text", "selector" or "url".');
+      }
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
       if (condition) {
@@ -921,7 +938,6 @@ const TOOLS = [
       if (text) checks.push(`(document.body?.innerText || '').includes(${JSON.stringify(text)})`);
       if (selector) checks.push(`!!document.querySelector(${JSON.stringify(selector)})`);
       if (url) checks.push(`location.href.includes(${JSON.stringify(url)})`);
-      if (!checks.length) throw new Error('Pass text, selector, url or condition.');
       const expression = `${gone ? '!' : ''}(${checks.join(' && ')})`;
       const end = Date.now() + Math.min(Number(timeout) || 15, 120) * 1000;
       while (Date.now() < end) {

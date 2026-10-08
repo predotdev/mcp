@@ -508,7 +508,7 @@ npx -y @predotdev/mcp uninstall  # remove it from every agent and delete its fil
 | --- | --- |
 | `Chrome remote debugging is off` | Open `chrome://inspect/#remote-debugging` in Chrome and turn it on. |
 | `Chrome is asking "Allow remote debugging?"` | Click **Allow** in Chrome, then ask your agent to try again. |
-| Chrome asks to allow again | Normal after Chrome restarts, or after this tool updates to a new version. |
+| Chrome asks to allow again | Normal after Chrome restarts. Updates keep the approved connection, except a rare one that changes how the background process talks to Chrome. |
 | `Plain-words actions need a pre.dev account` | Run `npx -y @predotdev/mcp login`. No restart needed. |
 | `pre.dev rejected the saved key` | Run `npx -y @predotdev/mcp login` again. |
 | A message about credits or subscribing | Your workspace is out of trial credits. Subscribe or top up at [pre.dev/billing](https://pre.dev/billing). |
@@ -531,7 +531,7 @@ cd mcp
 node src/bridge.mjs check
 ```
 
-Point your agent at `node /path/to/mcp/src/bridge.mjs`. Edits to `src/tools.mjs` reload automatically without dropping Chrome's approved connection. Edits to `src/bridge.mjs` restart the background process, so Chrome asks you to allow again.
+Point your agent at `node /path/to/mcp/src/bridge.mjs`. Edits to `src/tools.mjs` reload automatically without dropping Chrome's approved connection: every call runs the calling copy's `tools.mjs`. The background process restarts (and Chrome asks you to allow again) only when `PROTOCOL` in `src/bridge.mjs` changes; bump it when you change the daemon's HTTP API, what it hands `tools.mjs`, or its Chrome connection code, or run `node src/bridge.mjs stop` to pick up other daemon edits.
 
 ## About
 
