@@ -83,17 +83,17 @@ Both editions of pre.dev Browser Agents are in this server, and your agent picks
 | --- | --- |
 | `chrome_profiles` | List your Chrome profiles (name, Google account) and how many tabs each has open |
 | `chrome_tabs` | List open tabs grouped by profile |
-| `chrome_open` | Open a URL in a specific profile, in the background by default so you are not interrupted |
+| `chrome_open` | Open a URL in a specific profile, in the background by default so you are not interrupted; returns once the page has loaded |
 | `chrome_navigate` | Load a URL in a tab, or go back, forward or reload |
-| `chrome_snapshot` | List the clickable and typeable elements on a page as short refs (`[e1]`, `[e2]`, ...) |
+| `chrome_snapshot` | List the clickable and typeable elements on a page as short refs (`[e1]`, `[e2]`, ...), with each link's address (tracking parameters removed) |
 | `chrome_click` | Click by ref, CSS selector, visible text or coordinates, with real mouse events |
 | `chrome_type` | Type into inputs, text areas, rich editors and dropdowns |
 | `chrome_act` | Click or type into an element described in plain words, in one call ([plain-words actions](#plain-words-actions)) |
 | `chrome_press` | Press keys and shortcuts (`Enter`, `Tab`, `cmd+a`, `shift+Tab`) |
 | `chrome_scroll` | Scroll the page or bring an element into view |
-| `chrome_read` | Read a page's text, paged for long pages |
+| `chrome_read` | Read a page's text without site menus, footers and off-screen panels (`full` keeps them), paged for long pages. `selector` reads just the matching elements and `links` adds their URLs, so a results page's names, prices and product links come back in one call |
 | `chrome_screenshot` | Screenshot the visible area or the full page |
-| `chrome_wait` | Wait for text, a selector, a URL change, or a plain-words condition |
+| `chrome_wait` | Wait for text, a selector, a URL change, or a plain-words condition; with only a tab, until the page has loaded and stopped changing |
 | `chrome_eval` | Run JavaScript in the page and return the result |
 | `chrome_upload` | Attach local files to an upload button or file input |
 | `chrome_show` | Bring a tab to the front so you can see it or take over |
@@ -465,6 +465,8 @@ flowchart LR
 - Each agent uses its own pre.dev API key, even though they share the connection.
 - The cloud tools are pre.dev's hosted MCP tools, passed through on the same key, so they stay current without updating this package.
 - Tabs open in the background by default and are kept responsive while an agent works in them, so you can keep using Chrome.
+- Page loads count as done when the page is loaded and has stopped changing (or has been still for a second while images and ads finish), so results that scripts fill in are there when the agent reads.
+- Links come back as the page's own address: sponsored redirects resolve to where they go, Amazon product links become `/dp/<id>`, and tracking parameters are removed.
 - Snapshots reach into shadow DOM and same-origin iframes, and clicks are real mouse events, so modern web apps behave the way they do for you.
 - It has no dependencies: plain Node.js talking to Chrome's DevTools Protocol.
 

@@ -407,7 +407,12 @@ async function ensureDaemon() {
 
 const remote = createRemote({ version: PKG.version || '0.0.0' });
 
+// Tools that act on one tab. chrome_close is left out on purpose: closing needs the tab named.
+const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
+  'chrome_scroll', 'chrome_read', 'chrome_screenshot', 'chrome_wait', 'chrome_eval', 'chrome_upload', 'chrome_show']);
+
 function runMcp() {
+  let lastTab = null;
   const write = message => process.stdout.write(`${JSON.stringify(message)}\n`);
   const handle = async message => {
     const reply = result => write({ jsonrpc: '2.0', id: message.id, result });
@@ -433,7 +438,14 @@ function runMcp() {
             return reply(await remote.callTool(ctx, name, args));
           }
           const state = await ensureDaemon();
-          return reply(await request(state, 'POST', '/call', { name, args }));
+          // A call without a tab means the tab this agent last worked in (an error would cost it a turn).
+          // Remembered per agent session, so agents sharing the daemon never borrow each other's tabs.
+          let callArgs = args || {};
+          if (!callArgs.tab && lastTab && TAB_TOOLS.has(name)) callArgs = { ...callArgs, tab: lastTab };
+          const result = await request(state, 'POST', '/call', { name, args: callArgs });
+          const seen = !result?.isError && result?.content?.find(c => c.type === 'text')?.text?.match(/^Tab ([0-9A-F]{6,}) ·/m);
+          if (name === 'chrome_close') { if (callArgs.tab === lastTab) lastTab = null; } else if (seen) lastTab = seen[1];
+          return reply(result);
         }
         case 'ping':
           return reply({});
