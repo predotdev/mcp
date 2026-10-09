@@ -45,9 +45,9 @@ npx -y @predotdev/mcp setup
 
 It walks you through everything:
 
-1. **Signs you in to pre.dev** in your browser (or creates a free account). Approve, and your key is saved for every agent. Nothing to copy. Already signed in to the pre.dev CLI? It uses that login.
-2. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Hermes, Pi, OpenClaw, Cursor, Copilot CLI, Cline, Antigravity, Gemini CLI, OpenCode, VS Code, Claude Desktop, the pre.dev CLI and more (28 in all; [list](#setup-for-every-agent)). Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
-3. **Connects to Chrome.** The first time, it asks you to turn on remote debugging at `chrome://inspect/#remote-debugging` (it copies the address for you), and Chrome asks **"Allow remote debugging?"**: click **Allow**.
+1. **Adds it to every coding agent on your Mac**: Claude Code, Codex, Hermes, Pi, OpenClaw, Cursor, Copilot CLI, Cline, Antigravity, Gemini CLI, OpenCode, VS Code, Claude Desktop, the pre.dev CLI and more (28 in all; [list](#setup-for-every-agent)). Already using the hosted pre.dev MCP? This one includes all of its tools, so setup replaces it.
+2. **Connects to Chrome.** The first time, it asks you to turn on remote debugging at `chrome://inspect/#remote-debugging` (it copies the address for you), and Chrome asks **"Allow remote debugging?"**: click **Allow**.
+3. **Signs you in to pre.dev** in your browser (or creates a free account), for plain-words actions and the cloud tools. Approve, and your key is saved for every agent; nothing to copy. Already signed in to the pre.dev CLI? It uses that login. Optional: press Enter to skip, and the Chrome tools still work.
 
 Then restart your agent and try:
 
@@ -494,7 +494,7 @@ State, logs, the stable copy `setup` installs and the key saved by `login` (read
 ## Commands
 
 ```bash
-npx -y @predotdev/mcp setup      # sign in, add to every agent, connect to Chrome (also updates)
+npx -y @predotdev/mcp setup      # add to every agent, connect to Chrome, sign in (optional; also updates)
 npx -y @predotdev/mcp check      # check your setup, list your Chrome profiles, check your key
 npx -y @predotdev/mcp login      # sign in to pre.dev again
 npx -y @predotdev/mcp logout     # forget the saved key

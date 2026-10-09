@@ -87,7 +87,7 @@ export function createSetup(ctx) {
   }
 
   // The pre.dev CLI's short-code sign-in: approve in the browser, the key comes back here.
-  async function signIn() {
+  async function signIn(allowSkip = false) {
     const url = apiUrl();
     const verifier = crypto.randomBytes(32).toString('base64url');
     const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
@@ -107,9 +107,18 @@ export function createSetup(ctx) {
     else console.log(`  ${link}`);
     console.log(`  Your code: ${start.user_code}`);
     const end = Date.now() + (start.expires_in || 600) * 1000;
+    // On a terminal, Enter skips: the Chrome tools work without an account.
+    let skipped = false;
+    const onKey = () => { skipped = true; };
+    if (allowSkip && process.stdin.isTTY) {
+      console.log('  Press Enter to skip (the Chrome tools work without an account).');
+      process.stdin.resume();
+      process.stdin.once('data', onKey);
+    }
     const wait = waiter('Waiting for you to approve in the browser');
     let code = null;
-    while (Date.now() < end && !code) {
+    try {
+    while (Date.now() < end && !code && !skipped) {
       wait.tick();
       await sleep((start.interval || 2) * 1000);
       const poll = await fetch(`${url}/oauth/cli/poll?state=${encodeURIComponent(state)}`, { signal: AbortSignal.timeout(15000) })
@@ -117,7 +126,12 @@ export function createSetup(ctx) {
       if (poll.error) { wait.done(); throw new Error(poll.error === 'access_denied' ? 'Sign-in was denied in the browser.' : `Sign-in failed: ${poll.error}`); }
       if (poll.code) code = poll.code;
     }
+    } finally {
+      process.stdin.off('data', onKey);
+      if (process.stdin.isTTY) process.stdin.pause();
+    }
     wait.done();
+    if (skipped) return null;
     if (!code) throw new Error('The sign-in code expired. Run this again for a new one.');
     const token = await fetch(`${url}/oauth/token`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(20000),
@@ -143,11 +157,14 @@ export function createSetup(ctx) {
       // Signed in to the pre.dev CLI: the server uses that login as it is, nothing new is saved.
       if (await keyWorks(cliLogin(), url)) return ok('Signed in with your pre.dev CLI login');
     }
+    const later = 'Plain-words actions stay off until you run: npx -y @predotdev/mcp login';
     try {
-      await signIn();
+      const key = await signIn(!force);
+      if (!key) return skip(`Skipped sign-in. The Chrome tools work without it. ${later}`);
       ok(`Signed in. Your key is saved in ${credentialsFile.replace(home, '~')} for every agent.`);
     } catch (error) {
-      bad(`${error.message} Plain-words actions stay off until you run: npx -y @predotdev/mcp login`);
+      if (force) bad(`${error.message} ${later}`);
+      else skip(`${error.message} The Chrome tools work without it. ${later}`);
     }
   }
 
@@ -454,14 +471,14 @@ export function createSetup(ctx) {
       if (next.status !== null) process.exit(next.status);
       console.log('  Could not switch; continuing with this version.');
     }
-    step(1, 'Sign in to pre.dev');
-    await ensureSignedIn();
-    step(2, 'Install');
+    step(1, 'Install');
     installApp();
-    step(3, 'Add to your coding agents');
+    step(2, 'Add to your coding agents');
     const added = registerAgents();
-    step(4, 'Connect to Chrome');
+    step(3, 'Connect to Chrome');
     await connectChrome();
+    step(4, 'Sign in to pre.dev (optional: plain-words actions and cloud tools)');
+    await ensureSignedIn();
     console.log(failed ? '\nFix the ✗ items above, then run this again (it is safe to repeat).'
       : `\nAll set.${added.length ? ` Restart ${added.length > 4 ? `your agents (${added.length} set up above)` : added.join(', ')} so ${added.length === 1 ? 'it loads' : 'they load'} the new server,` : ''} then ask your agent:\n  "List my Chrome profiles and the tabs I have open."`);
     process.exit(failed ? 1 : 0);

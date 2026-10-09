@@ -536,7 +536,7 @@ async function runCheck() {
     else if (status === 401 || status === 403) bad('pre.dev rejected your key. Sign in again with: npx -y @predotdev/mcp login');
     else bad(`Could not check PREDEV_API_KEY with ${apiUrl} (${status ? `HTTP ${status}` : 'no answer'}).`);
   }
-  console.log(failed ? '\nFix the ✗ items above, then run this again.' : '\nAll set. Add the server to your agent and ask it to use Chrome.');
+  console.log(failed ? '\nFix the ✗ items above, then run this again.' : '\nAll set. If your agent was open during setup, restart it, then ask it to use Chrome.');
   process.exit(failed ? 1 : 0);
 }
 
