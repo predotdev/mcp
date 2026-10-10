@@ -23,6 +23,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import zlib from 'node:zlib';
 import { createRemote } from './remote.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -405,6 +406,99 @@ async function ensureDaemon() {
   throw new Error(`Could not start the Chrome MCP daemon; see ${LOG_FILE}.`);
 }
 
+// ---------------------------------------------------------------- updates
+
+// `setup` installs a copy in ~/.predev/mcp/app that agents start with node, so on its own it would
+// never change. That copy keeps itself current: at most every 6 hours (shared by every agent) it asks
+// npm for the newest version and swaps the new files in. The running daemon uses the new tools.mjs
+// from its next call (callerTools), and this server is the new one from the agent's next start. A
+// release that changes PROTOCOL is left to `setup`, which also replaces the daemon.
+// PREDEV_MCP_AUTO_UPDATE=off turns it off.
+const APP_DIR = path.join(BASE_STATE_DIR, 'app');
+const UPDATE_FILE = path.join(BASE_STATE_DIR, 'update.json');
+const UPDATE_EVERY = 6 * 3600 * 1000;
+const AUTO_UPDATE = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_AUTO_UPDATE || '');
+
+function runsInstalledCopy() {
+  try { return fs.realpathSync(SELF) === fs.realpathSync(path.join(APP_DIR, 'src', 'bridge.mjs')); } catch { return false; }
+}
+
+/** a > b for x.y.z versions. */
+function newer(a, b) {
+  const pa = String(a).split('.').map(n => Number.parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => Number.parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  return false;
+}
+
+// The regular files in an npm tarball (gzipped tar), by path.
+function untar(gz) {
+  const tar = zlib.gunzipSync(gz);
+  const files = new Map();
+  let longName = '';
+  for (let at = 0; at + 512 <= tar.length;) {
+    const header = tar.subarray(at, at + 512);
+    if (header.every(b => b === 0)) break;
+    const field = (start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0[\s\S]*$/, '');
+    const size = Number.parseInt(field(124, 12).trim() || '0', 8);
+    const type = field(156, 1) || '0';
+    const body = tar.subarray(at + 512, at + 512 + size);
+    const prefix = field(257, 6).startsWith('ustar') ? field(345, 155) : '';
+    const name = longName || (prefix ? `${prefix}/${field(0, 100)}` : field(0, 100));
+    longName = '';
+    if (type === 'x') longName = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(body.toString('utf8'))?.[1] || '';
+    else if (type === 'L') longName = body.toString('utf8').replace(/\0[\s\S]*$/, '');
+    else if (type === '0') files.set(name, body);
+    at += 512 + Math.ceil(size / 512) * 512;
+  }
+  return files;
+}
+
+function writePrivate(file, data, mode = 0o600) {
+  const tmp = `${file}.${process.pid}`;
+  fs.writeFileSync(tmp, data, { mode });
+  fs.chmodSync(tmp, mode);
+  fs.renameSync(tmp, file);
+}
+
+/** Updates the installed copy when npm has a newer version; returns that version, or '' when nothing changed. */
+async function updateInstalledCopy() {
+  if (!AUTO_UPDATE || !runsInstalledCopy()) return '';
+  let last = {};
+  try { last = JSON.parse(fs.readFileSync(UPDATE_FILE, 'utf8')) || {}; } catch {}
+  if (Date.now() - (Number(last.checkedAt) || 0) < UPDATE_EVERY) return '';
+  // Claimed before asking, so agents that start together ask npm once.
+  writePrivate(UPDATE_FILE, JSON.stringify({ ...last, checkedAt: Date.now() }));
+  const meta = await fetch('https://registry.npmjs.org/@predotdev/mcp/latest', { signal: AbortSignal.timeout(15000) })
+    .then(r => (r.ok ? r.json() : null)).catch(() => null);
+  // The copy on disk, which another agent may have updated since this one started.
+  let current = '0.0.0';
+  try { current = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'package.json'), 'utf8')).version || current; } catch {}
+  if (typeof meta?.version !== 'string' || !newer(meta.version, current) || !meta.dist?.tarball) return '';
+  const gz = Buffer.from(await fetch(meta.dist.tarball, { signal: AbortSignal.timeout(60000) })
+    .then(r => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`npm answered ${r.status}`)))));
+  const [algorithm, digest] = String(meta.dist.integrity || '').split('-');
+  if (algorithm !== 'sha512' || crypto.createHash('sha512').update(gz).digest('base64') !== digest) throw new Error(`${meta.version}: the download does not match npm's checksum`);
+  const files = untar(gz);
+  const protocol = Number(/^const PROTOCOL = (\d+);/m.exec(files.get('package/src/bridge.mjs')?.toString('utf8') || '')?.[1]);
+  if (protocol !== PROTOCOL) {
+    log('update', meta.version, `needs setup (protocol ${protocol})`);
+    return '';
+  }
+  // The files setup installs. tools.mjs, which running daemons reload, goes after the modules, and
+  // package.json last, so the version only changes once the code has.
+  const modules = [...files.keys()].filter(name => /^package\/src\/[\w.-]+\.mjs$/.test(name))
+    .sort((a, b) => a.endsWith('/tools.mjs') - b.endsWith('/tools.mjs'));
+  for (const name of [...modules, 'package/LICENSE', 'package/README.md', 'package/package.json']) {
+    if (!files.has(name)) continue;
+    const to = path.join(APP_DIR, name.slice('package/'.length));
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    writePrivate(to, files.get(name), name.endsWith('/bridge.mjs') ? 0o755 : 0o644);
+  }
+  log('updated the installed copy from', current, 'to', meta.version);
+  return meta.version;
+}
+
 const remote = createRemote({ version: PKG.version || '0.0.0' });
 
 // Tools that act on one tab. chrome_close is left out on purpose: closing needs the tab named.
@@ -413,7 +507,16 @@ const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click',
 
 function runMcp() {
   let lastTab = null;
+  let listed = '';
   const write = message => process.stdout.write(`${JSON.stringify(message)}\n`);
+  // After an update, the agent re-lists the tools when they changed (new tools or parameters).
+  const update = () => updateInstalledCopy().then(async version => {
+    if (!version || !listed) return;
+    const now = JSON.stringify((await loadTools()).toolList(shimCtx()));
+    if (now !== listed) write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+  }).catch(error => log('update check failed:', error.message));
+  setTimeout(update, 5000).unref();
+  setInterval(update, UPDATE_EVERY).unref();
   const handle = async message => {
     const reply = result => write({ jsonrpc: '2.0', id: message.id, result });
     try {
@@ -421,13 +524,15 @@ function runMcp() {
         case 'initialize':
           return reply({
             protocolVersion: message.params?.protocolVersion || '2025-06-18',
-            capabilities: { tools: {} },
+            capabilities: { tools: { listChanged: true } },
             serverInfo: { name: 'predev', version: PKG.version || '0.0.0' },
             instructions: (await loadTools()).instructions(shimCtx()),
           });
         case 'tools/list': {
           const ctx = shimCtx();
-          return reply({ tools: [...(await loadTools()).toolList(ctx), ...(CLOUD ? await remote.listTools(ctx) : [])] });
+          const local = (await loadTools()).toolList(ctx);
+          listed = JSON.stringify(local);
+          return reply({ tools: [...local, ...(CLOUD ? await remote.listTools(ctx) : [])] });
         }
         case 'tools/call': {
           const ctx = shimCtx();

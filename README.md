@@ -57,7 +57,7 @@ Then restart your agent and try:
 > **Or let your agent do it.** Paste this into Claude Code (or any coding agent):
 > *Run `npx -y @predotdev/mcp setup` with a 10 minute timeout and tell me what to click.*
 
-The command is safe to run again at any time, and running it again updates to the latest version. `npx -y @predotdev/mcp check` shows the state of everything, and `uninstall` removes it from every agent.
+The command is safe to run again at any time. The copy it installs keeps itself up to date (see [How it works](#how-it-works)), and running setup again also updates it. `npx -y @predotdev/mcp check` shows the state of everything, and `uninstall` removes it from every agent.
 
 ### Coming from Claude in Chrome?
 
@@ -91,7 +91,7 @@ Both editions of pre.dev Browser Agents are in this server, and your agent picks
 | `chrome_act` | Click or type into an element described in plain words, in one call ([plain-words actions](#plain-words-actions)) |
 | `chrome_press` | Press keys and shortcuts (`Enter`, `Tab`, `cmd+a`, `shift+Tab`) |
 | `chrome_scroll` | Scroll the page or bring an element into view |
-| `chrome_read` | Read a page's text without site menus, footers and off-screen panels (`full` keeps them), paged for long pages. `selector` reads just the matching elements and `links` adds their URLs, so a results page's names, prices and product links come back in one call |
+| `chrome_read` | Read a page's text without site menus, footers and off-screen panels (`full` keeps them), paged for long pages. `selector` reads just the matching elements and `links` adds their URLs, so a results page's names, prices and product links come back in one call. When a selector matches nothing, it lists the page's repeated items (result cards) with selectors that work |
 | `chrome_screenshot` | Screenshot the visible area or the full page |
 | `chrome_wait` | Wait for text, a selector, a URL change, or a plain-words condition; with only a tab, until the page has loaded and stopped changing |
 | `chrome_eval` | Run JavaScript in the page and return the result |
@@ -468,6 +468,7 @@ flowchart LR
 - Page loads count as done when the page is loaded and has stopped changing (or has been still for a second while images and ads finish), so results that scripts fill in are there when the agent reads.
 - Links come back as the page's own address: sponsored redirects resolve to where they go, Amazon product links become `/dp/<id>`, and tracking parameters are removed.
 - Snapshots reach into shadow DOM and same-origin iframes, and clicks are real mouse events, so modern web apps behave the way they do for you.
+- Updates: the copy `setup` installs checks npm at most every 6 hours, checks the download against npm's checksum and swaps in the new files. Tool changes apply from the next call, with no new Chrome approval; the rare update that changes how the background process talks to Chrome waits until you run `setup` again. `PREDEV_MCP_AUTO_UPDATE=off` turns this off.
 - It has no dependencies: plain Node.js talking to Chrome's DevTools Protocol.
 
 ## Safety
@@ -489,6 +490,7 @@ Set these in your agent's MCP config (`env`).
 | `PREDEV_API_KEY` | Your pre.dev API key. Overrides the key saved by `login`, which overrides your pre.dev CLI login. |
 | `PREDEV_MCP_CLOUD` | `off` lists only the Chrome tools, without pre.dev's cloud tools. |
 | `PREDEV_API_URL` | The pre.dev API to call. Default `https://api.pre.dev`. |
+| `PREDEV_MCP_AUTO_UPDATE` | `off` stops the copy `setup` installs from updating itself from npm. |
 | `CHROME_MCP_USER_DATA_DIR` | Use a different Chrome data folder, for example Chrome Beta or a separate Chrome you started yourself. Each folder gets its own background process. |
 
 State, logs, the stable copy `setup` installs and the key saved by `login` (readable only by you) are kept in `~/.predev/mcp/`.
