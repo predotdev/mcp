@@ -595,6 +595,8 @@ Commands:
   predev-mcp login      sign in to pre.dev again
   predev-mcp logout     forget the saved pre.dev key
   predev-mcp stop       stop the background daemon (it restarts on the next tool call)
+  predev-mcp install-app  only install (or update) the copy in ~/.predev/mcp/app, which keeps
+                        itself up to date; what the pre.dev CLI runs (no sign-in, no agents)
   predev-mcp uninstall  remove it from every agent and delete its files
   predev-mcp            run the MCP server (what your agent launches)
   predev-mcp tools      list the tools and their arguments
@@ -728,6 +730,7 @@ async function runSetupCommand(name) {
 const command = process.argv[2] || '';
 if (command === 'daemon') runDaemon();
 else if (['setup', 'install', 'login', 'logout', 'uninstall'].includes(command)) runSetupCommand(command === 'install' ? 'setup' : command);
+else if (command === 'install-app') runSetupCommand('installApp');
 else if (command === 'check') runCheck();
 else if (command === 'tools') runTools();
 else if (command === 'call') runCall(process.argv[3], process.argv[4]);

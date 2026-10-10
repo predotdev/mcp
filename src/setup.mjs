@@ -522,5 +522,5 @@ export function createSetup(ctx) {
     console.log('\nDone. Restart your agents. To also turn off remote debugging, open chrome://inspect/#remote-debugging.');
   }
 
-  return { setup, login, logout, uninstall };
+  return { setup, login, logout, uninstall, installApp };
 }

@@ -468,7 +468,7 @@ flowchart LR
 - Page loads count as done when the page is loaded and has stopped changing (or has been still for a second while images and ads finish), so results that scripts fill in are there when the agent reads.
 - Links come back as the page's own address: sponsored redirects resolve to where they go, Amazon product links become `/dp/<id>`, and tracking parameters are removed.
 - Snapshots reach into shadow DOM and same-origin iframes, and clicks are real mouse events, so modern web apps behave the way they do for you.
-- Updates: the copy `setup` installs checks npm at most every 6 hours, checks the download against npm's checksum and swaps in the new files. Tool changes apply from the next call, with no new Chrome approval; the rare update that changes how the background process talks to Chrome waits until you run `setup` again. `PREDEV_MCP_AUTO_UPDATE=off` turns this off.
+- Updates: the copy `setup` installs checks npm at most every 6 hours, checks the download against npm's checksum and swaps in the new files. Tool changes apply from the next call, with no new Chrome approval; the rare update that changes how the background process talks to Chrome waits until you run `setup` again. `PREDEV_MCP_AUTO_UPDATE=off` turns this off. `npx -y @predotdev/mcp install-app` installs or updates only that copy (no sign-in, no agent configs); the pre.dev CLI runs it for you.
 - It has no dependencies: plain Node.js talking to Chrome's DevTools Protocol.
 
 ## Safety
