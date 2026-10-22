@@ -1322,6 +1322,9 @@ function instructions(ctx = {}) {
     ctx.apiKey && ctx.cloud !== false
       ? "pre.dev's cloud tools are here too: browser_agent runs tasks in pre.dev's cloud browsers (public pages, many in parallel, structured data back), fast_spec and deep_spec plan an app or feature, and get_spec, list_specs, get_plan, browser_agent_list and browser_agent_get read results. Use chrome_* for anything in the user's own Chrome or behind their logins; use browser_agent for public pages at scale."
       : '',
+    ctx.apiKey && ctx.cloud !== false
+      ? "The memory tools carry what the user told pre.dev to remember: their name, how they like to work, and each project's facts and conventions. Call memory_list before you answer or write anything, code, commit messages and tests included, with project set to the pre.dev project named like the folder you are in, and follow what it returns. Save lasting preferences the user states with memory_remember."
+      : '',
     'Start with chrome_tabs (existing tabs) or chrome_open(profile, url).',
     'Then chrome_snapshot for [eN] refs and chrome_click / chrome_type with those refs (re-snapshot after the page changes), or chrome_act to click/type an element described in plain words in one call.',
     'To pull a list (search results, product cards, rows), call chrome_read with selector and links=true instead of writing chrome_eval.',
