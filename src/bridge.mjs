@@ -299,9 +299,13 @@ function runDaemon() {
       for await (const chunk of req) body += chunk;
       const { name, args } = JSON.parse(body);
       // Each agent passes its own pre.dev API key; the daemon is shared, so it never uses one of its own.
+      // A call whose caller went away (a cancelled handoff) is told so through ctx.signal.
+      const gone = new AbortController();
+      res.on('close', () => { if (!res.writableFinished) gone.abort(); });
       const ctx = {
         apiKey: String(req.headers['x-predev-api-key'] || '').trim(),
         apiUrl: String(req.headers['x-predev-api-url'] || DEFAULT_API_URL).trim(),
+        signal: gone.signal,
       };
       const tools = callerTools(req.headers['x-predev-tools']);
       const started = Date.now();
@@ -341,6 +345,12 @@ function cliLogin() {
 }
 /** PREDEV_MCP_CLOUD=off lists only the chrome_* tools (the pre.dev CLI has its own cloud tools). */
 const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
+/** PREDEV_HANDOFF=1: handoffs (chrome_handoff) and the guard that goes with them (only this
+ *  agent's tabs, no typing into password, code or card fields, ask first before send, post, buy
+ *  or delete). Off by default; off, every tool works as before. */
+const HANDOFF = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
+/** Which agent a call comes from, so agents sharing the daemon keep to their own tabs. */
+const AGENT_ID = crypto.randomBytes(6).toString('hex');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
 // PREDEV_API_KEY wins over the saved key, which wins over the pre.dev CLI's login.
 function shimCtx() {
@@ -349,15 +359,19 @@ function shimCtx() {
     apiKey: String(process.env.PREDEV_API_KEY || saved.apiKey || cliLogin() || '').trim(),
     apiUrl: String(process.env.PREDEV_API_URL || saved.apiUrl || DEFAULT_API_URL).trim(),
     cloud: CLOUD,
+    handoff: HANDOFF,
   };
 }
 
-function request(state, method, route, body, timeout = 180000) {
+function request(state, method, route, body, timeout = 180000, onRequest = null) {
   // The key goes only with tool calls, never with the health and shutdown probes.
   const { apiKey, apiUrl } = route === '/call' ? shimCtx() : {};
   return new Promise((resolve, reject) => {
     const req = http.request({
-      host: '127.0.0.1', port: state.port, path: route, method, timeout,
+      host: '127.0.0.1', port: state.port, path: route, method,
+      // No limit (a handoff waiting for the user): its own connection, off the global agent's
+      // idle timeout too.
+      ...(timeout ? { timeout } : { agent: false }),
       headers: {
         'x-bridge-token': state.token, 'content-type': 'application/json',
         // The daemon runs this copy's tools (see callerTools).
@@ -371,6 +385,7 @@ function request(state, method, route, body, timeout = 180000) {
     });
     req.on('timeout', () => req.destroy(new Error('The Chrome MCP daemon did not answer in time.')));
     req.on('error', reject);
+    onRequest?.(req);
     if (body) req.write(JSON.stringify(body));
     req.end();
   });
@@ -503,11 +518,24 @@ const remote = createRemote({ version: PKG.version || '0.0.0' });
 
 // Tools that act on one tab. chrome_close is left out on purpose: closing needs the tab named.
 const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
-  'chrome_scroll', 'chrome_read', 'chrome_screenshot', 'chrome_wait', 'chrome_eval', 'chrome_upload', 'chrome_show']);
+  'chrome_scroll', 'chrome_read', 'chrome_screenshot', 'chrome_wait', 'chrome_eval', 'chrome_upload', 'chrome_show', 'chrome_handoff']);
+
+/** Arguments for a local tool call: which agent it is, and whether handoffs are on. A flag the
+ *  caller passed in (pre.dev's own agent sets __predev_handoff) is kept. */
+function withCallFlags(args) {
+  const out = { ...(args || {}), __agent: AGENT_ID };
+  if (HANDOFF) out.__predev_handoff = true;
+  return out;
+}
+
+/** A chrome_handoff that waits for the user (no time limit on it). */
+const waitsForUser = (name, a) => name === 'chrome_handoff' && a.wait !== false && !a.peek && !a.check && !a.release && !a.cancel && !a.resume;
 
 function runMcp() {
   let lastTab = null;
   let listed = '';
+  // A chrome_handoff can wait for the user for as long as they need; the agent can cancel it.
+  const inflight = new Map(); // MCP request id -> { req, tab, state }
   const write = message => process.stdout.write(`${JSON.stringify(message)}\n`);
   // After an update, the agent re-lists the tools when they changed (new tools or parameters).
   const update = () => updateInstalledCopy().then(async version => {
@@ -545,15 +573,29 @@ function runMcp() {
           const state = await ensureDaemon();
           // A call without a tab means the tab this agent last worked in (an error would cost it a turn).
           // Remembered per agent session, so agents sharing the daemon never borrow each other's tabs.
-          let callArgs = args || {};
-          if (!callArgs.tab && lastTab && TAB_TOOLS.has(name)) callArgs = { ...callArgs, tab: lastTab };
-          const result = await request(state, 'POST', '/call', { name, args: callArgs });
+          let callArgs = withCallFlags(args);
+          if (!callArgs.tab && lastTab && TAB_TOOLS.has(name) && !callArgs.resume_url) callArgs = { ...callArgs, tab: lastTab };
+          const waits = waitsForUser(name, callArgs);
+          const result = await request(state, 'POST', '/call', { name, args: callArgs }, waits ? 0 : 180000,
+            waits ? req => inflight.set(message.id, { req, tab: callArgs.tab, state }) : null)
+            .finally(() => inflight.delete(message.id));
           const seen = !result?.isError && result?.content?.find(c => c.type === 'text')?.text?.match(/^Tab ([0-9A-F]{6,}) ·/m);
           if (name === 'chrome_close') { if (callArgs.tab === lastTab) lastTab = null; } else if (seen) lastTab = seen[1];
           return reply(result);
         }
         case 'ping':
           return reply({});
+        case 'notifications/cancelled': {
+          // The agent gave up on a call: end a waiting handoff (this daemon sees the request
+          // close; an older one is told with an explicit cancel).
+          const call = inflight.get(message.params?.requestId);
+          if (call) {
+            inflight.delete(message.params?.requestId);
+            call.req.destroy();
+            request(call.state, 'POST', '/call', { name: 'chrome_handoff', args: withCallFlags({ tab: call.tab, cancel: true, __predev_handoff: true }) }).catch(() => {});
+          }
+          return;
+        }
         default:
           if (message.id !== undefined) write({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
       }
@@ -700,7 +742,8 @@ async function runCall(name, raw) {
       result = ctx.apiKey ? await remote.callTool(ctx, name, args)
         : { content: [{ type: 'text', text: 'pre.dev tools need a free pre.dev account. Sign in with: npx -y @predotdev/mcp login' }], isError: true };
     } else {
-      result = await request(await ensureDaemon(), 'POST', '/call', { name, args });
+      const callArgs = withCallFlags(args);
+      result = await request(await ensureDaemon(), 'POST', '/call', { name, args: callArgs }, waitsForUser(name, callArgs) ? 0 : 180000);
     }
   } catch (error) {
     result = { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };

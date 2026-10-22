@@ -98,6 +98,7 @@ Both editions of pre.dev Browser Agents are in this server, and your agent picks
 | `chrome_upload` | Attach local files to an upload button or file input |
 | `chrome_show` | Bring a tab to the front so you can see it or take over |
 | `chrome_close` | Close a tab |
+| `chrome_handoff` | With `PREDEV_HANDOFF=1`: hand you a step only you can do (a sign-in, a 2FA code, a CAPTCHA, a consent screen, or clicking Send yourself), wait until it's done, then carry on |
 
 **In pre.dev's cloud** (need a pre.dev plan; on the free plan your agent sees them and can open the subscribe page for you):
 
@@ -479,6 +480,7 @@ This tool drives your real, logged-in Chrome. Read this before you turn it on.
 - **Passwords stay with you.** It refuses to type into password fields (except on `localhost` and `.test` dev sites) and masks the values of password, card number, security code, one-time code and other secret-looking fields in snapshots. It won't attach or open SSH keys, cloud credentials, `.env` files, your saved pre.dev key or Chrome's own data files. The agent is told never to enter passwords, payment details or government ID numbers.
 - **It only listens on your machine.** The background process binds to `127.0.0.1` only and rejects requests without a random per-run token, which is stored in a file only you can read. It also rejects any request that comes from a web page.
 - **What leaves your machine.** Plain-words actions send pre.dev what that one action needs, and pre.dev's AI model reads it to answer: `chrome_act` sends your description, the page's headings and its interactive elements (role, name and field value, with the secret fields above masked); a plain-words `chrome_wait` sends the condition, the page title, its URL (with token-like query values removed), the interactive elements and up to about 8,000 characters of the page's visible text. The cloud tools send what you ask them to do. Every other Chrome tool runs locally, though your agent's own AI model sees what the tools return.
+- **Handoffs (`PREDEV_HANDOFF=1`, off by default).** The agent hands you the steps that are yours instead of working around them: `chrome_handoff` brings the tab forward once Chrome is the app in front (never taking the keyboard from another app), and waits with no time limit until the page shows the step is done (for example, the URL leaves `/login`); it picks up again if Chrome quits and comes back, and handoffs from several agents take turns. While you have the tab the agent gets nothing from it. With it on, the agent also works only in tabs it opened (and their popups), never types into password, one-time code or card fields (input type and autocomplete decide, then pre.dev's check when you're signed in), can't write those fields or click from `chrome_eval`, asks you first before a click that would send, post, buy or delete something (without a pre.dev key: any form submit sent with POST), pauses when you click or type in its tab, and reads the page again after you had it.
 - **Off switch.** Run `npx -y @predotdev/mcp stop` to stop the background process, or turn remote debugging off at `chrome://inspect/#remote-debugging`.
 
 ## Configuration
@@ -491,6 +493,7 @@ Set these in your agent's MCP config (`env`).
 | `PREDEV_MCP_CLOUD` | `off` lists only the Chrome tools, without pre.dev's cloud tools. |
 | `PREDEV_API_URL` | The pre.dev API to call. Default `https://api.pre.dev`. |
 | `PREDEV_MCP_AUTO_UPDATE` | `off` stops the copy `setup` installs from updating itself from npm. |
+| `PREDEV_HANDOFF` | `1` turns on handoffs and the guard that goes with them (see Safety). Off by default. |
 | `CHROME_MCP_USER_DATA_DIR` | Use a different Chrome data folder, for example Chrome Beta or a separate Chrome you started yourself. Each folder gets its own background process. |
 
 State, logs, the stable copy `setup` installs and the key saved by `login` (readable only by you) are kept in `~/.predev/mcp/`.
