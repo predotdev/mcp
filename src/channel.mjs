@@ -505,6 +505,8 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         let m;
         try { m = JSON.parse(event.data); } catch { return; }
         if (m.t === 'req' && Number.isInteger(m.id)) void onRequest(socket, m, port);
+        // Unpaired at pre.dev: the edge says so before it closes; ask pre.dev now.
+        else if (m.t === 'bye') finish('check-now', `bye ${String(m.why || '').slice(0, 40)}`);
       };
       socket.onerror = () => {};
       socket.onclose = event => {
@@ -520,7 +522,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       const next = await connectOnce(port).catch(error => { log('channel', 'error', error.message); return 'retry'; });
       if (!running || next === 'stop') break;
       if (next === 'retry-now') backoff = 1000;
-      const wait = next === 'later' ? 60000 : next === 'check' ? 2000 : backoff;
+      const wait = next === 'later' ? 60000 : next === 'check' ? 2000 : next === 'check-now' ? 0 : backoff;
       backoff = Math.min(backoff * 2, 30000);
       await new Promise(resolve => { wake = resolve; setTimeout(resolve, wait).unref?.(); });
       wake = null;
