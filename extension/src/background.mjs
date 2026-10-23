@@ -12,14 +12,16 @@
 //     handoff made (no scripts there at all; the web tools have no script tool);
 //   - Chrome shows its own "started debugging this browser" bar while a tab is attached, and Cancel on
 //     it pauses pre.dev here at once;
-//   - Pause, Stop this run and Unpair in the popup take effect at once;
+//   - Pause, Stop this run (for the rest of that turn) and Unpair in the popup take effect at once;
+//   - "Finish on my computer": a Browser Agents task handed to this Chrome goes on here, carried on by pre.dev's
+//     cloud run with the same rules, in the tab opened for it (web_rules.mjs createTaskCalls);
 //   - it never reads cookies, storage or passwords, and asks for no permission that could.
 
 import { CONFIG } from './config.mjs';
 import { CONTEXT, createDebuggerChrome } from './cdp.mjs';
 import { createTools } from './lib/tools.mjs';
 import {
-  ALLOW_WAIT_MS, HANDOFF_TOOL, WEB_TOOLS, allowQuestion, createWebCalls, hostOf, refusedText, runKeyOf, text, webAgent,
+  ALLOW_WAIT_MS, HANDOFF_TOOL, WEB_TOOLS, allowQuestion, cleanTaskId, createTaskCalls, createWebCalls, hostOf, runKeyOf, runTurnOf, taskAgent, text, webAgent,
 } from './lib/web_rules.mjs';
 
 const PING_MS = 15000;
@@ -34,10 +36,9 @@ const IDLE_DETACH_MS = 90000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 const PAUSED_TEXT = "The user paused pre.dev in their Chrome. Don't retry: tell them in one line what you need from their Chrome, and continue with what you have.";
-/** A stopped run stays stopped while it keeps calling; once it has been quiet this long, the next call is a
- *  new run (the same chat's next message) and may use this Chrome again. */
-const STOP_HOLD_MS = 2 * 60000;
-const STOPPED_TEXT = "The user stopped this run in their Chrome. Don't use their Chrome again in this run: tell them in one line what is left, and finish with what you have.";
+/** A stopped run stays stopped for the rest of its turn, however long it waits between calls: pre.dev names the
+ *  turn on every call (the person's latest message in that chat), and only a new message there ends the stop. */
+const STOPPED_TEXT = "The user stopped this run in their Chrome. Don't use their Chrome again for the rest of this turn (until they send a new message): tell them in one line what is left, and finish with what you have.";
 const BLOCKED_TEXT = "This Chrome's settings (set by the user's company) turn off developer tools, which pre.dev needs to work in it. Don't retry here: tell the user in one line, and continue with what you have.";
 
 // ---------------------------------------------------------------- state
@@ -128,6 +129,10 @@ const REFUSED_AS = {
   secret: 'Never types passwords, codes or cards',
   scope: 'Not one of its tabs',
   passkey: 'Left the passkey to you',
+  chrome_dialog: "Chrome's own dialog is over the tab",
+  user_control: 'You were using the tab',
+  tab_closed: 'Its tab was closed',
+  taken_over: 'Not handed here any more',
 };
 function outcomeOf(result) {
   if (!result?.isError) return { ok: true, text: 'done' };
@@ -137,6 +142,7 @@ function outcomeOf(result) {
   if (all.includes(BLOCKED_TEXT)) return { ok: false, kind: 'blocked', text: 'Refused: developer tools are off' };
   if (all.includes(PAUSED_TEXT)) return { ok: false, kind: 'ended', text: 'Refused: paused' };
   if (all.includes(STOPPED_TEXT)) return { ok: false, kind: 'ended', text: 'Refused: you stopped this run' };
+  if (kind === 'not_allowed' && result.refusal?.answer === 'none') return { ok: false, kind, text: `No answer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes` };
   return { ok: false, kind: kind || 'error', text: REFUSED_AS[kind] || all.split('\n')[0].slice(0, 160) };
 }
 
@@ -319,7 +325,9 @@ async function siteFor(host) {
 }
 
 /** Ask the person at this Chrome to allow a site: the extension's own page, which no run can reach
- *  (no run attaches to an extension page or opens one). true once allowed. */
+ *  (no run attaches to an extension page or opens one). true once allowed, false when they said no,
+ *  'no_answer' when nobody answered in time (the question closes; the next call asks again), 'off' when
+ *  the site is unticked here. */
 async function askToAllow(site) {
   await sites();
   if (isAllowedNow(site)) return true;
@@ -354,8 +362,9 @@ async function askToAllow(site) {
   if (answer === null && !entry.decided) {
     entry.decided = 'timeout';
     closeQuestion(entry, 0);
+    await note({ kind: 'control', text: `No answer about ${site} in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: the question closed` });
   }
-  return answer === true;
+  return answer === true ? true : answer === null ? 'no_answer' : false;
 }
 
 function closeQuestion(entry, delay) {
@@ -410,11 +419,12 @@ async function loadPairing() {
   return pairingCache;
 }
 
-async function touchRun(runKey, name, args) {
+async function touchRun(runKey, name, args, turn = '') {
   const runs = await session.get('runs', {});
   const r = runs[runKey] || { first: Date.now(), calls: 0, hosts: [] };
   r.last = Date.now();
   r.calls++;
+  if (turn) r.turn = turn;
   const host = (name === 'chrome_open' || name === 'chrome_navigate') ? hostOf(/^[a-z][a-z0-9+.-]*:/i.test(String(args?.url || '')) ? args.url : `https://${args?.url || ''}`) : '';
   if (host && !r.hosts.includes(host)) r.hosts = [...r.hosts, host].slice(-6);
   runs[runKey] = r;
@@ -426,15 +436,16 @@ async function touchRun(runKey, name, args) {
 async function webCall(body) {
   const name = String(body?.name || '');
   const runKey = runKeyOf(body);
+  const turn = runTurnOf(body);
   const args = body?.args && typeof body.args === 'object' ? body.args : {};
-  const early = paused ? PAUSED_TEXT : devtoolsBlocked ? BLOCKED_TEXT : (await stillStopped(runKey)) ? STOPPED_TEXT : '';
+  const early = paused ? PAUSED_TEXT : devtoolsBlocked ? BLOCKED_TEXT : (await stillStopped(runKey, turn)) ? STOPPED_TEXT : '';
   if (early) {
     await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: early === PAUSED_TEXT ? 'Refused: paused' : early === STOPPED_TEXT ? 'Refused: you stopped this run' : 'Refused: developer tools are off', ms: 0 });
     return text(early);
   }
   await sites();
   await loadPairing();
-  if (runKey) await touchRun(runKey, name, args);
+  if (runKey) await touchRun(runKey, name, args, turn);
   const controller = new AbortController();
   const call = { runKey, controller, why: '' };
   inflight.add(call);
@@ -468,7 +479,8 @@ async function endCalls(why, runKey = null) {
   }
   const H = conn.__predevHandoff;
   if (runKey) {
-    for (const targetId of H?.owned?.get(webAgent(runKey)) || []) await conn.detach(targetId);
+    const agent = runKey.startsWith('task:') ? taskAgent(runKey.slice(5)) : webAgent(runKey);
+    for (const targetId of H?.owned?.get(agent) || []) await conn.detach(targetId);
   } else {
     await conn.detachAll();
   }
@@ -485,30 +497,154 @@ async function setPaused(on) {
   ui();
 }
 
-/** The person stopped this run here and it is still going (a call within STOP_HOLD_MS of the last one). */
-async function stillStopped(runKey) {
+/** The person stopped this run here, for the rest of its turn: every call of that turn is refused, however long
+ *  the run waits between calls. A call from a later turn (the person sent a new message in that chat) ends the
+ *  stop; a run in another chat is another run key, never blocked by it. With no turn named (an older pre.dev),
+ *  the stop holds until this Chrome restarts. */
+async function stillStopped(runKey, turn) {
   if (!runKey) return false;
   const stopped = await session.get('stopped', {});
   const stop = stopped[runKey];
   if (!stop) return false;
-  if (Date.now() - stop.last > STOP_HOLD_MS) {
+  if (turn && stop.turn && turn !== stop.turn) {
     delete stopped[runKey];
     await session.set('stopped', stopped);
+    await note({ kind: 'control', run: runKey, text: 'A new message in that chat: its run may use this Chrome again' });
+    ui();
     return false;
   }
-  stopped[runKey] = { ...stop, last: Date.now() };
-  await session.set('stopped', stopped);
+  // Stopped before the run named its turn: this call's turn is the one stopped.
+  if (turn && !stop.turn) { stopped[runKey] = { ...stop, turn }; await session.set('stopped', stopped); }
   return true;
 }
 
 async function stopRun(runKey) {
   runKey = String(runKey || '');
   if (!runKey) return;
+  if (runKey.startsWith('task:')) return stopTask(runKey.slice(5));
+  const runs = await session.get('runs', {});
   const stopped = await session.get('stopped', {});
-  stopped[runKey] = { at: Date.now(), last: Date.now() };
+  stopped[runKey] = { at: Date.now(), turn: runs[runKey]?.turn || '' };
   await session.set('stopped', stopped);
   await endCalls(STOPPED_TEXT, runKey);
-  await note({ kind: 'control', run: runKey, text: 'Stopped this run in this Chrome' });
+  await note({ kind: 'control', run: runKey, text: 'Stopped this run in this Chrome for the rest of its turn' });
+  ui();
+}
+
+// ---------------------------------------------------------------- Finish on my computer
+
+/** The tasks handed to this Chrome: only id, site, tab and who drives, for this browser session (never the
+ *  task's instruction or progress, and nothing is written to disk). */
+const handedTasks = {
+  list: () => session.get('tasks', []),
+  save: list => session.set('tasks', list),
+};
+const taskInflight = new Map();
+const taskCalls = createTaskCalls({
+  callTool,
+  ctx: () => ({ apiKey: pairingKey, apiUrl: apiBase(pairingCache) }),
+  tabInfo: tab => conn.tabInfo(tab),
+  isPrivate: targetId => !!targetId && conn.__predevPrivate.has(targetId),
+  siteFor,
+  isAllowed: isAllowedNow,
+  askToAllow,
+  webCalls,
+  tasks: handedTasks,
+  defaultProfile: () => PROFILE.dir,
+  owned: agent => {
+    const H = conn.__predevHandoff;
+    if (!H?.owned) return null;
+    if (!H.owned.has(agent)) H.owned.set(agent, new Set());
+    return H.owned.get(agent);
+  },
+  approved: conn.__predevApproved || (conn.__predevApproved = new Map()),
+  inflight: taskInflight,
+  refresh: () => conn.refresh(),
+  log: line => log(line),
+  cloudOnly: true,
+});
+
+/** Paused, blocked or stopped here: pre.dev's cloud run of a handed task finds this Chrome unavailable (it waits a
+ *  moment, then stops with its progress saved, unbilled). */
+async function taskUnavailable(taskId) {
+  if (paused) return PAUSED_TEXT;
+  if (devtoolsBlocked) return BLOCKED_TEXT;
+  const stopped = await session.get('stopped', {});
+  return stopped[`task:${taskId}`] ? STOPPED_TEXT : '';
+}
+
+/** A task handed here: the person sees it in the popup's runs and log. */
+async function takeTaskHere(body) {
+  const taskId = cleanTaskId(body?.taskId);
+  const why = await taskUnavailable(taskId);
+  if (why) return { accepted: false, error: why === PAUSED_TEXT ? 'the person paused pre.dev in this Chrome' : why === BLOCKED_TEXT ? "this Chrome's settings turn off developer tools" : 'the person stopped this task in this Chrome' };
+  await sites();
+  await loadPairing();
+  const out = await taskCalls.takeTask(body);
+  if (out.accepted) {
+    const stopped = await session.get('stopped', {});
+    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await session.set('stopped', stopped); }
+    await touchRun(`task:${taskId}`, 'chrome_open', { url: body?.checkpoint?.url });
+  }
+  await note({ kind: 'control', run: `task:${taskId}`, text: out.accepted ? `A Browser Agents task was handed to this Chrome (${hostOf(String(body?.checkpoint?.url || '')) || 'its page'})` : `A handed task was not taken: ${out.error}` });
+  ui();
+  return out;
+}
+
+/** One call from pre.dev's cloud run of a task handed here: logged like a web run's, and ended by Pause, Stop or Unpair. */
+async function taskCallHere(body) {
+  const name = String(body?.name || '');
+  const taskId = cleanTaskId(body?.taskId);
+  const runKey = `task:${taskId}`;
+  const args = body?.args && typeof body.args === 'object' ? body.args : {};
+  const why = taskId && name !== 'ping' ? await taskUnavailable(taskId) : '';
+  if (why) {
+    await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: why === PAUSED_TEXT ? 'Refused: paused' : why === STOPPED_TEXT ? 'Refused: you stopped this task' : 'Refused: developer tools are off', ms: 0 });
+    return { unavailable: why };
+  }
+  if (body?.__checkOnly) return {};
+  if (name === 'ping') return { result: await taskCalls.taskCall(body) };
+  await sites();
+  await loadPairing();
+  await touchRun(runKey, name, args);
+  const controller = new AbortController();
+  const call = { runKey, controller, why: '' };
+  inflight.add(call);
+  ui();
+  const started = Date.now();
+  let result;
+  try {
+    const ended = new Promise(resolve => controller.signal.addEventListener('abort', () => resolve({ unavailable: call.why || STOPPED_TEXT }), { once: true }));
+    result = await Promise.race([
+      taskCalls.taskCall(body).then(r => ({ result: r }), error => ({ result: { ...text(`Error: ${error.message}`), ...(error.refusal ? { refusal: error.refusal } : {}) } })),
+      ended,
+    ]);
+  } finally {
+    inflight.delete(call);
+    ui();
+  }
+  const o = result.unavailable ? { ok: false, kind: 'ended', text: 'Ended here' } : outcomeOf(result.result);
+  await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: o.ok, outcome: o.kind || 'ok', text: o.text, ms: Date.now() - started });
+  log('task call', name, result.unavailable ? 'ended' : result.result?.refusal ? `refused (${result.result.refusal.kind})` : result.result?.isError ? 'failed' : 'ok', `${Date.now() - started}ms`);
+  return result;
+}
+
+/** pre.dev: the cloud run of a handed task ended. */
+async function taskDriverHere(body) {
+  const out = await taskCalls.taskDriver(body);
+  if (out.removed) { await note({ kind: 'control', run: `task:${cleanTaskId(body?.taskId)}`, text: 'The handed task ended here' }); ui(); }
+  return out;
+}
+
+/** Stop this task here: its cloud run finds this Chrome unavailable (it stops with its progress saved). */
+async function stopTask(taskId) {
+  taskId = cleanTaskId(taskId);
+  if (!taskId) return;
+  const stopped = await session.get('stopped', {});
+  stopped[`task:${taskId}`] = { at: Date.now() };
+  await session.set('stopped', stopped);
+  await endCalls(STOPPED_TEXT, `task:${taskId}`);
+  await note({ kind: 'control', run: `task:${taskId}`, text: 'Stopped this task in this Chrome' });
   ui();
 }
 
@@ -544,10 +680,16 @@ async function onRequest(socket, m) {
   try { body = m.body ? JSON.parse(fromBase64(m.body)) : null; } catch {}
   const route = `${m.method} ${String(m.path || '').split('?')[0]}`;
   try {
+    // A handed task's call while this Chrome is paused, blocked or stopped for it: unavailable (503), so pre.dev's
+    // cloud run waits a moment and then stops with its progress saved.
+    if (route === 'POST /tasks/call' && String(body?.name || '') !== 'ping') {
+      const out = await taskCallHere({ ...body, __checkOnly: true });
+      if (out.unavailable) { head(503); end({ error: out.unavailable, unavailable: true }); return; }
+    }
     head(200);
     await loadPairing();
     if (route === 'GET /state') {
-      end({ ok: true, chrome: !paused && !devtoolsBlocked, version: CONFIG.version, client: 'chrome-extension', profiles: [{ dir: PROFILE.dir, name: PROFILE.name, lastUsed: true }] });
+      end({ ok: true, chrome: !paused && !devtoolsBlocked, version: CONFIG.version, client: 'chrome-extension', ...(paused ? { paused: true } : {}), ...(devtoolsBlocked ? { blocked: true } : {}), profiles: [{ dir: PROFILE.dir, name: PROFILE.name, lastUsed: true }] });
     } else if (route === 'GET /tools') {
       end(webTools());
     } else if (route === 'POST /sites/revoke') {
@@ -561,12 +703,13 @@ async function onRequest(socket, m) {
     } else if (route === 'POST /call') {
       end({ result: await webCall(body) });
     } else if (route === 'POST /tasks/continue') {
-      // "Finish on my computer" needs the pre.dev MCP on this computer (its agents take the task over).
-      end({ accepted: false, error: 'this Chrome is paired through the pre.dev extension, which does not take handed tasks; pair the pre.dev MCP on this computer for that' });
+      end(await takeTaskHere(body));
     } else if (route === 'POST /tasks/call') {
-      end({ result: refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' }) });
+      const out = await taskCallHere(body);
+      // Ended while it ran (Pause, Stop, Unpair): the next call finds this Chrome unavailable.
+      end({ result: out.unavailable ? text(out.unavailable) : out.result });
     } else if (route === 'POST /tasks/driver') {
-      end({ ok: true, known: false });
+      end(await taskDriverHere(body));
     } else {
       end({ error: 'not found' });
     }

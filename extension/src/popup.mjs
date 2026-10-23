@@ -27,8 +27,12 @@ function el(tag, attrs = {}, ...children) {
 const timeOf = at => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const runName = key => {
   const parts = String(key || '').split(':');
+  if (parts[0] === 'task') return `Browser Agents task ${String(parts[1] || '').slice(-6)}`;
   return parts.length >= 2 ? `Web run in project ${parts[1].slice(0, 6)}` : 'Web run';
 };
+const stoppedNote = key => (String(key).startsWith('task:')
+  ? 'Stopped here: pre.dev keeps its progress.'
+  : "Stopped for the rest of this turn: it can use this Chrome again when you send a new message in that chat.");
 
 function render() {
   const paired = !!view.account || ['online', 'connecting', 'offline', 'signed_out', 'unavailable'].includes(view.status);
@@ -52,9 +56,11 @@ function render() {
   $('pauseNote').textContent = view.paused ? 'Web runs cannot use this Chrome until you resume.' : '';
 
   const runs = $('runs');
-  runs.replaceChildren(...(view.runs || []).filter(r => !r.stopped && Date.now() - r.last < 30 * 60000).slice(0, 3).map(r => el('div', { class: 'run' },
-    el('div', { class: 'what' }, el('b', {}, runName(r.key)), el('br'), el('span', { class: 'dim small' }, `${r.active ? 'Working now' : `Last step ${timeOf(r.last)}`}${r.hosts?.length ? ` on ${r.hosts.join(', ')}` : ''}`)),
-    el('button', { onclick: () => send({ type: 'stopRun', runKey: r.key }) }, 'Stop this run'),
+  runs.replaceChildren(...(view.runs || []).filter(r => Date.now() - r.last < 30 * 60000).slice(0, 3).map(r => el('div', { class: 'run' },
+    el('div', { class: 'what' }, el('b', {}, runName(r.key)), el('br'), el('span', { class: 'dim small' }, r.stopped
+      ? stoppedNote(r.key)
+      : `${r.active ? 'Working now' : `Last step ${timeOf(r.last)}`}${r.hosts?.length ? ` on ${r.hosts.join(', ')}` : ''}`)),
+    ...(r.stopped ? [] : [el('button', { onclick: () => send({ type: 'stopRun', runKey: r.key }) }, String(r.key).startsWith('task:') ? 'Stop this task' : 'Stop this run')]),
   )));
 
   const names = Object.keys(sites).sort();

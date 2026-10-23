@@ -55,6 +55,8 @@ export function callArgs(body) {
 
 /** The run a web call names (its tabs are its own), or ''. */
 export const runKeyOf = body => String(body?.run?.key || '').replace(/[^A-Za-z0-9:_-]/g, '').slice(0, 100);
+/** The turn of that run a call belongs to (pre.dev names it: the person's latest message in that chat), or ''. */
+export const runTurnOf = body => String(body?.run?.turn || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
 /** The guard's scope for a web run: `web:<run>`. */
 export const webAgent = runKey => (runKey.startsWith('web:') ? runKey : `web:${runKey}`);
 /** How long one call may take: what pre.dev asked, within 5 s and 11 minutes. */
@@ -145,4 +147,155 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
   }
 
   return { webCall, sitesAllowed, movedTo };
+}
+
+/** A handed task's id as pre.dev sends it. */
+export const cleanTaskId = v => String(v || '').replace(/[^a-f0-9]/gi, '').slice(0, 40);
+/** A handed task's own guard scope: its tabs are its own. */
+export const taskAgent = taskId => `handed:${taskId}`;
+
+/**
+ * "Finish on my computer" for every client of the computer channel: a cloud Browser Agents task handed
+ * to this computer, which pre.dev's cloud run carries on in this Chrome with this computer's rules.
+ * On top of createWebCalls' parts, each client passes in:
+ *   webCalls                 its createWebCalls(...) (sitesAllowed, movedTo)
+ *   tasks                    { list(), save(list) }: where it keeps the handed tasks (no cookie or storage in them)
+ *   defaultProfile()         the Chrome profile a task's tab opens in
+ *   owned(agent)             the guard's set of tabs an agent opened (tools.mjs)
+ *   approved, inflight       the guard's one-approved-control map, and calls in flight per task
+ *   refresh()                makes the tab list current before a kept tab is looked up
+ *   log(text)
+ *   cloudOnly                true when nothing on this computer can take a task over (the extension): it keeps
+ *                            only the task's id, site and tab, never its instruction or progress
+ */
+export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, cloudOnly = false }) {
+  const handedTask = async taskId => (await tasks.list()).find(t => t.taskId === taskId) || null;
+
+  /** One call from pre.dev's cloud run of a task handed here. It drives only the tabs it opened for that task
+   *  (the one opened at hand-off, and its popups), with this computer's rules, and only while no agent here took
+   *  the task over. */
+  async function taskCall(body) {
+    const taskId = cleanTaskId(body?.taskId);
+    const name = String(body?.name || '');
+    const t = taskId ? await handedTask(taskId) : null;
+    if (!t) return refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
+    if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
+    if (name === 'ping') return text('ok', false);
+    const agent = taskAgent(taskId);
+    const args = callArgs(body);
+    args.__agent = agent;
+    args.__predev_handoff = true;
+    args.__via = 'web';
+    // Of chrome_handoff, a handed task's run may: take the tab back after the user had it (a card's Done); hand the
+    // user a sign-in step in its own tab without waiting (a passkey: the browser and Touch ID do it, nothing is typed),
+    // with a done check from the URL or the page's structure; and run that check. Never a wait, a release of another
+    // agent's tab, or any other reason.
+    let handoffArgs = null;
+    if (name === HANDOFF_TOOL) {
+      const base = { tab: args.tab, __agent: agent, __predev_handoff: true, __via: 'web' };
+      const kinds = ['url_changes', 'url_leaves', 'element_gone', 'element_present'];
+      const done = args.done && typeof args.done === 'object' && kinds.includes(args.done.kind)
+        ? { kind: args.done.kind, ...(typeof args.done.value === 'string' ? { value: args.done.value.slice(0, 300) } : {}) } : { kind: 'url_changes' };
+      if (!args.tab) return text('A call for this task must name its tab.');
+      if (args.reason === 'user_control' && args.resume === true) handoffArgs = { ...base, reason: 'user_control', resume: true };
+      else if (args.check === true) handoffArgs = { ...base, check: true };
+      else if ((args.reason === 'login_required' || args.reason === 'step_up') && args.wait === false) handoffArgs = { ...base, reason: args.reason, wait: false, done };
+      else return text('Only the hand-back of the tab, a sign-in step handed to the user in it, and its check are available to this run.');
+    } else if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
+    if (args.tab) {
+      const info = tabInfo(args.tab);
+      if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
+      if (isPrivate(info.targetId)) return refusedText(PRIVATE_TAB, { kind: 'scope' });
+      // The tab opened for this task stays this run's, also after this client restarted (the list says so).
+      if (t.tab && info.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) owned(agent)?.add(info.targetId);
+    } else if (name !== 'chrome_open') return text('A call for this task must name its tab.');
+    if (handoffArgs) return callTool(HANDOFF_TOOL, handoffArgs, ctx());
+    if (name === 'chrome_open' && !args.profile) args.profile = defaultProfile();
+    const blocked = await webCalls.sitesAllowed(name, args, body);
+    if (blocked) return blocked;
+    // An approval the person gave on pre.dev's card, for exactly one control (pre.dev checked the card).
+    const ok = body?.approved && typeof body.approved === 'object' && typeof body.approved.desc === 'string' && typeof body.approved.page === 'string'
+      ? { desc: body.approved.desc.slice(0, 500), page: body.approved.page.slice(0, 2000), at: Date.now() } : null;
+    if (ok) approved.set(agent, ok);
+    inflight.set(taskId, (inflight.get(taskId) || 0) + 1);
+    let result;
+    try {
+      // Taken over while this call waited (a new site's question): it does not run.
+      if ((await handedTask(taskId))?.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
+      result = await callTool(name, args, { ...ctx(), signal: AbortSignal.timeout(callTimeout(body)) });
+    } catch (error) {
+      return { ...text(`Error: ${error.message}`), ...(error.refusal ? { refusal: error.refusal } : {}) };
+    } finally {
+      inflight.set(taskId, Math.max(0, (inflight.get(taskId) || 1) - 1));
+      if (ok && approved.get(agent) === ok) approved.delete(agent);
+    }
+    return (await webCalls.movedTo(name, args, result)) || result;
+  }
+
+  /** pre.dev: the cloud run of a handed task ended (or never started): it comes off the list, or waits for an agent here. */
+  async function taskDriver(body) {
+    const taskId = cleanTaskId(body?.taskId);
+    const list = await tasks.list();
+    const t = list.find(x => x.taskId === taskId);
+    if (!t) return { ok: true, known: false };
+    if (body?.finished === true && t.driver === 'cloud') {
+      await tasks.save(list.filter(x => x.taskId !== taskId));
+      log(`task ${taskId} finished by pre.dev's cloud run`);
+      return { ok: true, removed: true };
+    }
+    if (body?.driver === 'local' && t.driver === 'cloud') {
+      // Nothing here takes a task over (the extension): it comes off the list instead.
+      if (cloudOnly) { await tasks.save(list.filter(x => x.taskId !== taskId)); log(`task ${taskId} ended here`); return { ok: true, removed: true }; }
+      t.driver = 'local';
+      await tasks.save(list);
+      log(`task ${taskId} waits for an agent on this computer`);
+    }
+    return { ok: true, driver: t.driver || 'local' };
+  }
+
+  /** A cloud Browser Agents task handed here: keep it (an agent on this computer may take it over, where there is
+   *  one), and open the page it stopped on in this Chrome, once the person here allows that site. Nothing in it is
+   *  a cookie or storage. */
+  async function takeTask(body) {
+    const taskId = cleanTaskId(body?.taskId);
+    const checkpoint = body?.checkpoint || {};
+    const url = String(checkpoint.url || '');
+    const host = hostOf(url);
+    if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
+    if (cloudOnly && body?.runner !== 'cloud') return { accepted: false, error: "this Chrome has no agent of its own to take a task over; only pre.dev's cloud run can carry a task on here" };
+    const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
+    const ok = isAllowed(site) || await askToAllow(site);
+    if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
+    if (ok === 'off') return { accepted: false, error: `the person at this computer turned ${site} off for pre.dev runs` };
+    if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
+    const before = await tasks.list();
+    const prior = before.find(t => t.taskId === taskId);
+    const rest = before.filter(t => t.taskId !== taskId);
+    let tab = '';
+    // Handed here again (the computer was away, and the user chose it once more): the tab it had, if still open.
+    if (prior?.tab) await refresh().catch(() => {});
+    const kept = prior?.tab ? tabInfo(prior.tab) : null;
+    if (kept && !isPrivate(kept.targetId)) tab = prior.tab;
+    if (!tab) try {
+      const opened = await callTool('chrome_open', { profile: defaultProfile(), url, foreground: false, __agent: taskAgent(taskId), __predev_handoff: true, __via: 'web' },
+        { ...ctx(), signal: AbortSignal.timeout(60000) });
+      tab = tabInResult(opened);
+    } catch (error) { log(`handed task open failed: ${error.message}`); }
+    rest.push({
+      taskId, batchId: String(body?.batchId || ''), site, tab, at: new Date().toISOString(),
+      // 'cloud': pre.dev's cloud carries it on in that tab by itself; else it waits for an agent here.
+      driver: body?.runner === 'cloud' ? 'cloud' : 'local',
+      // What an agent here needs to take it over (chrome_handed_off): only where one can.
+      ...(cloudOnly ? {} : {
+        instruction: String(body?.instruction || '').slice(0, 20000),
+        checkpoint: { url, step: Number(checkpoint.step) || 0, reason: String(checkpoint.reason || ''), memory: String(checkpoint.memory || '').slice(0, 8000),
+          history: (Array.isArray(checkpoint.history) ? checkpoint.history : []).slice(-60) },
+      }),
+    });
+    await tasks.save(rest.slice(-20));
+    log(`task ${taskId} handed to this computer (${site}${body?.runner === 'cloud' ? ', carried on by pre.dev' : ''})`);
+    return { accepted: true, ...(tab ? { tab } : {}) };
+  }
+
+  return { takeTask, taskCall, taskDriver, handedTask };
 }
