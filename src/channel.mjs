@@ -481,6 +481,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     const tasks = before.filter(t => t.taskId !== taskId);
     let tab = '';
     // Handed here again (the computer was away, and the user chose it once more): the tab it had, if still open.
+    if (prior?.tab) await chrome.connect().catch(() => {});
     const kept = prior?.tab ? tabInfo(prior.tab) : null;
     if (kept && !privateTabs.has(kept.targetId)) tab = prior.tab;
     if (!tab) try {
