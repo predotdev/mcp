@@ -35,6 +35,8 @@ export const text = (t, isError = true) => ({ content: [{ type: 'text', text: t 
 /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
 export const refusedText = (t, refusal) => ({ ...text(t), refusal });
 export const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
+/** A site the person turned off here (the extension's list of allowed sites): no question, a plain no. */
+export const turnedOff = site => text(`The user turned ${site} off for web runs in their Chrome, so this run can't use it there. Don't retry or ask them to allow it: tell them in one line what you need from ${site} (they can tick it again from the pre.dev button in their Chrome's toolbar), and continue with what you have.`);
 export const PRIVATE_TAB = "That tab is pre.dev's own question to the user; no run can use it.";
 
 /** A call's arguments without pre.dev's own `__` flags (the computer sets those), except the
@@ -80,7 +82,8 @@ export const plainLine = parts => parts.map(p => (typeof p === 'string' ? p : p.
  *   isPrivate(targetId)        pre.dev's own question tab
  *   siteFor(host)              the registrable domain pre.dev computes for a host
  *   isAllowed(site)            the person allowed it here
- *   askToAllow(site)           ask the person here; true once allowed
+ *   askToAllow(site)           ask the person here; true once allowed, 'off' when the person turned that
+ *                              site off here (then there is no question)
  */
 export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow }) {
   /** A new site needs a click here first: where the call goes, and where the tab is now. null when allowed. */
@@ -99,6 +102,7 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
     for (const site of wanted) {
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site);
+      if (ok === 'off') return { ...turnedOff(site), refusal: { kind: 'not_allowed', site } };
       if (!ok) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
     }
     return null;
