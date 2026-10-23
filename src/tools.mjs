@@ -1084,9 +1084,10 @@ async function clickInner(session, x, y, count) {
 }
 
 // The page's address and an id for its document, taken before an action so settle can tell whether
-// the action loaded a new page.
-function docState(session) {
-  return evaluate(session, '[location.href, window.__agentDoc || (window.__agentDoc = Math.random().toString(36).slice(2))]', 5000).catch(() => [null, null]);
+// the action loaded a new page. When the page doesn't answer in time (a dialog, a busy page), the
+// address is `fallbackUrl`, the tab's last known one, so the guard's site checks still apply.
+function docState(session, fallbackUrl = null) {
+  return evaluate(session, '[location.href, window.__agentDoc || (window.__agentDoc = Math.random().toString(36).slice(2))]', 5000).catch(() => [fallbackUrl, null]);
 }
 
 // Waits for whatever an action set off, without assuming it did anything. A new page gets the full
@@ -1408,7 +1409,7 @@ const TOOLS = [
     async run(args, ctx = {}) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);
-      const before = await docState(session);
+      const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
       if (handoffOn(args) && x !== undefined && y !== undefined && keepsSignIn(args, before[0])) {
@@ -1458,7 +1459,7 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       const q = target(args.ref || args.selector ? args : { ...args, text: undefined });
       if (q === '{}') throw new Error('Pass ref (from chrome_snapshot) or selector for the field.');
-      const before = await docState(session);
+      const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
         if (secret) throw secret;
@@ -1525,7 +1526,7 @@ const TOOLS = [
     async run({ tab, keys, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      const before = await docState(session);
+      const before = await docState(session, info.url);
       if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
         // Enter (or Space) on a focused link or button activates it, like a click.
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
@@ -1694,7 +1695,7 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       let expression = js;
       if (handoffOn(rest)) {
-        const [href] = await docState(session);
+        const [href] = await docState(session, info.url);
         // Where a handoff signed the user in (rule 3), no script runs. Not a read-only run under V8's
         // side-effect check: that check lets a script keep a change on an object Chrome builds on first
         // use (navigator.credentials, navigator.clipboard, an element's own wrapper), and it would stay
