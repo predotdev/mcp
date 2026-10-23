@@ -1072,7 +1072,7 @@ async function inputBlocked(session, seen0, before, framed) {
 const CHROME_DIALOG = 'chrome_dialog';
 // A handoff that ends once input reaches the page again (the user closed Chrome's dialog).
 const waitsForInput = (reason, done) => reason === CHROME_DIALOG || done?.kind === 'input_reaches';
-const DIALOG_REFUSAL = `Chrome's own dialog is open over this tab, most likely its password warning ("Change your password"), so clicks and typing don't reach the page (this call's didn't either). Don't retry, and don't open another tab for it: hand this step to the user: call chrome_handoff with this tab and reason "${CHROME_DIALOG}". They close Chrome's dialog, and it returns once input reaches the page again.`;
+const dialogRefusal = (args, what = "this call's didn't either") => `Chrome's own dialog is open over this tab, most likely its password warning ("Change your password"), so clicks and typing don't reach the page (${what}). Don't retry, and don't open another tab for it: hand this step to the user, who closes Chrome's dialog: ${handTo(args, CHROME_DIALOG)}.`;
 
 // Waits for whatever an action set off, without assuming it did anything. A new page gets the full
 // load wait; on the same page, scripts get up to 2 s to finish showing the change (it returns as soon
@@ -1420,7 +1420,7 @@ const TOOLS = [
       }
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
       await click(session, x, y, args.double ? 2 : 1);
-      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(DIALOG_REFUSAL);
+      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(dialogRefusal(args));
       await settle(session, before);
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1468,11 +1468,11 @@ const TOOLS = [
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL);
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args));
       if (args.submit) {
         const seen1 = handoffOn(args) ? await seenCount(session) : null;
         await pressKeys(session, 'Enter');
-        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL.replace("(this call's didn't either)", "(the text went in, but this call's Enter didn't)"));
+        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args, "the text went in, but this call's Enter didn't"));
         await settle(session, before);
       }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
@@ -1530,7 +1530,7 @@ const TOOLS = [
       }
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       await pressKeys(session, keys);
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL);
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(rest));
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
