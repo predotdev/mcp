@@ -13,7 +13,10 @@ const { chrome, contextDirs, failedProbes, triedDirs, saveProfileMap, log, sleep
 const CHROME_DIR = core.chromeDir;
 
 
+// The Chrome profiles this Chrome has. A client that reaches Chrome another way (the pre.dev Chrome
+// extension, which lives in one profile) says so through core.chromeProfiles.
 function chromeProfiles() {
+  if (core.chromeProfiles) return core.chromeProfiles();
   const state = JSON.parse(fs.readFileSync(path.join(CHROME_DIR, 'Local State'), 'utf8'));
   const open = new Set(state.profile?.last_active_profiles || []);
   return Object.entries(state.profile?.info_cache || {}).map(([dir, info]) => ({
@@ -1227,8 +1230,10 @@ function doneExpression(done, startUrl) {
 
 // macOS: is this Chrome the app in front? Then the handoff tab can come forward without taking
 // the keyboard from whatever the user is typing in (the notification comes first).
+// The extension knows from Chrome itself (core.chromeInFront).
 let browserPid = 0;
 async function chromeInFront() {
+  if (core.chromeInFront) return core.chromeInFront();
   if (process.platform !== 'darwin') return true;
   try {
     if (!browserPid) {
