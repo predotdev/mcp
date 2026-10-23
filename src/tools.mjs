@@ -720,6 +720,12 @@ function fieldFacts(q) {
   if (f.error) return f;
   return factsOf(f.el.__agentInput || f.el);
 }
+function factsAt(x, y) {
+  let el = document.elementFromPoint(x, y);
+  while (el && el.shadowRoot) { const inner = el.shadowRoot.elementFromPoint(x, y); if (!inner || inner === el) break; el = inner; }
+  if (!el) return { error: 'nothing at that point' };
+  return factsOf((el.closest && el.closest('a[href],button,input,[role=button],[role=link],[role=menuitem]')) || el);
+}
 function activeFacts() {
   let el = document.activeElement;
   while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
@@ -732,6 +738,7 @@ function factsOf(el) {
     secret: structSecret(el), desc: describe(el), tag: el.tagName.toLowerCase(), type: el.type || '',
     autocomplete: el.getAttribute('autocomplete') || '', inForm: !!form,
     formMethod: form ? String(form.method || '') : '', submitDesc: sub ? describe(sub) : '',
+    href: (el.closest && el.closest('a[href]') || {}).href || '', formAction: form ? String(form.action || '') : '',
     isSubmit: (el.tagName === 'BUTTON' && (!el.getAttribute('type') || el.type === 'submit')) || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')),
   };
 }
@@ -754,7 +761,7 @@ function selectOption(q, text) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
   return { desc: describe(el), chosen: clean(opt.text) };
 }
-window.__agent = { snapshot, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts };
+window.__agent = { snapshot, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts, factsAt };
 })();`;
 // Pages keep the injected helpers; a changed source gets a new version and is re-injected.
 const PAGE_LIB = PAGE_LIB_SOURCE.replaceAll('__LIBVER__', crypto.createHash('sha1').update(PAGE_LIB_SOURCE).digest('hex').slice(0, 12));
@@ -774,8 +781,9 @@ const inPage = (session, call, timeout) => evaluate(session, `${PAGE_LIB}\nwindo
 //   reread: tabs the user just had, which the agent must read before acting again.
 const H = chrome.__predevHandoff || (chrome.__predevHandoff = {
   owned: new Map(), handoff: new Map(), queue: [], active: null, actedAt: new Map(), ackAt: new Map(),
-  reread: new Set(), cancel: new Set(), checks: new Map(), watched: new Set(),
+  reread: new Set(), cancel: new Set(), checks: new Map(), watched: new Set(), signedIn: new Map(),
 });
+H.signedIn ||= new Map();
 // Per call, never from the daemon's own environment: one daemon serves agents with and without it.
 const handoffOn = args => args?.__predev_handoff === true;
 const agentOf = args => String(args?.__agent || 'agent');
@@ -887,6 +895,50 @@ async function approvalRefusal(args, session, desc, facts, url, ctx) {
   if (p < 0.7) return '';
   return `Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"element_gone","value":"<a selector for that control>"} (or url_changes); they review it and click it themselves, and you carry on once it's done.`;
 }
+
+// Rule 3: keep a sign-in a handoff made. Once the user signed in to a site through a handoff, the
+// agent may not sign them out there or open its account security pages, by a click, Enter, an
+// address or a script, unless the user's own message asks for it (pre.dev's agent knows that and
+// sends __predev_signout_ok; any other agent's user does it in the tab themselves).
+const SIGN_IN_REASONS = new Set(['login_required', 'step_up', 'consent', 'captcha']);
+// The site of an address, close to its registrable domain. There is no suffix list here, so it can
+// be wider than the real one (all of github.io, say): wider only keeps more sign-ins.
+function siteKey(href) {
+  let host = '';
+  try { host = new URL(/^[a-z][a-z0-9+.-]*:/i.test(String(href)) ? String(href) : `https://${href}`).hostname.toLowerCase(); } catch { return ''; }
+  if (!host.includes('.') || /^[\d.]+$/.test(host) || host.startsWith('[')) return host;
+  const labels = host.split('.');
+  const n = labels.length > 2 && labels.at(-1).length === 2 && labels.at(-2).length <= 3 ? 3 : 2;
+  return labels.slice(-n).join('.');
+}
+function noteSignedIn(reason, href) {
+  const k = SIGN_IN_REASONS.has(reason) ? siteKey(href) : '';
+  if (k) H.signedIn.set(k, Date.now());
+}
+// The site this call must keep the sign-in on, or ''.
+function keepsSignIn(args, href) {
+  if (!handoffOn(args) || !href || isLocalDev(href)) return '';
+  const k = siteKey(href);
+  if (!k) return '';
+  const named = Array.isArray(args.__predev_signed_in) ? args.__predev_signed_in.map(siteKey) : [];
+  if (!H.signedIn.has(k) && !named.includes(k)) return '';
+  const ok = Array.isArray(args.__predev_signout_ok) ? args.__predev_signout_ok.map(siteKey) : [];
+  return ok.includes(k) ? '' : k;
+}
+const hostOf = href => { try { return new URL(String(href)).hostname; } catch { return String(href || ''); } };
+const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the agent keeps that sign-in for the rest of the run: don't log out, switch accounts or re-trigger the sign-in, carry on signed in. If the task needs it, ask the user; they can do it in the tab themselves.`;
+// The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
+// user out or open account security? No verdict: allowed.
+async function accountRefusal(args, session, action, target, url, ctx) {
+  if (!keepsSignIn(args, url)) return '';
+  const site = hostOf(url);
+  const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
+    `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
+  if (p === null) { log('keep sign-in: no verdict, allowed', target); return ''; }
+  if (p < 0.7) return '';
+  return `Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`;
+}
+const linkTarget = f => (f?.href ? ` (it goes to ${f.href})` : f?.isSubmit && f?.formAction ? ` (it submits to ${f.formAction})` : '');
 
 const KEYS = {
   enter: ['Enter', 'Enter', 13, '\r'], return: ['Enter', 'Enter', 13, '\r'], tab: ['Tab', 'Tab', 9],
@@ -1187,9 +1239,11 @@ const TOOLS = [
         foreground: { type: 'boolean', description: 'Bring the tab to the front. Default false.' },
       },
     },
-    async run({ profile, url, foreground = false, ...rest }) {
+    async run({ profile, url, foreground = false, ...rest }, ctx = {}) {
       const p = resolveProfile(profile);
       const address = normalizeUrl(url);
+      const keep = await accountRefusal(rest, null, 'Opening', address, address, ctx);
+      if (keep) throw new Error(keep);
       await mapContexts();
       const context = [...contextDirs].find(([ctx, dir]) => dir === p.dir && [...chrome.targets.values()].some(t => t.browserContextId === ctx))?.[0];
       // The tab starts blank and then loads the URL, so the wait below is for the page itself: a tab
@@ -1214,9 +1268,18 @@ const TOOLS = [
     name: 'chrome_navigate',
     description: 'Load a URL in an existing tab, or pass "back", "forward" or "reload".',
     inputSchema: { type: 'object', required: ['tab', 'url'], properties: { tab: { type: 'string' }, url: { type: 'string' } } },
-    async run({ tab, url }) {
+    async run({ tab, url, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
+      if (handoffOn(rest) && url !== 'reload') {
+        let dest = url;
+        if (url === 'back' || url === 'forward') {
+          const h = await chrome.send('Page.getNavigationHistory', {}, session).catch(() => null);
+          dest = h?.entries?.[h.currentIndex + (url === 'back' ? -1 : 1)]?.url || '';
+        } else dest = normalizeUrl(url);
+        const keep = dest ? await accountRefusal(rest, session, 'Opening', dest, dest, ctx) : '';
+        if (keep) throw new Error(keep);
+      }
       let loaded;
       if (url === 'reload') {
         const mark = crypto.randomBytes(6).toString('hex');
@@ -1265,11 +1328,21 @@ const TOOLS = [
       const before = await docState(session);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
+      if (handoffOn(args) && x !== undefined && y !== undefined && keepsSignIn(args, before[0])) {
+        // A click by position: the control under that point.
+        const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
+        if (f && !f.error) {
+          const keep = await accountRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], ctx);
+          if (keep) throw new Error(keep);
+        }
+      }
       if (x === undefined || y === undefined) {
         const hit = await inPage(session, `point(${target(args)})`);
         if (hit.error) throw new Error(hit.error);
         if (handoffOn(args)) {
           const facts = await inPage(session, `fieldFacts(${target(args)})`).catch(() => null);
+          const keep = await accountRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(facts && !facts.error ? facts : null)}`, before[0], ctx);
+          if (keep) throw new Error(keep);
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
           if (ask) throw new Error(ask);
         }
@@ -1353,7 +1426,7 @@ const TOOLS = [
       if (!match.ref) throw new Error(`Not sure which element "${description}" means. Likely:\n${match.list || '(none)'}\nPass one of these refs to chrome_click / chrome_type.`);
       if (action === 'find') return `Found [${match.ref}] ${match.desc} (p=${match.p.toFixed(2)})`;
       const tool = TOOLS.find(t => t.name === (action === 'type' ? 'chrome_type' : 'chrome_click'));
-      const result = await tool.run({ tab, ref: match.ref, text, submit, clear, __agent: args.__agent, __predev_handoff: args.__predev_handoff }, ctx);
+      const result = await tool.run({ tab, ref: match.ref, text, submit, clear, __agent: args.__agent, __predev_handoff: args.__predev_handoff, __predev_signed_in: args.__predev_signed_in, __predev_signout_ok: args.__predev_signout_ok }, ctx);
       return `Matched [${match.ref}] ${match.desc} (p=${match.p.toFixed(2)})\n${result}`;
     },
   },
@@ -1365,6 +1438,14 @@ const TOOLS = [
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
       const before = await docState(session);
+      if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
+        // Enter (or Space) on a focused link or button activates it, like a click.
+        const facts = await inPage(session, 'activeFacts()').catch(() => null);
+        if (facts && !facts.error) {
+          const keep = await accountRefusal(rest, session, 'Pressing Enter on', `${facts.desc}${linkTarget(facts)}`, before[0], ctx);
+          if (keep) throw new Error(keep);
+        }
+      }
       if (handoffOn(rest) && /(^|\s|\+)(enter|return)(\s|$)/i.test(String(keys))) {
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
         if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
@@ -1523,6 +1604,23 @@ const TOOLS = [
       let expression = js;
       if (handoffOn(rest)) {
         const [href] = await docState(session);
+        // Where a handoff signed the user in (rule 3), a script may only read: V8's own side-effect
+        // check runs it and refuses anything that would navigate, submit, click, write to the page,
+        // cookies or storage, send a request or start a timer. No reading of the script's text.
+        const site = keepsSignIn(rest, href) ? hostOf(href) : '';
+        if (site) {
+          const r = await chrome.send('Runtime.evaluate', { expression: js, returnByValue: true, awaitPromise: true, throwOnSideEffect: true, timeout: 30000 }, session, 35000);
+          if (r.exceptionDetails) {
+            const d = r.exceptionDetails;
+            const why = (d.exception?.description || d.text || 'Script error').split('\n')[0];
+            if (d.exception?.className === 'EvalError' && /side-effect/i.test(why))
+              throw new Error(`Refused: on this tab scripts may only read the page. This one would change something (navigate, submit or click, write to the page, cookies or storage, send a request, or start a timer). ${KEEP_SIGNIN(site)} Use chrome_click or chrome_type for actions; they check each one.`);
+            throw new Error(why);
+          }
+          const value = r.result?.value;
+          const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
+          return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
+        }
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
@@ -1654,6 +1752,7 @@ const TOOLS = [
         const session = await chrome.session(info.targetId);
         const startUrl = String(args.start_url || H.handoff.get(info.targetId)?.startUrl || info.url);
         const v = await evaluate(session, doneExpression(args.done || H.handoff.get(info.targetId)?.done, startUrl), 5000).catch(() => null);
+        if (v?.ok) noteSignedIn(H.handoff.get(info.targetId)?.reason || reason, v.url || info.url);
         return handoffLines(v?.ok ? 'done' : 'waiting', info, v?.url || info.url);
       }
       if (args.release || args.cancel) {
@@ -1723,6 +1822,7 @@ const TOOLS = [
             if (v) misses = 0;
             if (v?.url) lastUrl = v.url;
             if (v?.ok) {
+              noteSignedIn(reason, v.url || info.url);
               end(info.targetId, 'done');
               await waitForLoad(session, 10000).catch(() => {});
               return `${handoffLines('done', info, v.url)}${await pageLine(info, session)}\nThe user finished. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
