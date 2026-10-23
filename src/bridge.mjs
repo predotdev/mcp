@@ -364,6 +364,10 @@ const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
  *  agent's tabs, no typing into password, code or card fields, ask first before send, post, buy
  *  or delete). Off by default; off, every tool works as before. */
 const HANDOFF = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
+/** PREDEV_MCP_FROM_PREDEV=1: started by pre.dev's own CLI, whose agent knows what its user
+ *  asked for. Only then may a call lift the kept sign-in (__predev_signout_ok); from any other
+ *  agent it is dropped, so a model can't lift it by passing the argument itself. */
+const FROM_PREDEV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_MCP_FROM_PREDEV || '');
 /** Which agent a call comes from, so agents sharing the daemon keep to their own tabs. */
 const AGENT_ID = crypto.randomBytes(6).toString('hex');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
@@ -540,6 +544,7 @@ const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click',
 function withCallFlags(args) {
   const out = { ...(args || {}), __agent: AGENT_ID };
   if (HANDOFF) out.__predev_handoff = true;
+  if (!FROM_PREDEV) delete out.__predev_signout_ok;
   return out;
 }
 
