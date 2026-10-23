@@ -133,6 +133,7 @@ const REFUSED_AS = {
   user_control: 'You were using the tab',
   tab_closed: 'Its tab was closed',
   taken_over: 'Not handed here any more',
+  page_busy: "The page wasn't answering (a dialog on it?)",
 };
 function outcomeOf(result) {
   if (!result?.isError) return { ok: true, text: 'done' };
