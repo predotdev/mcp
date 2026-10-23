@@ -13,7 +13,10 @@
 //     every pre.dev `site`: pre.dev computes it from the host alone, never a URL. The allowed list
 //     is listed and revoked here (`predev-mcp sites`) and on pre.dev, at once;
 //   - "Finish on my computer": a paused cloud Browser Agents task can hand its rest here (the
-//     instruction, the page it stopped on and what it did), for Browser Agents Local in this Chrome;
+//     instruction, the page it stopped on and what it did). pre.dev's cloud then carries it on by
+//     itself in the tab opened for it: its planner stays in the cloud and sends one chrome_* call at a
+//     time (POST /tasks/call), under the same rules plus a screenshot of that tab only. An agent on
+//     this computer may take the task over instead (chrome_handed_off): one of them drives at a time;
 //   - only the tools a web run needs: no scripts (chrome_eval could read a site's cookies or
 //     storage), no file uploads (files on this computer), no screenshots;
 //   - nothing else leaves this computer: no cookies, no storage, no files.
@@ -29,6 +32,11 @@ import path from 'node:path';
 const WEB_TOOLS = new Set(['chrome_profiles', 'chrome_tabs', 'chrome_open', 'chrome_navigate', 'chrome_snapshot', 'chrome_click',
   'chrome_type', 'chrome_act', 'chrome_press', 'chrome_scroll', 'chrome_read', 'chrome_wait', 'chrome_show', 'chrome_close']);
 const HANDOFF_TOOL = 'chrome_handoff';
+/** What pre.dev's cloud run of a handed task may call here ("Finish on my computer"): a web run's tools
+ *  minus the tab list and profile list, plus a screenshot of its own tab (its planner looks at the page).
+ *  Still no scripts and no uploads. */
+const TASK_TOOLS = new Set(['chrome_open', 'chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_press',
+  'chrome_scroll', 'chrome_read', 'chrome_wait', 'chrome_screenshot']);
 /** Tools that can take a tab to another page: the page they end on is checked too. */
 const MOVES = new Set(['chrome_open', 'chrome_navigate', 'chrome_click', 'chrome_act', 'chrome_press', 'chrome_type', 'chrome_handoff']);
 const PING_MS = 15000;
@@ -102,6 +110,9 @@ export function createChannel(ctx) {
   /** One question per site at a time: site -> { nonce, decided, waiters, targetId }. */
   const asking = new Map();
   const byNonce = new Map();
+  /** Cloud runs of handed tasks: calls in flight per task (chrome_handed_off waits for them on a take-over). */
+  const RUNS = chrome.__predevHandedRuns || (chrome.__predevHandedRuns = { inflight: new Map() });
+  const APPROVED = chrome.__predevApproved || (chrome.__predevApproved = new Map());
 
   const readJson = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
   const writePrivate = (file, value) => {
@@ -286,6 +297,8 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
   }
 
   const text = (t, isError = true) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
+  /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
+  const refusedText = (t, refusal) => ({ ...text(t), refusal });
   const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
   /** Nobody answered the question in time (the next call asks again). */
   const noAnswer = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. Don't call it again right away: tell them in one line that their Chrome is waiting for a click to allow ${site}; when they say go ahead, call again and the question comes back. Continue with what you have meanwhile.`);
@@ -308,7 +321,16 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     args.__predev_handoff = true;
     args.__via = 'web';
     if (args.tab && privateTabs.has(tabInfo(args.tab)?.targetId)) return text("That tab is pre.dev's own question to the user; no run can use it.");
-    // A new site needs a click here first: where the call goes, and where the tab is now.
+    const blocked = await sitesAllowed(name, args, body, port, api);
+    if (blocked) return blocked;
+    const timeoutMs = Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
+    const signal = AbortSignal.timeout(timeoutMs);
+    const result = await callTool(name, args, { apiKey: key(), apiUrl: (pairing()?.apiUrl || defaultApiUrl), signal });
+    return (await movedTo(name, args, result)) || result;
+  }
+
+  /** A new site needs a click here first: where the call goes, and where the tab is now. null when allowed. */
+  async function sitesAllowed(name, args, body, port, api) {
     const wanted = [];
     if ((name === 'chrome_open' || name === 'chrome_navigate') && args.url && !['back', 'forward', 'reload'].includes(args.url)) {
       const raw = String(args.url);
@@ -323,23 +345,107 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     for (const site of wanted) {
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site, port, api.chromeInFront);
-      if (ok === 'no_answer') return noAnswer(site);
-      if (ok !== true) return notAllowed(site);
+      if (ok === 'no_answer') return { ...noAnswer(site), refusal: { kind: 'not_allowed', site, answer: 'none' } };
+      if (ok !== true) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
     }
-    const timeoutMs = Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
-    const signal = AbortSignal.timeout(timeoutMs);
-    const result = await callTool(name, args, { apiKey: key(), apiUrl: (pairing()?.apiUrl || defaultApiUrl), signal });
-    // The page a call ended on must be allowed too: else its text never leaves this computer.
-    if (MOVES.has(name) && !result?.isError) {
-      const shown = (result?.content || []).find(c => c.type === 'text')?.text || '';
-      const tab = /^Tab ([0-9A-F]{6,}) ·/m.exec(shown)?.[1] || args.tab;
-      const now = tab ? tabInfo(tab) : null;
-      const site = now ? await siteFor(hostOf(now.url)) : '';
-      if (site && !isAllowed(site)) {
-        return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
+    return null;
+  }
+
+  /** The page a call ended on must be allowed too: else its text never leaves this computer. */
+  async function movedTo(name, args, result) {
+    if (!MOVES.has(name) || result?.isError) return null;
+    const shown = (result?.content || []).find(c => c.type === 'text')?.text || '';
+    const tab = /^Tab ([0-9A-F]{6,}) ·/m.exec(shown)?.[1] || args.tab;
+    const now = tab ? tabInfo(tab) : null;
+    const site = now ? await siteFor(hostOf(now.url)) : '';
+    if (site && !isAllowed(site)) {
+      return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------- a handed task, carried on by pre.dev's cloud
+
+  const handedTasks = () => readJson(TASKS_FILE)?.tasks || [];
+  const handedTask = taskId => handedTasks().find(t => t.taskId === taskId) || null;
+  const cleanTaskId = v => String(v || '').replace(/[^a-f0-9]/gi, '').slice(0, 40);
+
+  /** One call from pre.dev's cloud run of a task handed here. It drives only the tabs it opened for that task
+   *  (the one opened at hand-off, and its popups), with this computer's rules, and only while no agent here took
+   *  the task over. */
+  async function taskCall(body, port, api) {
+    const taskId = cleanTaskId(body?.taskId);
+    const name = String(body?.name || '');
+    const t = taskId ? handedTask(taskId) : null;
+    if (!t) return refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
+    if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
+    if (name === 'ping') return text('ok', false);
+    const agent = `handed:${taskId}`;
+    const args = {};
+    for (const [k, v] of Object.entries(body?.args || {})) if (!k.startsWith('__')) args[k] = v;
+    for (const k of ['__predev_signed_in', '__predev_signout_ok']) {
+      if (Array.isArray(body?.args?.[k])) args[k] = body.args[k].filter(x => typeof x === 'string').slice(0, 50).map(x => x.slice(0, 255));
+    }
+    args.__agent = agent;
+    args.__predev_handoff = true;
+    args.__via = 'web';
+    // The hand-back of the tab after the user had it (a card's Done): nothing else of chrome_handoff.
+    if (name === HANDOFF_TOOL) {
+      if (!args.tab || args.reason !== 'user_control' || args.resume !== true) return text('Only the hand-back of the tab is available to this run.');
+      return callTool(HANDOFF_TOOL, { tab: args.tab, reason: 'user_control', resume: true, __agent: agent, __predev_handoff: true, __via: 'web' }, { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl });
+    }
+    if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
+    if (args.tab) {
+      const info = tabInfo(args.tab);
+      if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
+      if (privateTabs.has(info.targetId)) return refusedText("That tab is pre.dev's own question to the user; no run can use it.", { kind: 'scope' });
+      // The tab opened for this task stays this run's, also after this daemon restarted (the list on disk says so).
+      const H = chrome.__predevHandoff;
+      if (H?.owned && t.tab && info.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) {
+        if (!H.owned.has(agent)) H.owned.set(agent, new Set());
+        H.owned.get(agent).add(info.targetId);
       }
+    } else if (name !== 'chrome_open') return text('A call for this task must name its tab.');
+    if (name === 'chrome_open' && !args.profile) args.profile = profiles().find(p => p.lastUsed)?.dir || profiles()[0]?.dir || 'Default';
+    const blocked = await sitesAllowed(name, args, body, port, api);
+    if (blocked) return blocked;
+    // An approval the person gave on pre.dev's card, for exactly one control (pre.dev checked the card).
+    const approved = body?.approved && typeof body.approved === 'object' && typeof body.approved.desc === 'string' && typeof body.approved.page === 'string'
+      ? { desc: body.approved.desc.slice(0, 500), page: body.approved.page.slice(0, 2000), at: Date.now() } : null;
+    if (approved) APPROVED.set(agent, approved);
+    const timeoutMs = Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
+    RUNS.inflight.set(taskId, (RUNS.inflight.get(taskId) || 0) + 1);
+    let result;
+    try {
+      // Taken over while this call waited (a new site's question): it does not run.
+      if (handedTask(taskId)?.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
+      result = await callTool(name, args, { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      return { ...text(`Error: ${error.message}`), ...(error.refusal ? { refusal: error.refusal } : {}) };
+    } finally {
+      RUNS.inflight.set(taskId, Math.max(0, (RUNS.inflight.get(taskId) || 1) - 1));
+      if (approved && APPROVED.get(agent) === approved) APPROVED.delete(agent);
     }
-    return result;
+    return (await movedTo(name, args, result)) || result;
+  }
+
+  /** pre.dev: the cloud run of a handed task ended (or never started): it comes off the list, or waits for an agent here. */
+  function taskDriver(body) {
+    const taskId = cleanTaskId(body?.taskId);
+    const tasks = handedTasks();
+    const t = tasks.find(x => x.taskId === taskId);
+    if (!t) return { ok: true, known: false };
+    if (body?.finished === true && t.driver === 'cloud') {
+      writePrivate(TASKS_FILE, { tasks: tasks.filter(x => x.taskId !== taskId) });
+      log('channel', `task ${taskId} finished by pre.dev's cloud run`);
+      return { ok: true, removed: true };
+    }
+    if (body?.driver === 'local' && t.driver === 'cloud') {
+      t.driver = 'local';
+      writePrivate(TASKS_FILE, { tasks });
+      log('channel', `task ${taskId} waits for an agent on this computer`);
+    }
+    return { ok: true, driver: t.driver || 'local' };
   }
 
   function webTools(api) {
@@ -374,9 +480,15 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     const ok = isAllowed(site) || await askToAllow(site, port, api.chromeInFront);
     if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
     if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
-    const tasks = (readJson(TASKS_FILE)?.tasks || []).filter(t => t.taskId !== taskId);
+    const before = readJson(TASKS_FILE)?.tasks || [];
+    const prior = before.find(t => t.taskId === taskId);
+    const tasks = before.filter(t => t.taskId !== taskId);
     let tab = '';
-    try {
+    // Handed here again (the computer was away, and the user chose it once more): the tab it had, if still open.
+    if (prior?.tab) await chrome.connect().catch(() => {});
+    const kept = prior?.tab ? tabInfo(prior.tab) : null;
+    if (kept && !privateTabs.has(kept.targetId)) tab = prior.tab;
+    if (!tab) try {
       const profile = profiles().find(p => p.lastUsed)?.dir || profiles()[0]?.dir || 'Default';
       const opened = await callTool('chrome_open', { profile, url, foreground: false, __agent: `handed:${taskId}`, __predev_handoff: true, __via: 'web' },
         { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl, signal: AbortSignal.timeout(60000) });
@@ -384,12 +496,14 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     } catch (error) { log('channel', 'handed task open failed', error.message); }
     tasks.push({
       taskId, batchId: String(body?.batchId || ''), site, tab, at: new Date().toISOString(),
+      // 'cloud': pre.dev's cloud carries it on in that tab by itself; else it waits for an agent here.
+      driver: body?.runner === 'cloud' ? 'cloud' : 'local',
       instruction: String(body?.instruction || '').slice(0, 20000),
       checkpoint: { url, step: Number(checkpoint.step) || 0, reason: String(checkpoint.reason || ''), memory: String(checkpoint.memory || '').slice(0, 8000),
         history: (Array.isArray(checkpoint.history) ? checkpoint.history : []).slice(-60) },
     });
     writePrivate(TASKS_FILE, { tasks: tasks.slice(-20) });
-    log('channel', `task ${taskId} handed to this computer (${site})`);
+    log('channel', `task ${taskId} handed to this computer (${site}${body?.runner === 'cloud' ? ', carried on by pre.dev' : ''})`);
     return { accepted: true, ...(tab ? { tab } : {}) };
   }
 
@@ -432,6 +546,13 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         end({ ok: true, revoked: had });
       } else if (route === 'POST /tasks/continue') {
         end(await takeTask(body, port, api));
+      } else if (route === 'POST /tasks/call') {
+        const started = Date.now();
+        const result = await taskCall(body, port, api);
+        log('channel', 'task call', String(body?.name || ''), result?.refusal ? `refused (${result.refusal.kind})` : result?.isError ? 'failed' : 'ok', `${Date.now() - started}ms`);
+        end({ result });
+      } else if (route === 'POST /tasks/driver') {
+        end(taskDriver(body));
       } else if (route === 'POST /call') {
         const started = Date.now();
         const result = await webCall(body, port, api);
@@ -442,7 +563,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       }
     } catch (error) {
       log('channel', route, 'error', error.message);
-      end({ result: text(`Error: ${error.message}`) });
+      end({ result: { ...text(`Error: ${error.message}`), ...(error.refusal ? { refusal: error.refusal } : {}) } });
     }
   }
 
