@@ -823,6 +823,10 @@ const INPUT_WATCH = `(() => {
   window.__predevInputWatch = true;
   const mark = e => { if (e.isTrusted && !window.__predevAgentActing) window.__predevUserAt = Date.now(); };
   for (const type of ['pointerdown', 'keydown', 'input', 'paste']) addEventListener(type, mark, true);
+  // Every trusted click or key that reaches this page, the agent's too: Chrome's own dialogs over a
+  // tab swallow input before it gets here (inputBlocked).
+  const seen = e => { if (e.isTrusted) window.__predevSeen = (window.__predevSeen || 0) + 1; };
+  for (const type of ['pointerdown', 'mousedown', 'keydown', 'keyup', 'beforeinput']) addEventListener(type, seen, true);
 })()`;
 async function watchInput(info, session) {
   if (!H.watched.has(info.targetId)) {
@@ -1023,6 +1027,52 @@ async function clickInner(session, x, y, count) {
 function docState(session, fallbackUrl = null) {
   return evaluate(session, '[location.href, window.__agentDoc || (window.__agentDoc = Math.random().toString(36).slice(2))]', 5000).catch(() => [fallbackUrl, null]);
 }
+
+// Chrome's own dialogs over a tab (most often its password warning, "Change your password", after a
+// sign-in with a password Chrome found in a data breach) swallow every click and key sent to the
+// tab, while the page itself still answers scripts and screenshots. With handoffs on, the page
+// counts the trusted input that reaches it (INPUT_WATCH). An action whose input never arrived, on a
+// page that didn't change and with no frame in the way, gets one probe key (Shift, which types
+// nothing); when that doesn't arrive either, such a dialog is open.
+const seenCount = session => evaluate(session, 'window.__predevSeen || 0', 3000).then(Number).catch(() => null);
+const FRAMED_AT = (x, y) => `(() => { const el = document.elementFromPoint(${Number(x)}, ${Number(y)}); return !!el && /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(el.tagName); })()`;
+const FRAMED_FOCUS = '(() => { const el = document.activeElement; return !!el && /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(el.tagName); })()';
+// Does input reach the page now? true, false, or null when the page doesn't answer (can't tell).
+// The probe is the agent's own input, so the watcher never counts it as the user's.
+const PROBE_START = `(${INPUT_WATCH}, window.__predevAgentActing = true, [Number(window.__predevSeen || 0), ${FRAMED_FOCUS}])`;
+async function inputReaches(session) {
+  const start = await evaluate(session, PROBE_START, 3000).catch(() => null);
+  const done = () => evaluate(session, 'window.__predevAgentActing = false', 3000).catch(() => {});
+  if (!Array.isArray(start)) return null;
+  if (start[1]) { await done(); return null; }
+  let out = false;
+  try {
+    await chrome.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
+    await chrome.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
+    for (let i = 0; i < 6; i++) {
+      const now = await seenCount(session);
+      if (now === null) { out = null; break; }
+      if (now > start[0]) { out = true; break; }
+      await sleep(60);
+    }
+  } catch { out = null; }
+  await done();
+  return out;
+}
+// After an action: did its input go nowhere because a Chrome dialog is over the tab?
+async function inputBlocked(session, seen0, before, framed) {
+  if (seen0 === null) return false;
+  const seen1 = await seenCount(session);
+  if (seen1 === null || seen1 > seen0) return false;
+  const [, doc] = await docState(session);
+  if (!doc || doc !== before[1]) return false;
+  if (await evaluate(session, framed, 3000).catch(() => true)) return false;
+  return (await inputReaches(session)) === false;
+}
+const CHROME_DIALOG = 'chrome_dialog';
+// A handoff that ends once input reaches the page again (the user closed Chrome's dialog).
+const waitsForInput = (reason, done) => reason === CHROME_DIALOG || done?.kind === 'input_reaches';
+const DIALOG_REFUSAL = `Chrome's own dialog is open over this tab, most likely its password warning ("Change your password"), so clicks and typing don't reach the page (this call's didn't either). Don't retry, and don't open another tab for it: hand this step to the user: call chrome_handoff with this tab and reason "${CHROME_DIALOG}". They close Chrome's dialog, and it returns once input reaches the page again.`;
 
 // Waits for whatever an action set off, without assuming it did anything. A new page gets the full
 // load wait; on the same page, scripts get up to 2 s to finish showing the change (it returns as soon
@@ -1368,7 +1418,9 @@ const TOOLS = [
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
+      const seen0 = handoffOn(args) ? await seenCount(session) : null;
       await click(session, x, y, args.double ? 2 : 1);
+      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(DIALOG_REFUSAL);
       await settle(session, before);
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1411,11 +1463,18 @@ const TOOLS = [
         return `Selected "${picked.chosen}" in ${picked.desc}`;
       }
       if (field.isPassword && !isLocalDev(before[0])) throw new Error('Refusing to type into a password field outside local dev sites; the user should enter it.');
+      const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
       if (args.text) {
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (args.submit) { await pressKeys(session, 'Enter'); await settle(session, before); }
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL);
+      if (args.submit) {
+        const seen1 = handoffOn(args) ? await seenCount(session) : null;
+        await pressKeys(session, 'Enter');
+        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL.replace("(this call's didn't either)", "(the text went in, but this call's Enter didn't)"));
+        await settle(session, before);
+      }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
       return `Typed into ${field.desc}${value !== null ? `; value is now ${JSON.stringify(value)}` : ' and pressed Enter'}\n${await pageLine(info, session)}`;
     },
@@ -1469,7 +1528,9 @@ const TOOLS = [
           if (ask) throw new Error(ask);
         }
       }
+      const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       await pressKeys(session, keys);
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL);
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
@@ -1704,15 +1765,15 @@ const TOOLS = [
   },
   {
     name: 'chrome_handoff',
-    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. With reason "user_control" and resume: true it takes the tab back after the user said to keep going.',
+    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. With reason "user_control" and resume: true it takes the tab back after the user said to keep going. With reason "chrome_dialog" (a tool said Chrome\'s own dialog, such as its password warning, is over the tab) the user closes that dialog, and it is done once clicks and keys reach the page again.',
     inputSchema: {
       type: 'object', required: ['tab'],
       properties: {
         tab: { type: 'string' },
-        reason: { type: 'string', enum: ['login_required', 'step_up', 'captcha', 'consent', 'approval', 'user_control'] },
+        reason: { type: 'string', enum: ['login_required', 'step_up', 'captcha', 'consent', 'approval', 'user_control', CHROME_DIALOG] },
         done: {
-          type: 'object', description: 'When the step is done, from the URL or the page structure: {"kind":"url_changes"} (default), {"kind":"url_leaves","value":"/login"}, {"kind":"element_gone","value":"input[type=password]"}, {"kind":"element_present","value":"<CSS selector>"}.',
-          properties: { kind: { type: 'string', enum: ['url_changes', 'url_leaves', 'element_gone', 'element_present'] }, value: { type: 'string' } },
+          type: 'object', description: 'When the step is done, from the URL or the page structure: {"kind":"url_changes"} (default), {"kind":"url_leaves","value":"/login"}, {"kind":"element_gone","value":"input[type=password]"}, {"kind":"element_present","value":"<CSS selector>"}, or {"kind":"input_reaches"} (Chrome\'s dialog over the tab is closed; the default for reason chrome_dialog).',
+          properties: { kind: { type: 'string', enum: ['url_changes', 'url_leaves', 'element_gone', 'element_present', 'input_reaches'] }, value: { type: 'string' } },
         },
         timeout: { type: 'number', description: 'Seconds; omit or 0 for no limit.' },
         resume: { type: 'boolean', description: 'With reason user_control: take the tab back (the user said to keep going).' },
@@ -1757,6 +1818,11 @@ const TOOLS = [
       if (args.check) {
         const session = await chrome.session(info.targetId);
         const startUrl = String(args.start_url || H.handoff.get(info.targetId)?.startUrl || info.url);
+        const open = H.handoff.get(info.targetId);
+        if (waitsForInput(open?.reason || args.reason, args.done || open?.done)) {
+          const [href] = await docState(session, info.url);
+          return handoffLines((await inputReaches(session)) ? 'done' : 'waiting', info, href || info.url);
+        }
         const v = await evaluate(session, doneExpression(args.done || H.handoff.get(info.targetId)?.done, startUrl), 5000).catch(() => null);
         if (v?.ok) noteSignedIn(H.handoff.get(info.targetId)?.reason || reason, v.url || info.url);
         return handoffLines(v?.ok ? 'done' : 'waiting', info, v?.url || info.url);
@@ -1817,7 +1883,15 @@ const TOOLS = [
             await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
             shown = true;
           }
-          if (reason !== 'user_control') {
+          if (waitsForInput(reason, args.done)) {
+            // Chrome's dialog: done once a probe key reaches the page (one probe a second).
+            session = await chrome.session(info.targetId).catch(() => session);
+            if (await inputReaches(session)) {
+              end(info.targetId, 'done');
+              return `${handoffLines('done', info, lastUrl)}${await pageLine(info, session)}\nThe user closed Chrome's dialog; clicks and keys reach the page again. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
+            }
+            await sleep(500);
+          } else if (reason !== 'user_control') {
             // The session can go stale (a detach on navigation): re-attach after a few misses.
             session = await chrome.session(info.targetId).catch(() => session);
             const v = await evaluate(session, doneExpression(args.done, startUrl), 5000).catch(error => {
