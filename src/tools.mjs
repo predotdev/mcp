@@ -1439,7 +1439,7 @@ const TOOLS = [
       }
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
       await click(session, x, y, args.double ? 2 : 1);
-      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(dialogRefusal(args));
+      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       await settle(session, before);
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1487,11 +1487,11 @@ const TOOLS = [
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args));
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       if (args.submit) {
         const seen1 = handoffOn(args) ? await seenCount(session) : null;
         await pressKeys(session, 'Enter');
-        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args, "the text went in, but this call's Enter didn't"));
+        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args, "the text went in, but this call's Enter didn't"), { kind: CHROME_DIALOG });
         await settle(session, before);
       }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
@@ -1549,7 +1549,7 @@ const TOOLS = [
       }
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       await pressKeys(session, keys);
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(rest));
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(rest), { kind: CHROME_DIALOG });
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
