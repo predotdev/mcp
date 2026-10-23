@@ -443,9 +443,10 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     if (!key()) { status = 'signed_out'; return 'later'; }
     let grant;
     try {
-      const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId() });
+      // This computer's own allowed list goes along: pre.dev keeps only what is still allowed here.
+      const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId(), sites: Object.keys(allowedSites()) });
       if (r.status === 409) {
-        // Unpaired at pre.dev, or another computer took over: stop, and say so in the log.
+        // Unpaired at pre.dev (by `unpair` or from pre.dev's settings): stop, and say so in the log.
         log('channel', 'pre.dev says this computer is no longer paired; stopping');
         try { fs.rmSync(PAIRING_FILE, { force: true }); } catch {}
         status = 'unpaired';
