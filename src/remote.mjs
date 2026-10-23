@@ -5,6 +5,9 @@
 // request is one POST, and the reply is JSON or a short event stream ending in the result.
 // Signed out, or on a plan without the hosted tools, they are still listed (from the public
 // /mcp/info) and a call says how to unlock them, so the agent can tell the user.
+//
+// Its answers also say which per-account features pre.dev has on for the key (the
+// X-Predev-Features header, e.g. "handoff"), sent only when one is on: no header means none.
 
 const LIST_TTL_MS = 10 * 60_000;
 /** Kept callable for old prompts, but not listed: the hosted server marks them deprecated. */
@@ -13,10 +16,19 @@ const SIGN_IN = 'Sign in to pre.dev (free) by running `npx -y @predotdev/mcp log
 
 class PlanRequired extends Error {}
 
-export function createRemote({ version }) {
+export function createRemote({ version, onFeatures = () => {} }) {
   let cache = { key: null, at: 0, tools: [], locked: null };
   let nextId = 0;
   const base = ctx => (ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
+  /** key -> the features pre.dev's last answer named for it. */
+  const features = new Map();
+
+  function noteFeatures(key, header) {
+    const list = String(header || '').split(',').map(s => s.trim()).filter(Boolean);
+    const before = features.get(key);
+    features.set(key, list);
+    if (!before || before.join(',') !== list.join(',')) onFeatures(key, list);
+  }
 
   async function rpc(ctx, method, params, timeout) {
     const id = ++nextId;
@@ -32,6 +44,7 @@ export function createRemote({ version }) {
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
       signal: AbortSignal.timeout(timeout),
     });
+    if (response.ok) noteFeatures(ctx.apiKey || '', response.headers.get('x-predev-features'));
     const text = await response.text();
     if (response.status === 401) {
       let message = '';
@@ -108,5 +121,8 @@ export function createRemote({ version }) {
     }
   }
 
-  return { listTools, isRemote, callTool };
+  /** The features pre.dev named for this key in its last answer; undefined before the first one. */
+  const featuresFor = key => features.get(key || '');
+
+  return { listTools, isRemote, callTool, featuresFor };
 }

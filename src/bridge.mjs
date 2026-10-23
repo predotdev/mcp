@@ -360,10 +360,40 @@ function cliLogin() {
 }
 /** PREDEV_MCP_CLOUD=off lists only the chrome_* tools (the pre.dev CLI has its own cloud tools). */
 const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
-/** PREDEV_HANDOFF=1: handoffs (chrome_handoff) and the guard that goes with them (only this
- *  agent's tabs, no typing into password, code or card fields, ask first before send, post, buy
- *  or delete). Off by default; off, every tool works as before. */
-const HANDOFF = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
+/** Handoffs (chrome_handoff) and the guard that goes with them (only this agent's tabs, no typing
+ *  into password, code or card fields, ask first before send, post, buy or delete). On for an
+ *  account pre.dev has them on for (it says so with its hosted tools, see handoffFor), or with
+ *  PREDEV_HANDOFF=1 (how the pre.dev CLI starts this server; also for tests). Off by default; off,
+ *  every tool works as before. */
+const HANDOFF_ENV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
+/** The features pre.dev last named for the saved key, kept for the terminal commands and for the
+ *  next start (written only once pre.dev names one; removed when it stops). */
+const FEATURES_FILE = path.join(BASE_STATE_DIR, 'features.json');
+const keyId = apiKey => crypto.createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
+function savedFeatures(apiKey) {
+  try {
+    const saved = JSON.parse(fs.readFileSync(FEATURES_FILE, 'utf8'));
+    return saved?.key === keyId(apiKey) && Array.isArray(saved.features) ? saved.features : [];
+  } catch { return []; }
+}
+function saveFeatures(apiKey, list) {
+  try {
+    if (list.length) {
+      fs.mkdirSync(BASE_STATE_DIR, { recursive: true, mode: 0o700 });
+      const tmp = `${FEATURES_FILE}.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ key: keyId(apiKey), features: list }), { mode: 0o600 });
+      fs.renameSync(tmp, FEATURES_FILE);
+    } else if (fs.existsSync(FEATURES_FILE) && savedFeatures(apiKey).length) fs.unlinkSync(FEATURES_FILE);
+  } catch {}
+}
+/** Handoffs for this key: PREDEV_HANDOFF=1, else what pre.dev's hosted tools last said (this run's
+ *  answer, or the saved one until it comes). Signed out, with the hosted tools off, or from a
+ *  pre.dev that says nothing: off. */
+function handoffFor(apiKey) {
+  if (HANDOFF_ENV) return true;
+  if (!CLOUD || !apiKey) return false;
+  return (remote.featuresFor(apiKey) || savedFeatures(apiKey)).includes('handoff');
+}
 /** PREDEV_MCP_FROM_PREDEV=1: started by pre.dev's own CLI, whose agent knows what its user
  *  asked for. Only then may a call lift the kept sign-in (__predev_signout_ok); from any other
  *  agent it is dropped, so a model can't lift it by passing the argument itself. */
@@ -372,14 +402,17 @@ const FROM_PREDEV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_MCP_FROM_PREDEV
 const AGENT_ID = crypto.randomBytes(6).toString('hex');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
 // PREDEV_API_KEY wins over the saved key, which wins over the pre.dev CLI's login.
-function shimCtx() {
+function keyCtx() {
   const saved = process.env.PREDEV_API_KEY ? {} : readCredentials();
   return {
     apiKey: String(process.env.PREDEV_API_KEY || saved.apiKey || cliLogin() || '').trim(),
     apiUrl: String(process.env.PREDEV_API_URL || saved.apiUrl || DEFAULT_API_URL).trim(),
     cloud: CLOUD,
-    handoff: HANDOFF,
   };
+}
+function shimCtx() {
+  const ctx = keyCtx();
+  return { ...ctx, handoff: handoffFor(ctx.apiKey) };
 }
 
 function request(state, method, route, body, timeout = 180000, onRequest = null) {
@@ -533,7 +566,12 @@ async function updateInstalledCopy() {
   return meta.version;
 }
 
-const remote = createRemote({ version: PKG.version || '0.0.0' });
+/** Set while serving MCP: tells the agent to re-list when the hosted tools change handoffs. */
+let featuresChanged = null;
+const remote = createRemote({
+  version: PKG.version || '0.0.0',
+  onFeatures: (apiKey, list) => { saveFeatures(apiKey, list); featuresChanged?.(); },
+});
 
 // Tools that act on one tab. chrome_close is left out on purpose: closing needs the tab named.
 const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
@@ -541,9 +579,9 @@ const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click',
 
 /** Arguments for a local tool call: which agent it is, and whether handoffs are on. A flag the
  *  caller passed in (pre.dev's own agent sets __predev_handoff) is kept. */
-function withCallFlags(args) {
+function withCallFlags(args, ctx = shimCtx()) {
   const out = { ...(args || {}), __agent: AGENT_ID };
-  if (HANDOFF) out.__predev_handoff = true;
+  if (ctx.handoff) out.__predev_handoff = true;
   if (!FROM_PREDEV) delete out.__predev_signout_ok;
   return out;
 }
@@ -565,6 +603,9 @@ function runMcp() {
   }).catch(error => log('update check failed:', error.message));
   setTimeout(update, 5000).unref();
   setInterval(update, UPDATE_EVERY).unref();
+  featuresChanged = () => loadTools().then(tools => {
+    if (listed && JSON.stringify(tools.toolList(shimCtx())) !== listed) write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+  }).catch(() => {});
   const handle = async message => {
     const reply = result => write({ jsonrpc: '2.0', id: message.id, result });
     try {
@@ -577,10 +618,11 @@ function runMcp() {
             instructions: (await loadTools()).instructions(shimCtx()),
           });
         case 'tools/list': {
-          const ctx = shimCtx();
-          const local = (await loadTools()).toolList(ctx);
+          // The hosted tools first: their answer says whether handoffs are on for this account.
+          const hosted = CLOUD ? await remote.listTools(shimCtx()) : [];
+          const local = (await loadTools()).toolList(shimCtx());
           listed = JSON.stringify(local);
-          return reply({ tools: [...local, ...(CLOUD ? await remote.listTools(ctx) : [])] });
+          return reply({ tools: [...local, ...hosted] });
         }
         case 'tools/call': {
           const ctx = shimCtx();
@@ -669,7 +711,7 @@ Commands:
 
 Docs: https://docs.pre.dev/browser-agents/local
 `;
-// Pairing, only with handoffs on (PREDEV_HANDOFF=1): off, the help is as before.
+// Pairing, only with handoffs on (handoffFor): off, the help is as before.
 const PAIR_HELP = `  predev-mcp pair       let pre.dev web runs you start do steps in this Chrome ("Do it in my
                         Chrome"); each new site asks you here first
   predev-mcp unpair     stop that now, for this computer
@@ -750,8 +792,8 @@ if (typeof WebSocket === 'undefined') {
 // `tools` and `call`: the same tools from a shell, for agents that run commands but don't speak MCP.
 // Text goes to stdout; an image (a screenshot) is saved to a private temp file and its path printed.
 async function runTools() {
-  const ctx = shimCtx();
-  const tools = [...(await loadTools()).toolList(ctx), ...(CLOUD ? await remote.listTools(ctx).catch(() => []) : [])];
+  const hosted = CLOUD ? await remote.listTools(shimCtx()).catch(() => []) : [];
+  const tools = [...(await loadTools()).toolList(shimCtx()), ...hosted];
   for (const tool of tools) {
     const props = Object.keys(tool.inputSchema?.properties || {});
     const required = tool.inputSchema?.required || [];
@@ -806,6 +848,8 @@ async function runSetupCommand(name, args = []) {
 }
 
 const command = process.argv[2] || '';
+/** Pairing commands and their help: with handoffs on for the saved key (no request made here). */
+const HANDOFF = ['pair', 'unpair', 'sites', 'start-at-login', '--help', '-h', 'help'].includes(command) && handoffFor(keyCtx().apiKey);
 if (command === 'daemon') runDaemon();
 else if (['setup', 'install', 'login', 'logout', 'uninstall'].includes(command)) runSetupCommand(command === 'install' ? 'setup' : command);
 else if (command === 'install-app') runSetupCommand('installApp');
