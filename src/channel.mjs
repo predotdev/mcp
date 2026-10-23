@@ -222,7 +222,8 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     }, allowed ? 1500 : 4000);
   }
 
-  /** Ask the person at this computer to allow a site for web runs. true once allowed. */
+  /** Ask the person at this computer to allow a site for web runs: true once allowed, false when they
+   *  said no, 'no_answer' when nobody answered in time (the question closes; the next call asks again). */
   async function askToAllow(site, port, inFront) {
     if (isAllowed(site)) return true;
     let entry = asking.get(site);
@@ -263,7 +264,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
       if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
       privateTabs.delete(entry.targetId);
     }
-    return answer === true;
+    return answer === true ? true : answer === null ? 'no_answer' : false;
   }
 
   // ---------------------------------------------------------------- the calls a web run makes
@@ -412,9 +413,9 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     const host = hostOf(url);
     if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
     const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
-    if (!isAllowed(site) && !(await askToAllow(site, port, api.chromeInFront))) {
-      return { accepted: false, error: `the person at this computer didn't allow ${site}` };
-    }
+    const ok = isAllowed(site) || await askToAllow(site, port, api.chromeInFront);
+    if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
+    if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
     const before = readJson(TASKS_FILE)?.tasks || [];
     const prior = before.find(t => t.taskId === taskId);
     const tasks = before.filter(t => t.taskId !== taskId);

@@ -35,6 +35,9 @@ export const text = (t, isError = true) => ({ content: [{ type: 'text', text: t 
 /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
 export const refusedText = (t, refusal) => ({ ...text(t), refusal });
 export const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
+/** Nobody answered the question in time (the next call asks again): that says nothing about what the
+ *  person wants, so the run asks them. */
+export const noAnswer = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. Don't call it again right away: tell them in one line that their Chrome is waiting for a click to allow ${site}; when they say go ahead, call again and the question comes back. Continue with what you have meanwhile.`);
 /** A site the person turned off here (the extension's list of allowed sites): no question, a plain no. */
 export const turnedOff = site => text(`The user turned ${site} off for web runs in their Chrome, so this run can't use it there. Don't retry or ask them to allow it: tell them in one line what you need from ${site} (they can tick it again from the pre.dev button in their Chrome's toolbar), and continue with what you have.`);
 export const PRIVATE_TAB = "That tab is pre.dev's own question to the user; no run can use it.";
@@ -82,8 +85,9 @@ export const plainLine = parts => parts.map(p => (typeof p === 'string' ? p : p.
  *   isPrivate(targetId)        pre.dev's own question tab
  *   siteFor(host)              the registrable domain pre.dev computes for a host
  *   isAllowed(site)            the person allowed it here
- *   askToAllow(site)           ask the person here; true once allowed, 'off' when the person turned that
- *                              site off here (then there is no question)
+ *   askToAllow(site)           ask the person here; true once allowed, false when they said no,
+ *                              'no_answer' when nobody answered in time, 'off' when the person turned
+ *                              that site off here (then there is no question)
  */
 export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow }) {
   /** A new site needs a click here first: where the call goes, and where the tab is now. null when allowed. */
@@ -103,7 +107,8 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site);
       if (ok === 'off') return { ...turnedOff(site), refusal: { kind: 'not_allowed', site } };
-      if (!ok) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
+      if (ok === 'no_answer') return { ...noAnswer(site), refusal: { kind: 'not_allowed', site, answer: 'none' } };
+      if (ok !== true) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
     }
     return null;
   }
