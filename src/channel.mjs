@@ -242,7 +242,8 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     }, allowed ? 1500 : 4000);
   }
 
-  /** Ask the person at this computer to allow a site for web runs. true once allowed. */
+  /** Ask the person at this computer to allow a site for web runs: true once allowed, false when they
+   *  said no, 'no_answer' when nobody answered in time (the question closes; the next call asks again). */
   async function askToAllow(site, port, inFront) {
     if (isAllowed(site)) return true;
     let entry = asking.get(site);
@@ -283,7 +284,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
       privateTabs.delete(entry.targetId);
     }
-    return answer === true;
+    return answer === true ? true : answer === null ? 'no_answer' : false;
   }
 
   // ---------------------------------------------------------------- the calls a web run makes
@@ -299,6 +300,8 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
   /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
   const refusedText = (t, refusal) => ({ ...text(t), refusal });
   const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
+  /** Nobody answered the question in time (the next call asks again). */
+  const noAnswer = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. Don't call it again right away: tell them in one line that their Chrome is waiting for a click to allow ${site}; when they say go ahead, call again and the question comes back. Continue with what you have meanwhile.`);
 
   /** One call from a web run. `run.key` names the run, so its tabs are its own. */
   async function webCall(body, port, api) {
@@ -342,7 +345,8 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     for (const site of wanted) {
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site, port, api.chromeInFront);
-      if (!ok) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
+      if (ok === 'no_answer') return { ...noAnswer(site), refusal: { kind: 'not_allowed', site, answer: 'none' } };
+      if (ok !== true) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
     }
     return null;
   }
@@ -473,9 +477,9 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     const host = hostOf(url);
     if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
     const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
-    if (!isAllowed(site) && !(await askToAllow(site, port, api.chromeInFront))) {
-      return { accepted: false, error: `the person at this computer didn't allow ${site}` };
-    }
+    const ok = isAllowed(site) || await askToAllow(site, port, api.chromeInFront);
+    if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
+    if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
     const before = readJson(TASKS_FILE)?.tasks || [];
     const prior = before.find(t => t.taskId === taskId);
     const tasks = before.filter(t => t.taskId !== taskId);
