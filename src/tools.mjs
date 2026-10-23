@@ -1638,23 +1638,13 @@ const TOOLS = [
       let expression = js;
       if (handoffOn(rest)) {
         const [href] = await docState(session);
-        // Where a handoff signed the user in (rule 3), a script may only read: V8's own side-effect
-        // check runs it and refuses anything that would navigate, submit, click, write to the page,
-        // cookies or storage, send a request or start a timer. No reading of the script's text.
+        // Where a handoff signed the user in (rule 3), no script runs. Not a read-only run under V8's
+        // side-effect check: that check lets a script keep a change on an object Chrome builds on first
+        // use (navigator.credentials, navigator.clipboard, an element's own wrapper), and it would stay
+        // on a page the user is signed in to.
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
-        if (site) {
-          const r = await chrome.send('Runtime.evaluate', { expression: js, returnByValue: true, awaitPromise: true, throwOnSideEffect: true, timeout: 30000 }, session, 35000);
-          if (r.exceptionDetails) {
-            const d = r.exceptionDetails;
-            const why = (d.exception?.description || d.text || 'Script error').split('\n')[0];
-            if (d.exception?.className === 'EvalError' && /side-effect/i.test(why))
-              throw new Error(`Refused: on this tab scripts may only read the page. This one would change something (navigate, submit or click, write to the page, cookies or storage, send a request, or start a timer). ${KEEP_SIGNIN(site)} Use chrome_click or chrome_type for actions; they check each one.`);
-            throw new Error(why);
-          }
-          const value = r.result?.value;
-          const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
-          return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
-        }
+        if (site)
+          throw new Error(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`);
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
