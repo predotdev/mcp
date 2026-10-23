@@ -466,8 +466,8 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
         // "Reach through my computer" from pre.dev's settings: the person here decides.
         const entry = checkedEntry(body);
         if (!entry) end({ added: false, error: 'That is not a site this computer can reach for runs.' });
-        else if (network.sites()[entry.site]) end({ added: true, already: true });
-        else end((await askToAllow(entry.allowedSite, port, api.chromeInFront, entry)) ? { added: true } : { added: false, error: 'The person at that computer did not allow it.' });
+        else if (network.sites()[entry.site]) end({ added: true, already: true, netKey: network.publicKey() });
+        else end((await askToAllow(entry.allowedSite, port, api.chromeInFront, entry)) ? { added: true, netKey: network.publicKey() } : { added: false, error: 'The person at that computer did not allow it.' });
       } else if (route === 'POST /network/remove') {
         end({ ok: true, removed: network.remove(String(body?.site || '')) });
       } else if (route === 'GET /network') {
@@ -496,7 +496,7 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
     try {
       // This computer's own allowed list goes along: pre.dev keeps only what is still allowed here.
       // So does its list of sites cloud runs reach through it, once it has one (network.mjs).
-      const reach = fs.existsSync(networkFiles(stateDir).sites) ? { network: network.list() } : {};
+      const reach = fs.existsSync(networkFiles(stateDir).sites) ? { network: network.list(), netKey: network.publicKey() } : {};
       const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId(), sites: Object.keys(allowedSites()), ...reach });
       if (r.status === 409) {
         // Unpaired at pre.dev (by `unpair` or from pre.dev's settings): stop, and say so in the log.

@@ -8,13 +8,17 @@
 //     a registrable site (it and its subdomains) or one exact host, and its site is one of the
 //     sites this computer allowed. Anything else is refused here, whatever pre.dev asks.
 //   - Never this computer itself (loopback), link-local or multicast addresses.
-//   - Bytes only: for https the cloud browser's own TLS goes through untouched, so neither this
-//     computer nor pre.dev can read the page. Plain http is the site's own choice.
+//   - Encrypted end to end between the cloud run and this computer ("pnet1"): a fresh X25519
+//     agreement per connection, this computer's half authenticated by its own network key (made
+//     here, registered with pre.dev over this computer's own calls, and named in the run's grant),
+//     the run's half bound to that grant, then AES-256-GCM frames. pre.dev's edge relays only
+//     ciphertext, plain http included; for https the cloud browser's own TLS sits inside it.
 //   - Limits per run (open connections, connections, bytes), and a log of every connection:
 //     host, port, bytes and the run id, never content. pre.dev shows the recent ones.
 //
 // Turning it off: `predev-mcp network remove <site>`, revoke the site, or unpair.
 
+import crypto from 'node:crypto';
 import dns from 'node:dns';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -32,7 +36,60 @@ const OWN_LIMITS = { maxOpen: 32, maxConnections: 1000, maxBytes: 200 * 1024 * 1
 export const networkFiles = stateDir => ({
   sites: path.join(stateDir, 'web-network.json'),
   log: path.join(stateDir, 'network-log.jsonl'),
+  key: path.join(stateDir, 'network-key.json'),
 });
+
+// ---------------------------------------------------------------- pnet1: the encryption
+
+const KEY_RE = /^[A-Za-z0-9_-]{43}$/;
+const rawPub = keyObject => keyObject.export({ format: 'jwk' }).x;
+const pubFrom = b64 => crypto.createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x: b64 }, format: 'jwk' });
+
+/** This computer's long-term network key (X25519), made once, kept 0600 in its state folder. */
+export function networkIdentity(stateDir) {
+  const file = networkFiles(stateDir).key;
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const privateKey = crypto.createPrivateKey({ key: Buffer.from(saved.priv, 'base64'), format: 'der', type: 'pkcs8' });
+    const pub = rawPub(crypto.createPublicKey(privateKey));
+    if (KEY_RE.test(pub)) return { privateKey, pub };
+  } catch {}
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ priv: privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64') }), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return { privateKey, pub: rawPub(publicKey) };
+}
+
+const nonce = (dir, n) => { const b = Buffer.alloc(12); b.writeUInt32BE(dir, 0); b.writeBigUInt64BE(BigInt(n), 4); return b; };
+const seal = (key, dir, n, plain) => { const c = crypto.createCipheriv('aes-256-gcm', key, nonce(dir, n)); return Buffer.concat([c.update(plain), c.final(), c.getAuthTag()]); };
+const open_ = (key, dir, n, sealed) => {
+  if (sealed.length < 16) throw new Error('short frame');
+  const d = crypto.createDecipheriv('aes-256-gcm', key, nonce(dir, n));
+  d.setAuthTag(sealed.subarray(sealed.length - 16));
+  return Buffer.concat([d.update(sealed.subarray(0, sealed.length - 16)), d.final()]);
+};
+
+/** The computer's side of one connection's agreement: its ephemeral half, the keys, and the confirmation. */
+export function pnet1Accept(identity, m) {
+  const eph = crypto.generateKeyPairSync('x25519');
+  const eR = pubFrom(m.e);
+  const ssE = crypto.diffieHellman({ privateKey: eph.privateKey, publicKey: eR });
+  const ssS = crypto.diffieHellman({ privateKey: identity.privateKey, publicKey: eR });
+  const eL = rawPub(eph.publicKey);
+  const info = `pnet1|${m.run}|${m.host}|${m.port}|${m.e}|${eL}|${identity.pub}`;
+  const okm = Buffer.from(crypto.hkdfSync('sha256', Buffer.concat([ssE, ssS]), Buffer.from(String(m.g)), Buffer.from(info), 64));
+  const toLaptop = okm.subarray(0, 32), toRunner = okm.subarray(32, 64);
+  return {
+    e: eL,
+    c: seal(toRunner, 2, 0, Buffer.from('pnet1 ok')).toString('base64url'),
+    /** Runner -> computer frames (counter from 1). */
+    openFrame: (n, sealed) => open_(toLaptop, 1, n, sealed),
+    /** Computer -> runner frames (counter from 1). */
+    sealFrame: (n, plain) => seal(toRunner, 2, n, plain),
+  };
+}
 
 /** The sites runs may reach through this computer: { site: { kind, allowedSite, addedAt } }. */
 export function readNetworkSites(stateDir) {
@@ -114,6 +171,8 @@ const lookup = host => new Promise((resolve) => {
 export function createNetwork(ctx) {
   const { stateDir, log } = ctx;
   const files = networkFiles(stateDir);
+  let identity = null;
+  const me = () => (identity ||= networkIdentity(stateDir));
   /** Open connections: id -> { socket, run, host, port, up, down, at, opened }. */
   const conns = new Map();
   /** Per run: { open, total, bytes }. */
@@ -179,6 +238,8 @@ export function createNetwork(ctx) {
     const host = cleanHost(m.host);
     const port = Number(m.port);
     if (!run || !host) return refuse(m, 'bad_request', 'That connection request is not valid.');
+    // Encrypted connections only: the run's half of the agreement and its grant's hash.
+    if (!KEY_RE.test(String(m.e || '')) || !/^[A-Za-z0-9_-]{43}$/.test(String(m.g || ''))) return refuse(m, 'encryption_required', 'This computer opens encrypted connections only.');
     const list = sites();
     const hit = entryFor(list, host);
     // This computer's own list decides, whatever pre.dev asked.
@@ -199,10 +260,12 @@ export function createNetwork(ctx) {
     if (!addrs.length) return refuse(m, 'dns', `${host} couldn't be found on this computer's network.`);
     const addr = addrs.find(a => !unreachableAddress(a));
     if (!addr) return refuse(m, 'address', `${host} points at this computer itself or a link-local address.`);
+    let session;
+    try { session = pnet1Accept(me(), { e: m.e, g: m.g, run, host, port }); } catch { return refuse(m, 'encryption_required', 'That connection\'s key is not valid.'); }
     use.open++;
     use.total++;
     const started = Date.now();
-    const conn = { socket: null, run, host, port, up: 0, down: 0, at: started, opened: false, done: false };
+    const conn = { socket: null, run, host, port, up: 0, down: 0, at: started, opened: false, done: false, session, inN: 1, outN: 1 };
     conns.set(m.id, conn);
     const socket = net.connect({ host: addr, port });
     conn.socket = socket;
@@ -222,14 +285,15 @@ export function createNetwork(ctx) {
     socket.once('connect', () => {
       clearTimeout(timer);
       conn.opened = true;
-      sendJson({ t: 'net-opened', id: m.id });
+      // Our half of the agreement and the proof that this computer holds its network key.
+      sendJson({ t: 'net-opened', id: m.id, e: session.e, c: session.c });
     });
     socket.on('data', chunk => {
       conn.down += chunk.length;
       use.bytes += chunk.length;
       if (use.bytes > limits.maxBytes) return finish('limit');
       for (let at = 0; at < chunk.length; at += CHUNK) {
-        try { ctx.send(frame(m.id, chunk.subarray(at, at + CHUNK))); } catch { return finish('tunnel_closed'); }
+        try { ctx.send(frame(m.id, session.sealFrame(conn.outN++, chunk.subarray(at, at + CHUNK)))); } catch { return finish('tunnel_closed'); }
       }
     });
     socket.on('error', () => finish('error'));
@@ -240,11 +304,14 @@ export function createNetwork(ctx) {
   function data(id, bytes) {
     const conn = conns.get(id);
     if (!conn?.opened) { if (!conn) sendJson({ t: 'net-close', id }); return; }
-    conn.up += bytes.length;
+    let plain;
+    // A frame that doesn't open with this connection's key, in order, ends it (tampered, replayed or reordered).
+    try { plain = conn.session.openFrame(conn.inN++, bytes); } catch { conn.socket.destroy(); return; }
+    conn.up += plain.length;
     const use = useOf(conn.run);
-    use.bytes += bytes.length;
+    use.bytes += plain.length;
     if (use.bytes > limits.maxBytes) { conn.socket.destroy(); return; }
-    conn.socket.write(bytes);
+    conn.socket.write(plain);
   }
 
   return {
@@ -266,6 +333,8 @@ export function createNetwork(ctx) {
       for (const k of Object.keys(OWN_LIMITS)) if (Number(l[k]) > 0) limits[k] = Math.min(OWN_LIMITS[k], Number(l[k]));
     },
     sites,
+    /** This computer's network key (public half), for pre.dev to put in the runs' grants. */
+    publicKey: () => me().pub,
     list: () => Object.keys(sites()),
     add(value) {
       const entry = checkedEntry(value);

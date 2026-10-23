@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computerIdIn, forgetAllowedSite, pairingFiles, readAllowedSites } from './channel.mjs';
-import { checkedEntry, hostFromInput, networkFiles, readNetworkLog, readNetworkSites, unreachableAddress, writeNetworkSites } from './network.mjs';
+import { checkedEntry, hostFromInput, networkFiles, networkIdentity, readNetworkLog, readNetworkSites, unreachableAddress, writeNetworkSites } from './network.mjs';
 
 const CLIENT_ID = 'predev-chrome-mcp';
 // pre.dev's own servers: the hosted one, this package under either name, or its installed copy.
@@ -619,6 +619,7 @@ export function createSetup(ctx) {
     fs.rmSync(files.sites, { force: true });
     fs.rmSync(files.tasks, { force: true });
     fs.rmSync(networkFiles(stateDir).sites, { force: true });
+    fs.rmSync(networkFiles(stateDir).key, { force: true });
     // Nothing to stay connected for.
     loginItem('off');
     // The daemon drops the channel now, whatever pre.dev answers.
@@ -834,7 +835,8 @@ ${envXml}  <key>RunAtLoad</key><true/>
     if (allowedSite !== host || kind === 'host') console.log(`  It also lets pre.dev web runs use ${allowedSite} in this Chrome.`);
     const yes = rest.includes('--yes') || rest.includes('-y') || await askYesNo('Allow it? [y/N] ', false);
     if (!yes) { skip('Not added.'); process.exit(0); }
-    const r = await callPredev(pairing, '/computer-channel/network', { computerId: computerIdIn(stateDir), site: host });
+    // This computer's network key goes along: runs encrypt every connection to it, and only it can answer.
+    const r = await callPredev(pairing, '/computer-channel/network', { computerId: computerIdIn(stateDir), site: host, netKey: networkIdentity(stateDir).pub });
     if (r.status === 404) { bad('Reaching sites through your computer is not available on your pre.dev account yet.'); process.exit(1); }
     if (!r.ok) { bad(`pre.dev did not add it: ${r.json.error || `HTTP ${r.status}`}`); process.exit(1); }
     const entry = checkedEntry({ site: r.json.site || host, kind: r.json.kind || kind, allowedSite: r.json.allowedSite || allowedSite });
