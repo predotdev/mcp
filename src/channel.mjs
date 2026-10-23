@@ -1,0 +1,451 @@
+// The user's computer, one channel: pre.dev web runs reach the Chrome on this computer ("Do it in
+// my Chrome"), only after the user paired it (`predev-mcp pair`, with PREDEV_HANDOFF=1). The daemon
+// holds one tunnel to pre.dev's edge for the paired account; a web run that person typed sends its
+// chrome_* calls down it, and they run here, in this Chrome, with this computer's rules:
+//
+//   - the guard is always on (handoffs on, whatever the calling agent's flags): the run works only
+//     in tabs it opened, never types into password, code or card fields, and asks first before a
+//     click that sends, posts, buys or deletes;
+//   - a site a web run has not used here before needs a click on this computer: a pre.dev page in
+//     this Chrome asks "Allow pre.dev to use <site>?", and only the person at this computer can
+//     answer it (the page's address carries a one-time secret no run ever sees);
+//   - only the tools a web run needs: no scripts (chrome_eval could read a site's cookies or
+//     storage), no file uploads (files on this computer), no screenshots;
+//   - nothing else leaves this computer: no cookies, no storage, no files.
+//
+// Unpair (`predev-mcp unpair`) stops all of it at once, here and at pre.dev.
+
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+/** What a web run may call here (pre.dev's backend has the same list). chrome_handoff is the
+ *  handoff itself (bring the tab forward, check, wait, release, take back after the user). */
+const WEB_TOOLS = new Set(['chrome_profiles', 'chrome_tabs', 'chrome_open', 'chrome_navigate', 'chrome_snapshot', 'chrome_click',
+  'chrome_type', 'chrome_act', 'chrome_press', 'chrome_scroll', 'chrome_read', 'chrome_wait', 'chrome_show', 'chrome_close']);
+const HANDOFF_TOOL = 'chrome_handoff';
+/** Tools that can take a tab to another page: the page they end on is checked too. */
+const MOVES = new Set(['chrome_open', 'chrome_navigate', 'chrome_click', 'chrome_act', 'chrome_press', 'chrome_type', 'chrome_handoff']);
+const PING_MS = 15000;
+/** How long a call waits for the person at this computer to allow a new site. */
+const ALLOW_WAIT_MS = 120000;
+const FRAME_BODY = 1;
+const CHUNK = 256 * 1024;
+
+const isPage = t => t?.type === 'page';
+
+/** The site a web run is allowed on: the host (no "www."); for this machine or a private network,
+ *  with its port. Hosts, not registrable domains: this package has no public suffix list, and a
+ *  host never lets one approval cover someone else's site (another app on the same hosting domain). */
+export function siteOf(url) {
+  let u;
+  try { u = new URL(String(url)); } catch { return ''; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/^www\./, '');
+  const local = host === 'localhost' || host.endsWith('.localhost') || /^(127|10)\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^::1$|^0\.0\.0\.0$/.test(host);
+  return local && u.port ? `${host}:${u.port}` : host;
+}
+
+/** This computer's id for pre.dev in a state folder: random, made once, not a secret. */
+export function computerIdIn(stateDir) {
+  const file = path.join(stateDir, 'computer.json');
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (/^[a-f0-9]{32}$/.test(saved?.id || '')) return saved.id;
+  } catch {}
+  const id = crypto.randomBytes(16).toString('hex');
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ id }), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return id;
+}
+
+/** The files pairing keeps in a state folder: the pairing itself and the sites web runs may use. */
+export const pairingFiles = stateDir => ({ pairing: path.join(stateDir, 'pairing.json'), sites: path.join(stateDir, 'web-sites.json') });
+
+const escapeHtml = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+export function createChannel(ctx) {
+  const { stateDir, chromeDir, chrome, log, sleep, callTool, loadTools, privateTabs, readCredentials, cliLogin, defaultApiUrl } = ctx;
+  const { pairing: PAIRING_FILE, sites: SITES_FILE } = pairingFiles(stateDir);
+  let ws = null;
+  let running = false;
+  let status = 'off';
+  let pingTimer = null;
+  let wake = null;
+  /** One question per site at a time: site -> { nonce, decided, waiters, targetId }. */
+  const asking = new Map();
+  const byNonce = new Map();
+
+  const readJson = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+  const writePrivate = (file, value) => {
+    const tmp = `${file}.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  };
+
+  const computerId = () => computerIdIn(stateDir);
+  const pairing = () => readJson(PAIRING_FILE);
+  // The key this computer signs in with: the saved one, else the pre.dev CLI's login.
+  const key = () => String(readCredentials().apiKey || cliLogin() || '').trim();
+
+  async function post(apiUrl, route, body) {
+    const res = await fetch(`${apiUrl.replace(/\/+$/, '')}${route}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key()}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+      body: JSON.stringify(body || {}),
+      signal: AbortSignal.timeout(20000),
+    });
+    const json = await res.json().catch(() => ({}));
+    return { status: res.status, json };
+  }
+
+  // ---------------------------------------------------------------- sites a web run may use
+
+  const allowedSites = () => readJson(SITES_FILE)?.sites || {};
+  const isAllowed = site => !!site && !!allowedSites()[site];
+  function allow(site) {
+    const sites = allowedSites();
+    sites[site] = { allowedAt: new Date().toISOString() };
+    writePrivate(SITES_FILE, { sites });
+  }
+
+  /** The page that asks the person at this computer. Its address carries the one-time secret. */
+  function askPage(entry, port) {
+    const site = escapeHtml(entry.site);
+    const local = /:\d+$/.test(entry.site) || entry.site === 'localhost';
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Allow pre.dev to use ${site}?</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0d0d;color:#cfd3da;font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif}
+main{max-width:480px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p{margin:0 0 12px;color:#9aa3b2}b{color:#fff}
+.row{display:flex;gap:10px;margin-top:20px}button{font:inherit;font-weight:600;border-radius:8px;padding:9px 16px;cursor:pointer;border:1px solid #333}
+.yes{background:#fff;color:#000;border-color:#fff}.no{background:transparent;color:#cfd3da}.warn{color:#f5c26b}</style></head>
+<body><main><h1>Allow pre.dev to use <b>${site}</b> in this Chrome?</h1>
+<p>A pre.dev run you started on the web wants to work on <b>${site}</b> here, signed in as you. It reads and clicks only in tabs it opens.</p>
+<p>It never types passwords, codes or card numbers, and it asks you before it sends, posts, buys or deletes anything.</p>
+${local ? '<p class="warn">This address is on this computer or your own network. Only allow it if you expect the run to use it.</p>' : ''}
+<p>Only allow sites you expect. You can stop all of it with: npx -y @predotdev/mcp unpair</p>
+<form method="post" action="/allow/${entry.nonce}" class="row">
+<button class="yes" name="decision" value="allow" type="submit">Allow</button>
+<button class="no" name="decision" value="deny" type="submit">Don't allow</button>
+</form></main></body></html>`;
+  }
+
+  const donePage = allowed => `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>pre.dev</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0d0d;color:#cfd3da;font:15px/1.5 ui-sans-serif,system-ui,sans-serif}</style></head>
+<body><p>${allowed ? 'Allowed. pre.dev carries on, and this tab closes.' : "Not allowed. pre.dev won't use this site here."}</p></body></html>`;
+
+  /** The daemon's HTTP server hands these here first: the question page and its answer. They
+   *  carry no daemon token (a page in Chrome can't); the one-time secret in the address is the key. */
+  async function handleHttp(req, res, port) {
+    const m = /^\/allow\/([A-Za-z0-9_-]{20,64})$/.exec(req.url || '');
+    if (!m) return false;
+    const entry = byNonce.get(m[1]);
+    const send = (status, html) => { res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-frame-options': 'DENY' }); res.end(html); };
+    if (!entry || entry.decided) { send(410, donePage(false)); return true; }
+    if (req.method === 'GET') { send(200, askPage(entry, port)); return true; }
+    if (req.method !== 'POST') { send(405, ''); return true; }
+    // Only the page itself answers: the same origin, a form the person submitted.
+    const origin = String(req.headers.origin || '');
+    if (origin !== `http://127.0.0.1:${port}` || String(req.headers['sec-fetch-site'] || '') !== 'same-origin') { send(403, donePage(false)); return true; }
+    let body = '';
+    for await (const chunk of req) { body += chunk; if (body.length > 1000) break; }
+    const decision = new URLSearchParams(body).get('decision');
+    decide(entry, decision === 'allow');
+    send(200, donePage(decision === 'allow'));
+    return true;
+  }
+
+  function decide(entry, allowed) {
+    if (entry.decided) return;
+    entry.decided = allowed ? 'allow' : 'deny';
+    if (allowed) allow(entry.site);
+    log('channel', `site ${entry.site} ${entry.decided}`);
+    for (const w of entry.waiters.splice(0)) w(allowed);
+    asking.delete(entry.site);
+    setTimeout(() => {
+      byNonce.delete(entry.nonce);
+      if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
+      privateTabs.delete(entry.targetId);
+    }, allowed ? 1500 : 4000);
+  }
+
+  /** Ask the person at this computer to allow a site for web runs. true once allowed. */
+  async function askToAllow(site, port, inFront) {
+    if (isAllowed(site)) return true;
+    let entry = asking.get(site);
+    if (!entry) {
+      entry = { site, nonce: crypto.randomBytes(24).toString('base64url'), decided: null, waiters: [], targetId: null };
+      asking.set(site, entry);
+      byNonce.set(entry.nonce, entry);
+      try {
+        await chrome.connect();
+        const front = await inFront().catch(() => true);
+        const { targetId } = await chrome.send('Target.createTarget', { url: `http://127.0.0.1:${port}/allow/${entry.nonce}`, background: !front });
+        entry.targetId = targetId;
+        // pre.dev's own tab: no agent may read or act in it.
+        privateTabs.add(targetId);
+        log('channel', `asked to allow ${site}`);
+        // Brought forward only once Chrome is the app in front, so it never takes the keyboard.
+        if (!front) void (async () => {
+          for (let i = 0; i < ALLOW_WAIT_MS / 1000 && !entry.decided; i++) {
+            await sleep(1000);
+            if (await inFront().catch(() => false)) { await chrome.send('Target.activateTarget', { targetId }).catch(() => {}); return; }
+          }
+        })();
+      } catch (error) {
+        asking.delete(site);
+        byNonce.delete(entry.nonce);
+        throw new Error(`Could not ask on this computer: ${error.message}`);
+      }
+    }
+    const answer = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve(null), ALLOW_WAIT_MS);
+      entry.waiters.push(v => { clearTimeout(timer); resolve(v); });
+    });
+    // Nobody answered: the question goes away, the next call asks again.
+    if (answer === null && !entry.decided) {
+      entry.decided = 'timeout';
+      asking.delete(site);
+      byNonce.delete(entry.nonce);
+      if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
+      privateTabs.delete(entry.targetId);
+    }
+    return answer === true;
+  }
+
+  // ---------------------------------------------------------------- the calls a web run makes
+
+  function tabInfo(tab) {
+    const wanted = String(tab || '').trim().toUpperCase();
+    if (!wanted) return null;
+    const hits = [...chrome.targets.values()].filter(t => isPage(t) && t.targetId.toUpperCase().startsWith(wanted));
+    return hits.length === 1 ? hits[0] : null;
+  }
+
+  const text = (t, isError = true) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
+  const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
+
+  /** One call from a web run. `run.key` names the run, so its tabs are its own. */
+  async function webCall(body, port, api) {
+    const name = String(body?.name || '');
+    if (!WEB_TOOLS.has(name) && name !== HANDOFF_TOOL) return text(`${name || 'That tool'} isn't available to web runs in the user's Chrome.`);
+    const args = {};
+    for (const [k, v] of Object.entries(body?.args || {})) if (!k.startsWith('__')) args[k] = v;
+    const runKey = String(body?.run?.key || '').replace(/[^A-Za-z0-9:_-]/g, '').slice(0, 100);
+    if (!runKey) return text('A web run must say which run it is.');
+    // This computer's rules for every web run: the guard on, the run's own tabs.
+    args.__agent = runKey.startsWith('web:') ? runKey : `web:${runKey}`;
+    args.__predev_handoff = true;
+    args.__via = 'web';
+    if (args.tab && privateTabs.has(tabInfo(args.tab)?.targetId)) return text("That tab is pre.dev's own question to the user; no run can use it.");
+    // A new site needs a click here first: where the call goes, and where the tab is now.
+    const wanted = [];
+    if ((name === 'chrome_open' || name === 'chrome_navigate') && args.url && !['back', 'forward', 'reload'].includes(args.url)) {
+      const raw = String(args.url);
+      const site = siteOf(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
+      if (!site) return text('Web runs can open only http and https pages in the user\'s Chrome.');
+      wanted.push(site);
+    }
+    const info = args.tab ? tabInfo(args.tab) : null;
+    if (info) { const here = siteOf(info.url); if (here && !wanted.includes(here)) wanted.push(here); }
+    for (const site of wanted) {
+      if (isAllowed(site)) continue;
+      const ok = await askToAllow(site, port, api.chromeInFront);
+      if (!ok) return notAllowed(site);
+    }
+    const timeoutMs = Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
+    const signal = AbortSignal.timeout(timeoutMs);
+    const result = await callTool(name, args, { apiKey: key(), apiUrl: (pairing()?.apiUrl || defaultApiUrl), signal });
+    // The page a call ended on must be allowed too: else its text never leaves this computer.
+    if (MOVES.has(name) && !result?.isError) {
+      const shown = (result?.content || []).find(c => c.type === 'text')?.text || '';
+      const tab = /^Tab ([0-9A-F]{6,}) ·/m.exec(shown)?.[1] || args.tab;
+      const now = tab ? tabInfo(tab) : null;
+      const site = now ? siteOf(now.url) : '';
+      if (site && !isAllowed(site)) {
+        return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
+      }
+    }
+    return result;
+  }
+
+  function webTools(api) {
+    const ctx = { handoff: true, via: 'web', apiKey: key(), cloud: false };
+    return {
+      tools: api.toolList(ctx).filter(t => WEB_TOOLS.has(t.name)),
+      instructions: api.instructions(ctx),
+    };
+  }
+
+  function profiles() {
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(chromeDir, 'Local State'), 'utf8'));
+      const cache = state?.profile?.info_cache || {};
+      const last = state?.profile?.last_used || 'Default';
+      return Object.entries(cache).map(([dir, p]) => ({ dir, name: String(p?.name || dir), lastUsed: dir === last }));
+    } catch { return []; }
+  }
+
+  // ---------------------------------------------------------------- the tunnel
+
+  function frame(id, bytes) {
+    const out = Buffer.alloc(5 + bytes.length);
+    out[0] = FRAME_BODY;
+    out.writeUInt32BE(id >>> 0, 1);
+    bytes.copy(out, 5);
+    return out;
+  }
+
+  async function onRequest(socket, m, port) {
+    // The head goes at once: a call that waits for the person here (a new site, a handoff) is
+    // timed by its caller, not by the edge's first-byte wait.
+    const head = status => socket.send(JSON.stringify({ t: 'res', id: m.id, status, headers: [['content-type', 'application/json']] }));
+    const end = value => {
+      if (socket.readyState !== 1) return;
+      const bytes = Buffer.from(JSON.stringify(value));
+      for (let at = 0; at < bytes.length; at += CHUNK) socket.send(frame(m.id, bytes.subarray(at, at + CHUNK)));
+      socket.send(JSON.stringify({ t: 'res-end', id: m.id }));
+    };
+    let body = null;
+    try { body = m.body ? JSON.parse(Buffer.from(m.body, 'base64').toString('utf8')) : null; } catch {}
+    const route = `${m.method} ${String(m.path || '').split('?')[0]}`;
+    try {
+      head(200);
+      const api = await loadTools();
+      if (route === 'GET /state') {
+        end({ ok: true, chrome: chrome.connected || fs.existsSync(path.join(chromeDir, 'DevToolsActivePort')), version: ctx.version, profiles: profiles() });
+      } else if (route === 'GET /tools') {
+        end(webTools(api));
+      } else if (route === 'POST /call') {
+        const started = Date.now();
+        const result = await webCall(body, port, api);
+        log('channel', 'call', String(body?.name || ''), result?.isError ? 'refused or failed' : 'ok', `${Date.now() - started}ms`);
+        end({ result });
+      } else {
+        end({ error: 'not found' });
+      }
+    } catch (error) {
+      log('channel', route, 'error', error.message);
+      end({ result: text(`Error: ${error.message}`) });
+    }
+  }
+
+  async function connectOnce(port) {
+    const p = pairing();
+    if (!p?.apiUrl) { status = 'unpaired'; return 'stop'; }
+    if (!key()) { status = 'signed_out'; return 'later'; }
+    let grant;
+    try {
+      const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId() });
+      if (r.status === 409) {
+        // Unpaired at pre.dev, or another computer took over: stop, and say so in the log.
+        log('channel', 'pre.dev says this computer is no longer paired; stopping');
+        try { fs.rmSync(PAIRING_FILE, { force: true }); } catch {}
+        status = 'unpaired';
+        return 'stop';
+      }
+      if (r.status === 404) { status = 'unavailable'; return 'later'; }
+      if (r.status === 401 || r.status === 403) { status = 'signed_out'; return 'later'; }
+      if (!r.json?.grant?.url) { status = 'offline'; return 'retry'; }
+      grant = r.json.grant;
+    } catch (error) {
+      log('channel', 'grant failed', error.message);
+      status = 'offline';
+      return 'retry';
+    }
+    const headers = { Authorization: `Bearer ${grant.token}`, 'X-Predev-Ping-Ms': String(PING_MS) };
+    // Against a local edge (development), name the host the edge would see.
+    try { if (new URL(grant.url).host !== grant.host) headers['X-Predev-Dev-Host'] = grant.host; } catch {}
+    return new Promise(resolve => {
+      let opened = false;
+      let settled = false;
+      let heardAt = Date.now();
+      const socket = new WebSocket(grant.url, { headers });
+      ws = socket;
+      socket.binaryType = 'arraybuffer';
+      // One way out, whichever comes first: the close, a connect that hangs, or a link that went
+      // silent (the edge answers every ping, so two missed answers mean it is gone).
+      const finish = (next, why) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(pingTimer);
+        clearTimeout(connectTimer);
+        if (ws === socket) ws = null;
+        if (status === 'online') status = 'offline';
+        log('channel', 'closed', why);
+        try { socket.close(1000, 'reconnect'); } catch {}
+        resolve(next);
+      };
+      const connectTimer = setTimeout(() => { if (!opened) finish('retry', 'connect timed out'); }, 15000);
+      socket.onopen = () => {
+        opened = true;
+        heardAt = Date.now();
+        status = 'online';
+        clearTimeout(connectTimer);
+        log('channel', 'connected');
+        clearInterval(pingTimer);
+        pingTimer = setInterval(() => {
+          if (Date.now() - heardAt > 2.5 * PING_MS) return finish('retry-now', 'no answer from pre.dev');
+          try { socket.send('{"t":"ping"}'); } catch {}
+        }, PING_MS);
+        pingTimer.unref?.();
+      };
+      socket.onmessage = event => {
+        heardAt = Date.now();
+        if (typeof event.data !== 'string') return;
+        let m;
+        try { m = JSON.parse(event.data); } catch { return; }
+        if (m.t === 'req' && Number.isInteger(m.id)) void onRequest(socket, m, port);
+      };
+      socket.onerror = () => {};
+      socket.onclose = event => {
+        // Unpaired or replaced at pre.dev: the edge cut it off on purpose.
+        finish(event.code === 4003 ? 'check' : opened ? 'retry-now' : 'retry', `${event.code || ''} ${event.reason || ''}`.trim());
+      };
+    });
+  }
+
+  async function loop(port) {
+    let backoff = 1000;
+    while (running) {
+      const next = await connectOnce(port).catch(error => { log('channel', 'error', error.message); return 'retry'; });
+      if (!running || next === 'stop') break;
+      if (next === 'retry-now') backoff = 1000;
+      const wait = next === 'later' ? 60000 : next === 'check' ? 2000 : backoff;
+      backoff = Math.min(backoff * 2, 30000);
+      await new Promise(resolve => { wake = resolve; setTimeout(resolve, wait).unref?.(); });
+      wake = null;
+    }
+    running = false;
+    if (status === 'online') status = 'offline';
+  }
+
+  return {
+    computerId,
+    pairing,
+    handleHttp,
+    get status() { return pairing() ? status : 'unpaired'; },
+    /** Start (or keep) the channel when this computer is paired. */
+    start(port) {
+      if (running || !pairing()) return;
+      running = true;
+      status = 'connecting';
+      void loop(port);
+    },
+    /** Stop it now (unpair). */
+    stop() {
+      running = false;
+      try { ws?.close(1000, 'unpaired'); } catch {}
+      wake?.();
+      status = 'unpaired';
+    },
+    /** Pairing changed on disk (pair, unpair): follow it. */
+    reload(port) {
+      if (!pairing()) { this.stop(); try { fs.rmSync(SITES_FILE, { force: true }); } catch {} return; }
+      if (!running) this.start(port);
+      else { try { ws?.close(1000, 'reload'); } catch {} wake?.(); }
+    },
+  };
+}

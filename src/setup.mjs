@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { computerIdIn, pairingFiles } from './channel.mjs';
 
 const CLIENT_ID = 'predev-chrome-mcp';
 // pre.dev's own servers: the hosted one, this package under either name, or its installed copy.
@@ -499,6 +500,17 @@ export function createSetup(ctx) {
 
   async function uninstall() {
     console.log('Removing the pre.dev MCP');
+    // Paired for pre.dev web runs: tell pre.dev too (best effort; the daemon stops below anyway).
+    const paired = (() => { try { return JSON.parse(fs.readFileSync(pairingFiles(stateDir).pairing, 'utf8')); } catch { return null; } })();
+    const key = String(readCredentials().apiKey || cliLogin() || '');
+    if (paired?.apiUrl && key) {
+      await fetch(`${paired.apiUrl.replace(/\/+$/, '')}/computer-channel/unpair`, {
+        method: 'POST', signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir) }),
+      }).catch(() => null);
+      ok('Unpaired from pre.dev web runs');
+    }
     for (const agent of AGENTS) {
       let found = false;
       try { found = agent.detect(); } catch {}
@@ -522,5 +534,85 @@ export function createSetup(ctx) {
     console.log('\nDone. Restart your agents. To also turn off remote debugging, open chrome://inspect/#remote-debugging.');
   }
 
-  return { setup, login, logout, uninstall, installApp };
+  // ------------------------------------------------------------------ pairing (PREDEV_HANDOFF)
+  // "Do it in my Chrome": pre.dev web runs you start may do steps in this Chrome, signed in as you
+  // (channel.mjs). Pairing is a device-code sign-in you approve on pre.dev, then this computer
+  // registered as yours: one paired computer per account, a new one replaces the old.
+
+  const files = pairingFiles(stateDir);
+  const readPairing = () => { try { return JSON.parse(fs.readFileSync(files.pairing, 'utf8')); } catch { return null; } };
+  const computerName = () => (process.env.PREDEV_COMPUTER_NAME || os.hostname()).replace(/\.local$/i, '').slice(0, 80) || 'computer';
+
+  // A daemon from before the channel can't carry web runs: replace it.
+  async function daemonWithChannel() {
+    const state = await ensureDaemon();
+    const has = await request(state, 'GET', '/channel', null, 3000).then(r => typeof r?.status === 'string').catch(() => false);
+    if (has) return state;
+    console.log('  Restarting the background daemon so web runs can reach Chrome (Chrome may ask "Allow remote debugging?" once more).');
+    await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {});
+    await sleep(500);
+    return ensureDaemon();
+  }
+
+  async function pair() {
+    console.log('Pair this computer with pre.dev');
+    console.log("  Web runs you start on pre.dev can then do steps in this Chrome, signed in as you, while this computer is on.");
+    console.log('  The first time a run uses a site here, this Chrome asks you to allow it.');
+    step(1, 'Approve this computer on pre.dev');
+    let key = '';
+    try { key = await signIn(false); } catch (error) { bad(error.message); }
+    if (key) ok('Approved');
+    if (!failed) { step(2, 'Connect to Chrome'); await connectChrome(); }
+    if (!failed) {
+      step(3, 'Pair');
+      const url = apiUrl();
+      const name = computerName();
+      const res = await fetch(`${url}/computer-channel/pair`, {
+        method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir), name, os: { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }[process.platform] || process.platform }),
+      }).catch(error => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 404) bad('Pairing a computer is not available on your pre.dev account yet.');
+      else if (!res.ok) bad(`pre.dev could not pair this computer: ${body.error || `HTTP ${res.status}`}`);
+      else {
+        fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+        const tmp = `${files.pairing}.${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify({ apiUrl: url, name, pairedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+        fs.renameSync(tmp, files.pairing);
+        const state = await daemonWithChannel();
+        await request(state, 'POST', '/channel/reload', {}, 5000).catch(() => {});
+        let status = '';
+        for (let i = 0; i < 30 && status !== 'online'; i++) {
+          await sleep(500);
+          status = (await request(state, 'GET', '/channel', null, 3000).catch(() => ({})))?.status || '';
+        }
+        if (status === 'online') ok(`Paired as "${name}"${body.replaced ? ` (replaces "${body.replaced}")` : ''}. Web runs you start can use this Chrome while pre.dev's MCP runs here.`);
+        else bad(`Paired as "${name}", but the connection to pre.dev isn't up yet (${status || 'no answer'}). It keeps trying; see ${path.join(stateDir, 'predev-mcp.log').replace(home, '~')}.`);
+      }
+    }
+    console.log(failed ? '\nFix the ✗ items above, then run this again (it is safe to repeat).' : '\nTo stop it any time: npx -y @predotdev/mcp unpair');
+    process.exit(failed ? 1 : 0);
+  }
+
+  async function unpair() {
+    const pairing = readPairing();
+    fs.rmSync(files.pairing, { force: true });
+    fs.rmSync(files.sites, { force: true });
+    // The daemon drops the channel now, whatever pre.dev answers.
+    const state = await (async () => { try { return await ensureDaemon(); } catch { return null; } })();
+    if (state) await request(state, 'POST', '/channel/reload', {}, 5000).catch(() => {});
+    const key = String(process.env.PREDEV_API_KEY || readCredentials().apiKey || cliLogin() || '');
+    if (pairing?.apiUrl && key) {
+      const res = await fetch(`${pairing.apiUrl.replace(/\/+$/, '')}/computer-channel/unpair`, {
+        method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir) }),
+      }).catch(() => null);
+      if (!res?.ok) skip(`pre.dev did not confirm (${res ? `HTTP ${res.status}` : 'no answer'}); this computer stopped anyway.`);
+    }
+    ok(pairing ? 'Unpaired: pre.dev web runs can no longer reach this Chrome.' : 'This computer was not paired.');
+  }
+
+  return { setup, login, logout, uninstall, installApp, pair, unpair };
 }

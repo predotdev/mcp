@@ -481,6 +481,7 @@ This tool drives your real, logged-in Chrome. Read this before you turn it on.
 - **It only listens on your machine.** The background process binds to `127.0.0.1` only and rejects requests without a random per-run token, which is stored in a file only you can read. It also rejects any request that comes from a web page.
 - **What leaves your machine.** Plain-words actions send pre.dev what that one action needs, and pre.dev's AI model reads it to answer: `chrome_act` sends your description, the page's headings and its interactive elements (role, name and field value, with the secret fields above masked); a plain-words `chrome_wait` sends the condition, the page title, its URL (with token-like query values removed), the interactive elements and up to about 8,000 characters of the page's visible text. The cloud tools send what you ask them to do. Every other Chrome tool runs locally, though your agent's own AI model sees what the tools return.
 - **Handoffs (`PREDEV_HANDOFF=1`, off by default).** The agent hands you the steps that are yours instead of working around them: `chrome_handoff` brings the tab forward once Chrome is the app in front (never taking the keyboard from another app), and waits with no time limit until the page shows the step is done (for example, the URL leaves `/login`); it picks up again if Chrome quits and comes back, and handoffs from several agents take turns. While you have the tab the agent gets nothing from it. With it on, the agent also works only in tabs it opened (and their popups), never types into password, one-time code or card fields (input type and autocomplete decide, then pre.dev's check when you're signed in), can't write those fields or click from `chrome_eval`, asks you first before a click that would send, post, buy or delete something (without a pre.dev key: any form submit sent with POST), pauses when you click or type in its tab, and reads the page again after you had it.
+- **Your Chrome for your pre.dev web runs (`predev-mcp pair`, with `PREDEV_HANDOFF=1`; off until you pair).** Pairing lets runs you start on pre.dev's website do steps in this Chrome ("Do it in my Chrome"): you approve this computer on pre.dev with a short code, and the background process keeps one connection to pre.dev for your account. Only runs you typed yourself reach it, never a teammate's. The first time a web run uses a site here, this Chrome opens a pre.dev page asking you to allow that site, and only you can answer it (its address carries a one-time secret no run sees). The guard above is always on for those calls, whatever your agents' settings: only tabs the run opened, no typing into password, code or card fields, ask first before send, post, buy or delete. Web runs can't run scripts, upload files from this computer, take screenshots or read cookies or storage here. `predev-mcp unpair` stops it at once, here and at pre.dev.
 - **Off switch.** Run `npx -y @predotdev/mcp stop` to stop the background process, or turn remote debugging off at `chrome://inspect/#remote-debugging`.
 
 ## Configuration
@@ -507,6 +508,13 @@ npx -y @predotdev/mcp login      # sign in to pre.dev again
 npx -y @predotdev/mcp logout     # forget the saved key
 npx -y @predotdev/mcp stop       # stop the background process (it restarts on the next tool call)
 npx -y @predotdev/mcp uninstall  # remove it from every agent and delete its files
+```
+
+With `PREDEV_HANDOFF=1`:
+
+```bash
+npx -y @predotdev/mcp pair       # let pre.dev web runs you start do steps in this Chrome
+npx -y @predotdev/mcp unpair     # stop that now
 ```
 
 ## Troubleshooting
