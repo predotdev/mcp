@@ -25,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import { createRemote } from './remote.mjs';
+import { createChannel } from './channel.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TOOLS_FILE = (file => { try { return fs.realpathSync(file); } catch { return file; } })(path.join(path.dirname(SELF), 'tools.mjs'));
@@ -203,7 +204,7 @@ let daemonPort = 0;
 
 const core = {
   chrome, contextDirs, failedProbes, triedDirs, saveProfileMap, log, sleep,
-  chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR), version: PKG.version || '0.0.0',
+  chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR), version: PKG.version || '0.0.0', stateDir: STATE_DIR,
   get daemonPort() { return daemonPort; },
 };
 
@@ -283,7 +284,17 @@ function runDaemon() {
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(0));
 
   const token = crypto.randomBytes(24).toString('hex');
+  // pre.dev web runs on this computer's Chrome, once it is paired (channel.mjs). Unpaired, it
+  // does nothing: no tunnel, no pages, no state.
+  chrome.__predevPrivate ??= new Set();
+  const channel = createChannel({
+    stateDir: STATE_DIR, chromeDir: CHROME_DIR, chrome, log, sleep, privateTabs: chrome.__predevPrivate,
+    callTool: (name, args, ctx) => callTool(name, args, ctx), loadTools: () => loadTools(),
+    readCredentials, cliLogin, defaultApiUrl: DEFAULT_API_URL, version: PKG.version || '0.0.0',
+  });
   const server = http.createServer(async (req, res) => {
+    // The "Allow pre.dev to use this site?" page in Chrome: its one-time address is its key.
+    if (req.url?.startsWith('/allow/') && channel.pairing() && await channel.handleHttp(req, res, daemonPort)) return;
     if (req.method === 'GET' && req.url === '/blank') {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end('<!doctype html><title>Opening…</title>');
@@ -294,6 +305,9 @@ function runDaemon() {
     const reply = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     if (req.method === 'GET' && req.url === '/health') return reply({ ok: true, protocol: PROTOCOL, version: PKG.version || '0.0.0', chrome: chrome.connected });
     if (req.method === 'POST' && req.url === '/shutdown') { reply({ ok: true }); setTimeout(() => process.exit(0), 50); return; }
+    // The computer channel's state, and "pairing changed on disk" from pair / unpair.
+    if (req.method === 'GET' && req.url === '/channel') return reply({ status: channel.status });
+    if (req.method === 'POST' && req.url === '/channel/reload') { channel.reload(daemonPort); return reply({ status: channel.status }); }
     if (req.method === 'POST' && req.url === '/call') {
       let body = '';
       for await (const chunk of req) body += chunk;
@@ -327,6 +341,7 @@ function runDaemon() {
     fs.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token, pid: process.pid, protocol: PROTOCOL, version: PKG.version || '0.0.0' }), { mode: 0o600 });
     fs.renameSync(tmp, STATE_FILE);
     log('daemon listening on', server.address().port, 'protocol', PROTOCOL, 'version', PKG.version || '0.0.0');
+    channel.start(daemonPort);
   });
 }
 
@@ -654,6 +669,14 @@ Commands:
 
 Docs: https://docs.pre.dev/browser-agents/local
 `;
+// Pairing, only with handoffs on (PREDEV_HANDOFF=1): off, the help is as before.
+const PAIR_HELP = `  predev-mcp pair       let pre.dev web runs you start do steps in this Chrome ("Do it in my
+                        Chrome"); each new site asks you here first
+  predev-mcp unpair     stop that now, for this computer
+  predev-mcp sites      the sites web runs may use here; \`sites revoke <site>\` revokes one at once
+  predev-mcp start-at-login on|off
+                        keep pre.dev connected when you log in (pair asks)
+`;
 
 async function runCheck() {
   let failed = false;
@@ -683,6 +706,13 @@ async function runCheck() {
       ok('Connected to Chrome. Your profiles:');
       console.log(text.split('\n').map(line => `      ${line}`).join('\n'));
     }
+  }
+  // Paired for pre.dev web runs (predev-mcp pair): say whether the channel is up.
+  if (fs.existsSync(path.join(STATE_DIR, 'pairing.json'))) {
+    const state = readState();
+    const status = state ? (await request(state, 'GET', '/channel', null, 3000).catch(() => ({})))?.status : 'daemon not running';
+    if (status === 'online') ok('Paired: pre.dev web runs you start can use this Chrome');
+    else console.log(`  · Paired for pre.dev web runs, connection: ${status || 'unknown'}`);
   }
   const { apiKey, apiUrl } = shimCtx();
   if (!apiKey) {
@@ -765,14 +795,14 @@ async function runCall(name, raw) {
   process.exit(result.isError ? 1 : 0);
 }
 
-async function runSetupCommand(name) {
+async function runSetupCommand(name, args = []) {
   const { createSetup } = await import(pathToFileURL(path.join(path.dirname(SELF), 'setup.mjs')).href);
   const setup = createSetup({
     baseStateDir: BASE_STATE_DIR, stateDir: STATE_DIR, chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR),
     pkg: PKG, sleep, ensureDaemon, request, readCredentials, credentialsFile: CREDENTIALS_FILE, cliLogin,
     packageRoot: path.join(path.dirname(SELF), '..'),
   });
-  await setup[name]();
+  await setup[name](...args);
 }
 
 const command = process.argv[2] || '';
@@ -784,7 +814,9 @@ else if (command === 'tools') runTools();
 else if (command === 'call') runCall(process.argv[3], process.argv[4]);
 else if (command === 'stop') runStop();
 else if (command === '--version' || command === '-v') console.log(PKG.version || '0.0.0');
-else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HELP);
+else if (HANDOFF && (command === 'pair' || command === 'unpair')) runSetupCommand(command);
+else if (HANDOFF && (command === 'sites' || command === 'start-at-login')) runSetupCommand(command === 'sites' ? 'sites' : 'startAtLogin', process.argv.slice(3));
+else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HANDOFF ? HELP.replace('  predev-mcp uninstall', `${PAIR_HELP}  predev-mcp uninstall`) : HELP);
 else if (command === '' || command === 'mcp') {
   if (process.stdin.isTTY && !command) process.stderr.write(HELP);
   else runMcp();

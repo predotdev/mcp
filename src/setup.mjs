@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { computerIdIn, forgetAllowedSite, pairingFiles, readAllowedSites } from './channel.mjs';
 
 const CLIENT_ID = 'predev-chrome-mcp';
 // pre.dev's own servers: the hosted one, this package under either name, or its installed copy.
@@ -499,6 +500,18 @@ export function createSetup(ctx) {
 
   async function uninstall() {
     console.log('Removing the pre.dev MCP');
+    // Paired for pre.dev web runs: tell pre.dev too (best effort; the daemon stops below anyway).
+    const paired = (() => { try { return JSON.parse(fs.readFileSync(pairingFiles(stateDir).pairing, 'utf8')); } catch { return null; } })();
+    const key = String(readCredentials().apiKey || cliLogin() || '');
+    if (paired?.apiUrl && key) {
+      await fetch(`${paired.apiUrl.replace(/\/+$/, '')}/computer-channel/unpair`, {
+        method: 'POST', signal: AbortSignal.timeout(10000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir) }),
+      }).catch(() => null);
+      ok('Unpaired from pre.dev web runs');
+    }
+    loginItem('off');
     for (const agent of AGENTS) {
       let found = false;
       try { found = agent.detect(); } catch {}
@@ -522,5 +535,237 @@ export function createSetup(ctx) {
     console.log('\nDone. Restart your agents. To also turn off remote debugging, open chrome://inspect/#remote-debugging.');
   }
 
-  return { setup, login, logout, uninstall, installApp };
+  // ------------------------------------------------------------------ pairing (PREDEV_HANDOFF)
+  // "Do it in my Chrome": pre.dev web runs you start may do steps in this Chrome, signed in as you
+  // (channel.mjs). Pairing is a device-code sign-in you approve on pre.dev, then this computer
+  // registered as yours. An account can pair several computers; pairing one never unpairs another.
+
+  const files = pairingFiles(stateDir);
+  const readPairing = () => { try { return JSON.parse(fs.readFileSync(files.pairing, 'utf8')); } catch { return null; } };
+  const computerName = () => (process.env.PREDEV_COMPUTER_NAME || os.hostname()).replace(/\.local$/i, '').slice(0, 80) || 'computer';
+
+  // A daemon from before the channel can't carry web runs: replace it.
+  async function daemonWithChannel() {
+    const state = await ensureDaemon();
+    const has = await request(state, 'GET', '/channel', null, 3000).then(r => typeof r?.status === 'string').catch(() => false);
+    if (has) return state;
+    console.log('  Restarting the background daemon so web runs can reach Chrome (Chrome may ask "Allow remote debugging?" once more).');
+    await request(state, 'POST', '/shutdown', {}, 3000).catch(() => {});
+    await sleep(500);
+    return ensureDaemon();
+  }
+
+  async function pair() {
+    console.log('Pair this computer with pre.dev');
+    console.log("  Web runs you start on pre.dev can then do steps in this Chrome, signed in as you, while this computer is on.");
+    console.log('  The first time a run uses a site here, this Chrome asks you to allow it.');
+    step(1, 'Approve this computer on pre.dev');
+    let key = '';
+    try { key = await signIn(false); } catch (error) { bad(error.message); }
+    if (key) ok('Approved');
+    if (!failed) { step(2, 'Connect to Chrome'); await connectChrome(); }
+    if (!failed) {
+      step(3, 'Pair');
+      const url = apiUrl();
+      const name = computerName();
+      const res = await fetch(`${url}/computer-channel/pair`, {
+        method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir), name, os: { darwin: 'macOS', win32: 'Windows', linux: 'Linux' }[process.platform] || process.platform }),
+      }).catch(error => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 404) bad('Pairing a computer is not available on your pre.dev account yet.');
+      else if (!res.ok) bad(`pre.dev could not pair this computer: ${body.error || `HTTP ${res.status}`}`);
+      else {
+        fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+        const tmp = `${files.pairing}.${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify({ apiUrl: url, name, pairedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+        fs.renameSync(tmp, files.pairing);
+        const state = await daemonWithChannel();
+        await request(state, 'POST', '/channel/reload', {}, 5000).catch(() => {});
+        let status = '';
+        for (let i = 0; i < 30 && status !== 'online'; i++) {
+          await sleep(500);
+          status = (await request(state, 'GET', '/channel', null, 3000).catch(() => ({})))?.status || '';
+        }
+        const others = Array.isArray(body.others) && body.others.length ? ` Your other paired computers stay paired: ${body.others.map(n => `"${n}"`).join(', ')}.` : '';
+        if (status === 'online') ok(`Paired as "${name}". Web runs you start can use this Chrome while pre.dev's MCP runs here.${others}`);
+        else bad(`Paired as "${name}", but the connection to pre.dev isn't up yet (${status || 'no answer'}). It keeps trying; see ${path.join(stateDir, 'predev-mcp.log').replace(home, '~')}.`);
+        // Staying connected after a restart: the person here decides.
+        if (!failed) {
+          step(4, 'Stay connected');
+          const yes = await askYesNo('Keep pre.dev connected when you log in to this computer? [Y/n] ', true);
+          if (yes) {
+            // The login item starts the stable copy, never a temporary npx folder.
+            if (!fs.existsSync(APP_ENTRY)) installApp();
+            const where = loginItem('on');
+            if (where) ok(`pre.dev starts when you log in (${where}). Turn it off any time: npx -y @predotdev/mcp start-at-login off`);
+            else skip('This system has no login item pre.dev knows how to add. Start pre.dev\'s MCP yourself to stay connected.');
+          } else {
+            loginItem('off');
+            skip('pre.dev stays connected only while its MCP runs here. Turn it on any time: npx -y @predotdev/mcp start-at-login on');
+          }
+        }
+      }
+    }
+    console.log(failed ? '\nFix the ✗ items above, then run this again (it is safe to repeat).' : '\nTo stop it any time: npx -y @predotdev/mcp unpair');
+    process.exit(failed ? 1 : 0);
+  }
+
+  async function unpair() {
+    const pairing = readPairing();
+    fs.rmSync(files.pairing, { force: true });
+    fs.rmSync(files.sites, { force: true });
+    fs.rmSync(files.tasks, { force: true });
+    // Nothing to stay connected for.
+    loginItem('off');
+    // The daemon drops the channel now, whatever pre.dev answers.
+    const state = await (async () => { try { return await ensureDaemon(); } catch { return null; } })();
+    if (state) await request(state, 'POST', '/channel/reload', {}, 5000).catch(() => {});
+    const key = String(process.env.PREDEV_API_KEY || readCredentials().apiKey || cliLogin() || '');
+    if (pairing?.apiUrl && key) {
+      const res = await fetch(`${pairing.apiUrl.replace(/\/+$/, '')}/computer-channel/unpair`, {
+        method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir) }),
+      }).catch(() => null);
+      if (!res?.ok) skip(`pre.dev did not confirm (${res ? `HTTP ${res.status}` : 'no answer'}); this computer stopped anyway.`);
+    }
+    ok(pairing ? 'Unpaired: pre.dev web runs can no longer reach this Chrome.' : 'This computer was not paired.');
+  }
+
+  // ------------------------------------------------------------------ staying connected
+
+  /** A yes/no question for the person at this computer. Without a terminal, the default. */
+  function askYesNo(question, fallback) {
+    if (!process.stdin.isTTY) {
+      console.log(`  ${question.trim()} ${fallback ? 'yes' : 'no'} (no terminal to ask in; the default)`);
+      return Promise.resolve(fallback);
+    }
+    return new Promise(resolve => {
+      process.stdout.write(`  ${question}`);
+      process.stdin.resume();
+      process.stdin.once('data', d => {
+        process.stdin.pause();
+        const a = String(d).trim().toLowerCase();
+        resolve(a ? /^y/.test(a) : fallback);
+      });
+    });
+  }
+
+  // One login item per Chrome this computer pairs (a custom Chrome folder has its own daemon).
+  const loginLabel = customChromeDir ? `dev.pre.mcp.${path.basename(stateDir)}` : 'dev.pre.mcp';
+  const loginEntry = () => (fs.existsSync(APP_ENTRY) ? APP_ENTRY : path.join(packageRoot, 'src', 'bridge.mjs'));
+  const loginEnv = () => ({
+    ...(customChromeDir ? { CHROME_MCP_USER_DATA_DIR: chromeDir } : {}),
+    ...(process.env.PREDEV_API_URL ? { PREDEV_API_URL: process.env.PREDEV_API_URL } : {}),
+  });
+  const loginFiles = {
+    darwin: () => path.join(home, 'Library', 'LaunchAgents', `${loginLabel}.plist`),
+    linux: () => path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'autostart', `${loginLabel}.desktop`),
+  };
+  const xml = v => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  /**
+   * Start pre.dev's background process (which holds the channel) when this user logs in: a
+   * LaunchAgent on macOS, an autostart entry on Linux, a Run key on Windows. It takes effect at the
+   * next login; nothing is started or loaded now (the daemon already runs). Returns where, or ''.
+   */
+  function loginItem(mode) {
+    const file = loginFiles[process.platform]?.();
+    if (mode === 'status') {
+      if (file) return fs.existsSync(file) ? file.replace(home, '~') : '';
+      if (process.platform === 'win32') return run('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', loginLabel]).status === 0 ? 'Windows sign-in (Run key)' : '';
+      return '';
+    }
+    if (mode === 'off') {
+      if (file) fs.rmSync(file, { force: true });
+      else if (process.platform === 'win32') run('reg', ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', loginLabel, '/f']);
+      return '';
+    }
+    const env = loginEnv();
+    if (process.platform === 'darwin') {
+      const envXml = Object.keys(env).length
+        ? `  <key>EnvironmentVariables</key>\n  <dict>\n${Object.entries(env).map(([k, v]) => `    <key>${xml(k)}</key><string>${xml(v)}</string>`).join('\n')}\n  </dict>\n`
+        : '';
+      const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${xml(loginLabel)}</string>
+  <key>ProgramArguments</key>
+  <array><string>${xml(NODE)}</string><string>${xml(loginEntry())}</string><string>daemon</string></array>
+${envXml}  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>${xml(path.join(stateDir, 'predev-mcp.log'))}</string>
+  <key>StandardErrorPath</key><string>${xml(path.join(stateDir, 'predev-mcp.log'))}</string>
+</dict>
+</plist>
+`;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, plist, { mode: 0o644 });
+      return file.replace(home, '~');
+    }
+    if (process.platform === 'linux') {
+      const envPart = Object.entries(env).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+      const desktop = `[Desktop Entry]\nType=Application\nName=pre.dev\nComment=Keeps pre.dev connected for web runs you start\nExec=${envPart ? `env ${envPart} ` : ''}${JSON.stringify(NODE)} ${JSON.stringify(loginEntry())} daemon\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n`;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, desktop, { mode: 0o644 });
+      return file.replace(home, '~');
+    }
+    if (process.platform === 'win32') {
+      const cmd = `"${NODE}" "${loginEntry()}" daemon`;
+      const r = run('reg', ['add', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', loginLabel, '/t', 'REG_SZ', '/d', cmd, '/f']);
+      return r.status === 0 ? 'Windows sign-in (Run key)' : '';
+    }
+    return '';
+  }
+
+  async function startAtLogin(mode = 'status') {
+    if (mode === 'on') {
+      if (!readPairing()) { bad('This computer is not paired. Pair it first: npx -y @predotdev/mcp pair'); process.exit(1); }
+      const where = loginItem('on');
+      if (where) ok(`pre.dev starts when you log in (${where}).`);
+      else bad('This system has no login item pre.dev knows how to add.');
+    } else if (mode === 'off') {
+      loginItem('off');
+      ok('pre.dev no longer starts when you log in. It stays connected only while its MCP runs here.');
+    } else {
+      const where = loginItem('status');
+      console.log(where ? `pre.dev starts when you log in (${where}).` : 'pre.dev does not start when you log in.');
+    }
+    process.exit(failed ? 1 : 0);
+  }
+
+  // ------------------------------------------------------------------ allowed sites
+
+  /** The sites this computer allowed pre.dev web runs to use, and revoking one (here and at pre.dev, at once). */
+  async function sites(mode = 'list', site = '') {
+    const list = readAllowedSites(stateDir);
+    if (mode !== 'revoke') {
+      const names = Object.entries(list);
+      if (!readPairing()) console.log('This computer is not paired with pre.dev.');
+      console.log(names.length
+        ? `Sites pre.dev web runs may use in this Chrome:\n${names.map(([s, v]) => `  ${s}  (allowed ${String(v?.allowedAt || '').slice(0, 10)})`).join('\n')}\nRevoke one: npx -y @predotdev/mcp sites revoke <site>`
+        : 'No sites allowed yet. The first time a web run uses a site here, this Chrome asks you.');
+      process.exit(0);
+    }
+    const name = String(site || '').trim().toLowerCase();
+    if (!name) { bad('Name the site to revoke, e.g. npx -y @predotdev/mcp sites revoke google.com'); process.exit(1); }
+    const had = forgetAllowedSite(stateDir, name);
+    const pairing = readPairing();
+    const key = String(process.env.PREDEV_API_KEY || readCredentials().apiKey || cliLogin() || '');
+    if (pairing?.apiUrl && key) {
+      await fetch(`${pairing.apiUrl.replace(/\/+$/, '')}/computer-channel/sites/revoke`, {
+        method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+        body: JSON.stringify({ computerId: computerIdIn(stateDir), site: name }),
+      }).catch(() => null);
+    }
+    if (had) ok(`Revoked: pre.dev web runs can no longer use ${name} in this Chrome without asking again.`);
+    else skip(`${name} was not on the list.`);
+    process.exit(0);
+  }
+
+  return { setup, login, logout, uninstall, installApp, pair, unpair, startAtLogin, sites, loginItem };
 }
