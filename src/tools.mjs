@@ -945,6 +945,19 @@ function keepsSignIn(args, href) {
 }
 const hostOf = href => { try { return new URL(String(href)).hostname; } catch { return String(href || ''); } };
 const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the agent keeps that sign-in for the rest of the run: don't log out, switch accounts or re-trigger the sign-in, carry on signed in. If the task needs it, ask the user; they can do it in the tab themselves.`;
+// A click, key or script needs the page to answer the guard's checks first. While a dialog the page
+// opened (an alert, a confirm or a prompt) is up, or the page is busy, it doesn't: the checks would
+// go without their facts, and the input would wait in Chrome and land once the page answers, past
+// every check. So the guard refuses at once, from the tab's last known address.
+const pageAnswers = session => evaluate(session, '1', 3000).then(() => true, () => false);
+async function pageMustAnswer(args, session, info, what) {
+  if (!handoffOn(args)) return;
+  if (await pageAnswers(session)) return;
+  const site = keepsSignIn(args, info.url) ? hostOf(info.url) : '';
+  if (site) throw new Error(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`);
+  throw new Error(pageBusy(hostOf(info.url), what));
+}
+const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict: allowed.
 async function accountRefusal(args, session, action, target, url, ctx) {
@@ -1391,6 +1404,7 @@ const TOOLS = [
     async run(args, ctx = {}) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);
+      await pageMustAnswer(args, session, info, 'this click');
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
@@ -1440,6 +1454,7 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       const q = target(args.ref || args.selector ? args : { ...args, text: undefined });
       if (q === '{}') throw new Error('Pass ref (from chrome_snapshot) or selector for the field.');
+      await pageMustAnswer(args, session, info, 'typing here');
       const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
@@ -1512,6 +1527,7 @@ const TOOLS = [
     async run({ tab, keys, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
+      await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
       const before = await docState(session, info.url);
       if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
         // Enter (or Space) on a focused link or button activates it, like a click.
@@ -1680,7 +1696,8 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       let expression = js;
       if (handoffOn(rest)) {
-        const [href] = await docState(session, info.url);
+        const answers = await pageAnswers(session);
+        const [href] = answers ? await docState(session, info.url) : [info.url];
         // Where a handoff signed the user in (rule 3), no script runs. Not a read-only run under V8's
         // side-effect check: that check lets a script keep a change on an object Chrome builds on first
         // use (navigator.credentials, navigator.clipboard, an element's own wrapper), and it would stay
@@ -1688,6 +1705,7 @@ const TOOLS = [
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
           throw new Error(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`);
+        if (!answers) throw new Error(pageBusy(hostOf(info.url), 'this script'));
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
