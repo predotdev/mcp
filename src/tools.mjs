@@ -1754,6 +1754,43 @@ const TOOLS = [
     },
   },
   {
+    name: 'chrome_handed_off',
+    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish on my computer" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. Pass task to take that tab and carry on with the other chrome_* tools from where the cloud run stopped; pass task and done: true once it is finished.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'The task id from the list.' },
+        done: { type: 'boolean', description: 'true: it is finished; take it off the list.' },
+      },
+    },
+    async run(args = {}) {
+      if (!handoffOn(args)) throw new Error('chrome_handed_off needs handoffs turned on (PREDEV_HANDOFF=1 for this MCP server).');
+      const file = path.join(core.stateDir || '', 'handed-tasks.json');
+      let tasks = [];
+      try { tasks = JSON.parse(fs.readFileSync(file, 'utf8'))?.tasks || []; } catch {}
+      const save = list => { const tmp = `${file}.${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ tasks: list }, null, 2), { mode: 0o600 }); fs.renameSync(tmp, file); };
+      if (!args.task) {
+        if (!tasks.length) return 'No tasks were handed to this computer.';
+        return tasks.map(t => `${t.taskId}  ${t.site}  handed ${t.at}  stopped at step ${t.checkpoint?.step ?? '?'} on ${t.checkpoint?.url || '?'}\n  ${String(t.instruction || '').slice(0, 300)}`).join('\n\n');
+      }
+      const t = tasks.find(x => x.taskId === String(args.task));
+      if (!t) throw new Error(`No handed-off task "${args.task}". Call chrome_handed_off with no arguments for the list.`);
+      if (args.done) { save(tasks.filter(x => x.taskId !== t.taskId)); return `Task ${t.taskId} is finished and off the list.`; }
+      // The tab it opened becomes this agent's (it works only in tabs it owns).
+      const info = t.tab ? [...chrome.targets.values()].find(x => isTab(x) && x.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) : null;
+      if (info) ownedBy(agentOf(args)).add(info.targetId);
+      const steps = (t.checkpoint?.history || []).map(h => `  ${h.step}. ${h.summary}${h.outcome ? ` (${h.outcome})` : ''}`).join('\n');
+      return [
+        `Task ${t.taskId}, handed from pre.dev's cloud to finish here (${t.site}).`,
+        `Instruction: ${t.instruction}`,
+        `It stopped at step ${t.checkpoint?.step ?? '?'} on ${t.checkpoint?.url || '?'} (${t.checkpoint?.reason || 'paused'}).`,
+        steps ? `Done so far:\n${steps}` : '',
+        t.checkpoint?.memory ? `Notes: ${t.checkpoint.memory}` : '',
+        info ? `Its page is open in tab ${tabId(info)}: read it first, then carry on with the chrome_* tools. Call chrome_handed_off with task and done: true when it is finished.` : `Open ${t.checkpoint?.url} with chrome_open to carry on, then call chrome_handed_off with task and done: true when it is finished.`,
+      ].filter(Boolean).join('\n');
+    },
+  },
+  {
     name: 'chrome_close',
     description: 'Close a tab.',
     inputSchema: { type: 'object', required: ['tab'], properties: { tab: { type: 'string' } } },
@@ -1809,8 +1846,9 @@ const NO_KEY_NOTE = ' Needs a free pre.dev account, not signed in yet: run `npx 
 function toolList(ctx = {}) {
   let profiles = '';
   try { profiles = ` Profiles: ${chromeProfiles().map(label).join('; ')}.`; } catch {}
-  // chrome_handoff is listed only with handoffs on (PREDEV_HANDOFF=1): off, the list is as before.
-  return TOOLS.filter(t => t.name !== 'chrome_handoff' || ctx.handoff).map(({ name, description, inputSchema }) => ({
+  // chrome_handoff and chrome_handed_off are listed only with handoffs on (PREDEV_HANDOFF=1): off,
+  // the list is as before.
+  return TOOLS.filter(t => (t.name !== 'chrome_handoff' && t.name !== 'chrome_handed_off') || ctx.handoff).map(({ name, description, inputSchema }) => ({
     name,
     description: name === 'chrome_open' || name === 'chrome_profiles' ? description + profiles
       : name === 'chrome_act' && !ctx.apiKey ? description + NO_KEY_NOTE : description,

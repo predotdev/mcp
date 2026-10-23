@@ -204,7 +204,7 @@ let daemonPort = 0;
 
 const core = {
   chrome, contextDirs, failedProbes, triedDirs, saveProfileMap, log, sleep,
-  chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR), version: PKG.version || '0.0.0',
+  chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR), version: PKG.version || '0.0.0', stateDir: STATE_DIR,
   get daemonPort() { return daemonPort; },
 };
 
@@ -667,7 +667,10 @@ Docs: https://docs.pre.dev/browser-agents/local
 // Pairing, only with handoffs on (PREDEV_HANDOFF=1): off, the help is as before.
 const PAIR_HELP = `  predev-mcp pair       let pre.dev web runs you start do steps in this Chrome ("Do it in my
                         Chrome"); each new site asks you here first
-  predev-mcp unpair     stop that now
+  predev-mcp unpair     stop that now, for this computer
+  predev-mcp sites      the sites web runs may use here; \`sites revoke <site>\` revokes one at once
+  predev-mcp start-at-login on|off
+                        keep pre.dev connected when you log in (pair asks)
 `;
 
 async function runCheck() {
@@ -787,14 +790,14 @@ async function runCall(name, raw) {
   process.exit(result.isError ? 1 : 0);
 }
 
-async function runSetupCommand(name) {
+async function runSetupCommand(name, args = []) {
   const { createSetup } = await import(pathToFileURL(path.join(path.dirname(SELF), 'setup.mjs')).href);
   const setup = createSetup({
     baseStateDir: BASE_STATE_DIR, stateDir: STATE_DIR, chromeDir: CHROME_DIR, customChromeDir: Boolean(CUSTOM_DIR),
     pkg: PKG, sleep, ensureDaemon, request, readCredentials, credentialsFile: CREDENTIALS_FILE, cliLogin,
     packageRoot: path.join(path.dirname(SELF), '..'),
   });
-  await setup[name]();
+  await setup[name](...args);
 }
 
 const command = process.argv[2] || '';
@@ -807,6 +810,7 @@ else if (command === 'call') runCall(process.argv[3], process.argv[4]);
 else if (command === 'stop') runStop();
 else if (command === '--version' || command === '-v') console.log(PKG.version || '0.0.0');
 else if (HANDOFF && (command === 'pair' || command === 'unpair')) runSetupCommand(command);
+else if (HANDOFF && (command === 'sites' || command === 'start-at-login')) runSetupCommand(command === 'sites' ? 'sites' : 'startAtLogin', process.argv.slice(3));
 else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HANDOFF ? HELP.replace('  predev-mcp uninstall', `${PAIR_HELP}  predev-mcp uninstall`) : HELP);
 else if (command === '' || command === 'mcp') {
   if (process.stdin.isTTY && !command) process.stderr.write(HELP);

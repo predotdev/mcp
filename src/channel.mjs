@@ -8,7 +8,12 @@
 //     click that sends, posts, buys or deletes;
 //   - a site a web run has not used here before needs a click on this computer: a pre.dev page in
 //     this Chrome asks "Allow pre.dev to use <site>?", and only the person at this computer can
-//     answer it (the page's address carries a one-time secret no run ever sees);
+//     answer it (the page's address carries a one-time secret no run ever sees). A site is a
+//     registrable domain (accounts.google.com and mail.google.com ask once), by the same rule as
+//     every pre.dev `site`: pre.dev computes it from the host alone, never a URL. The allowed list
+//     is listed and revoked here (`predev-mcp sites`) and on pre.dev, at once;
+//   - "Finish on my computer": a paused cloud Browser Agents task can hand its rest here (the
+//     instruction, the page it stopped on and what it did), for Browser Agents Local in this Chrome;
 //   - only the tools a web run needs: no scripts (chrome_eval could read a site's cookies or
 //     storage), no file uploads (files on this computer), no screenshots;
 //   - nothing else leaves this computer: no cookies, no storage, no files.
@@ -34,17 +39,15 @@ const CHUNK = 256 * 1024;
 
 const isPage = t => t?.type === 'page';
 
-/** The site a web run is allowed on: the host (no "www."); for this machine or a private network,
- *  with its port. Hosts, not registrable domains: this package has no public suffix list, and a
- *  host never lets one approval cover someone else's site (another app on the same hosting domain). */
-export function siteOf(url) {
+/** An http(s) page's host, or '' (other schemes are never a web run's). */
+export function hostOf(url) {
   let u;
   try { u = new URL(String(url)); } catch { return ''; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/^www\./, '');
-  const local = host === 'localhost' || host.endsWith('.localhost') || /^(127|10)\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^::1$|^0\.0\.0\.0$/.test(host);
-  return local && u.port ? `${host}:${u.port}` : host;
+  return u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
 }
+/** This machine or a private network: the Allow page warns about these. */
+const isLocalHost = host => host === 'localhost' || host.endsWith('.localhost') || /^(127|10)\.|^192\.168\.|^172\.(1[6-9]|2\d|3[01])\.|^::1$|^0\.0\.0\.0$/.test(host);
 
 /** This computer's id for pre.dev in a state folder: random, made once, not a secret. */
 export function computerIdIn(stateDir) {
@@ -61,14 +64,36 @@ export function computerIdIn(stateDir) {
   return id;
 }
 
-/** The files pairing keeps in a state folder: the pairing itself and the sites web runs may use. */
-export const pairingFiles = stateDir => ({ pairing: path.join(stateDir, 'pairing.json'), sites: path.join(stateDir, 'web-sites.json') });
+/** The files pairing keeps in a state folder: the pairing itself, the sites web runs may use, and the
+ *  cloud tasks handed here to finish ("Finish on my computer"). */
+export const pairingFiles = stateDir => ({
+  pairing: path.join(stateDir, 'pairing.json'),
+  sites: path.join(stateDir, 'web-sites.json'),
+  tasks: path.join(stateDir, 'handed-tasks.json'),
+});
+
+/** The sites this computer allowed web runs to use, from its state folder (newest last). */
+export function readAllowedSites(stateDir) {
+  try { return JSON.parse(fs.readFileSync(pairingFiles(stateDir).sites, 'utf8'))?.sites || {}; } catch { return {}; }
+}
+
+/** Forget one allowed site here, at once (a running daemon reads the file on every call). */
+export function forgetAllowedSite(stateDir, site) {
+  const sites = readAllowedSites(stateDir);
+  if (!sites[site]) return false;
+  delete sites[site];
+  const file = pairingFiles(stateDir).sites;
+  const tmp = `${file}.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ sites }, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  return true;
+}
 
 const escapeHtml = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 export function createChannel(ctx) {
   const { stateDir, chromeDir, chrome, log, sleep, callTool, loadTools, privateTabs, readCredentials, cliLogin, defaultApiUrl } = ctx;
-  const { pairing: PAIRING_FILE, sites: SITES_FILE } = pairingFiles(stateDir);
+  const { pairing: PAIRING_FILE, sites: SITES_FILE, tasks: TASKS_FILE } = pairingFiles(stateDir);
   let ws = null;
   let running = false;
   let status = 'off';
@@ -109,12 +134,47 @@ export function createChannel(ctx) {
     const sites = allowedSites();
     sites[site] = { allowedAt: new Date().toISOString() };
     writePrivate(SITES_FILE, { sites });
+    // pre.dev keeps the list too, to show it and to revoke from the web. Only this click adds one.
+    const p = pairing();
+    if (p?.apiUrl) void post(p.apiUrl, '/computer-channel/sites', { computerId: computerId(), site }).catch(error => log('channel', 'site note failed', error.message));
+  }
+  /** pre.dev's list at (re)connect: a site revoked there while this computer was away drops here. */
+  function keepOnly(sitesAtPredev) {
+    if (!Array.isArray(sitesAtPredev)) return;
+    const keep = new Set(sitesAtPredev.map(String));
+    const sites = allowedSites();
+    let dropped = 0;
+    for (const site of Object.keys(sites)) if (!keep.has(site)) { delete sites[site]; dropped++; }
+    if (dropped) { writePrivate(SITES_FILE, { sites }); log('channel', `dropped ${dropped} site(s) revoked at pre.dev`); }
+  }
+
+  /** The registrable domain of a host, as pre.dev computes every site (tldts, private suffixes
+   *  included). Asked with the host alone, cached; if pre.dev can't be asked, the host itself
+   *  (stricter: it never lets one click cover more). */
+  const siteCache = new Map();
+  async function siteFor(host) {
+    if (!host) return '';
+    if (siteCache.has(host)) return siteCache.get(host);
+    let site = host.replace(/^www\./, '');
+    const p = pairing();
+    try {
+      const res = await fetch(`${String(p?.apiUrl || defaultApiUrl).replace(/\/+$/, '')}/computer-channel/site?host=${encodeURIComponent(host)}`, {
+        headers: { Authorization: `Bearer ${key()}`, 'x-predev-client': 'predev-mcp' }, signal: AbortSignal.timeout(8000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && typeof json.site === 'string' && json.site && host.endsWith(json.site)) {
+        site = json.site;
+        siteCache.set(host, site);
+        if (siteCache.size > 2000) siteCache.delete(siteCache.keys().next().value);
+      }
+    } catch {}
+    return site;
   }
 
   /** The page that asks the person at this computer. Its address carries the one-time secret. */
   function askPage(entry, port) {
     const site = escapeHtml(entry.site);
-    const local = /:\d+$/.test(entry.site) || entry.site === 'localhost';
+    const local = isLocalHost(entry.site);
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Allow pre.dev to use ${site}?</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0d0d;color:#cfd3da;font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif}
@@ -244,12 +304,14 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     const wanted = [];
     if ((name === 'chrome_open' || name === 'chrome_navigate') && args.url && !['back', 'forward', 'reload'].includes(args.url)) {
       const raw = String(args.url);
-      const site = siteOf(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
-      if (!site) return text('Web runs can open only http and https pages in the user\'s Chrome.');
-      wanted.push(site);
+      const host = hostOf(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
+      if (!host) return text('Web runs can open only http and https pages in the user\'s Chrome.');
+      // pre.dev computed the target's site with the call (the same rule); only what matches this host counts.
+      const given = typeof body?.site === 'string' && body.site && host.endsWith(body.site) ? body.site : '';
+      wanted.push(given || await siteFor(host));
     }
     const info = args.tab ? tabInfo(args.tab) : null;
-    if (info) { const here = siteOf(info.url); if (here && !wanted.includes(here)) wanted.push(here); }
+    if (info) { const here = await siteFor(hostOf(info.url)); if (here && !wanted.includes(here)) wanted.push(here); }
     for (const site of wanted) {
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site, port, api.chromeInFront);
@@ -263,7 +325,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       const shown = (result?.content || []).find(c => c.type === 'text')?.text || '';
       const tab = /^Tab ([0-9A-F]{6,}) ·/m.exec(shown)?.[1] || args.tab;
       const now = tab ? tabInfo(tab) : null;
-      const site = now ? siteOf(now.url) : '';
+      const site = now ? await siteFor(hostOf(now.url)) : '';
       if (site && !isAllowed(site)) {
         return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
       }
@@ -286,6 +348,40 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       const last = state?.profile?.last_used || 'Default';
       return Object.entries(cache).map(([dir, p]) => ({ dir, name: String(p?.name || dir), lastUsed: dir === last }));
     } catch { return []; }
+  }
+
+  // ---------------------------------------------------------------- Finish on my computer
+
+  /** A cloud Browser Agents task handed here: keep it for Browser Agents Local (chrome_handed_off
+   *  lists it to the agents on this computer), and open the page it stopped on in this Chrome, once
+   *  the person here allows that site. Nothing in it is a cookie or storage. */
+  async function takeTask(body, port, api) {
+    const taskId = String(body?.taskId || '').replace(/[^a-f0-9]/gi, '').slice(0, 40);
+    const checkpoint = body?.checkpoint || {};
+    const url = String(checkpoint.url || '');
+    const host = hostOf(url);
+    if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
+    const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
+    if (!isAllowed(site) && !(await askToAllow(site, port, api.chromeInFront))) {
+      return { accepted: false, error: `the person at this computer didn't allow ${site}` };
+    }
+    const tasks = (readJson(TASKS_FILE)?.tasks || []).filter(t => t.taskId !== taskId);
+    let tab = '';
+    try {
+      const profile = profiles().find(p => p.lastUsed)?.dir || profiles()[0]?.dir || 'Default';
+      const opened = await callTool('chrome_open', { profile, url, foreground: false, __agent: `handed:${taskId}`, __predev_handoff: true, __via: 'web' },
+        { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl, signal: AbortSignal.timeout(60000) });
+      tab = /^Tab ([0-9A-F]{6,}) ·/m.exec((opened?.content || []).find(c => c.type === 'text')?.text || '')?.[1] || '';
+    } catch (error) { log('channel', 'handed task open failed', error.message); }
+    tasks.push({
+      taskId, batchId: String(body?.batchId || ''), site, tab, at: new Date().toISOString(),
+      instruction: String(body?.instruction || '').slice(0, 20000),
+      checkpoint: { url, step: Number(checkpoint.step) || 0, reason: String(checkpoint.reason || ''), memory: String(checkpoint.memory || '').slice(0, 8000),
+        history: (Array.isArray(checkpoint.history) ? checkpoint.history : []).slice(-60) },
+    });
+    writePrivate(TASKS_FILE, { tasks: tasks.slice(-20) });
+    log('channel', `task ${taskId} handed to this computer (${site})`);
+    return { accepted: true, ...(tab ? { tab } : {}) };
   }
 
   // ---------------------------------------------------------------- the tunnel
@@ -318,6 +414,15 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         end({ ok: true, chrome: chrome.connected || fs.existsSync(path.join(chromeDir, 'DevToolsActivePort')), version: ctx.version, profiles: profiles() });
       } else if (route === 'GET /tools') {
         end(webTools(api));
+      } else if (route === 'POST /sites/revoke') {
+        // Revoked on pre.dev: it stops here now.
+        const site = String(body?.site || '');
+        const sites = allowedSites();
+        const had = !!sites[site];
+        if (had) { delete sites[site]; writePrivate(SITES_FILE, { sites }); log('channel', `site ${site} revoked at pre.dev`); }
+        end({ ok: true, revoked: had });
+      } else if (route === 'POST /tasks/continue') {
+        end(await takeTask(body, port, api));
       } else if (route === 'POST /call') {
         const started = Date.now();
         const result = await webCall(body, port, api);
@@ -350,6 +455,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       if (r.status === 401 || r.status === 403) { status = 'signed_out'; return 'later'; }
       if (!r.json?.grant?.url) { status = 'offline'; return 'retry'; }
       grant = r.json.grant;
+      keepOnly(r.json.sites);
     } catch (error) {
       log('channel', 'grant failed', error.message);
       status = 'offline';
