@@ -834,14 +834,53 @@ const INPUT_WATCH = `(() => {
   const mark = e => { if (e.isTrusted && !window.__predevAgentActing) window.__predevUserAt = Date.now(); };
   for (const type of ['pointerdown', 'keydown', 'input', 'paste']) addEventListener(type, mark, true);
 })()`;
+// A passkey (WebAuthn) ceremony the AGENT'S own click or key starts in the user's Chrome is declined like a
+// cancelled sheet, so Touch ID never shows for a step the user did not start. A ceremony the USER starts (while
+// the agent is not acting, e.g. during a handoff) is left alone, so their passkey works. The page's API is
+// wrapped once; nothing is read about the call.
+const WEBAUTHN_WATCH = `(() => {
+  if (window.__predevWebauthnWatch) return; window.__predevWebauthnWatch = true;
+  const C = (typeof CredentialsContainer !== 'undefined') ? CredentialsContainer.prototype : null;
+  if (!C) return;
+  const acting = () => window.__predevAgentActing === true || Date.now() < (window.__predevActingGraceUntil || 0);
+  const wrap = (name) => {
+    const d = Object.getOwnPropertyDescriptor(C, name);
+    if (!d || typeof d.value !== 'function') return;
+    const orig = d.value;
+    try {
+      Object.defineProperty(C, name, { ...d, value: function (options) {
+        const pk = options && typeof options === 'object' ? options.publicKey : undefined;
+        if (pk && (name !== 'get' || options.mediation !== 'conditional') && acting()) {
+          window.__predevPasskey = { at: Date.now(), ceremony: name };
+          return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+        }
+        return orig.apply(this, arguments);
+      } });
+    } catch (e) {}
+  };
+  wrap('get'); wrap('create');
+})()`;
 async function watchInput(info, session) {
   if (!H.watched.has(info.targetId)) {
     H.watched.add(info.targetId);
     // Every later page in this tab gets it before its own scripts run.
     await chrome.send('Page.enable', {}, session).catch(() => {});
     await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: INPUT_WATCH }, session).catch(() => {});
+    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: WEBAUTHN_WATCH }, session).catch(() => {});
   }
   await evaluate(session, INPUT_WATCH, 3000).catch(() => {});
+  await evaluate(session, WEBAUTHN_WATCH, 3000).catch(() => {});
+}
+
+// After an action, the page asked for a passkey while the agent was acting (WEBAUTHN_WATCH declined it): the step
+// is the user's, in their own Chrome. Hand it off so they start it knowingly and the done check closes it.
+async function passkeyRefusal(args, session, startedAt) {
+  if (!handoffOn(args)) return null;
+  const seen = await evaluate(session, 'window.__predevPasskey || null', 3000).catch(() => null);
+  if (!seen || typeof seen !== 'object' || Number(seen.at) < startedAt) return null;
+  await evaluate(session, 'window.__predevPasskey = null', 3000).catch(() => {});
+  const how = handTo(args, 'step_up', ' and a done check like {"kind":"url_changes"}');
+  return refused(`That started a passkey sign-in (WebAuthn), which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: seen.ceremony === 'create' ? 'create' : 'get' });
 }
 // Wraps the agent's own input so the watcher above doesn't count it as the user's.
 async function asAgent(info, session, fn) {
@@ -990,7 +1029,12 @@ async function markActing(session, on) {
   let tid = null;
   for (const [targetId, sid] of chrome.sessions) if (sid === session) tid = targetId;
   if (!tid || !chrome.__predevHandoff?.watched?.has(tid)) return;
-  await evaluate(session, `window.__predevAgentActing = ${on ? 'true' : 'false'}`, 3000).catch(() => {});
+  // A click/key handler can start a WebAuthn ceremony a tick after the input dispatch returns, so a short grace
+  // keeps it counted as the agent's (WEBAUTHN_WATCH declines only while the agent is acting).
+  const expr = on
+    ? 'window.__predevAgentActing = true; window.__predevActingGraceUntil = Date.now() + 1200'
+    : 'window.__predevAgentActing = false';
+  await evaluate(session, expr, 3000).catch(() => {});
 }
 
 async function pressKeys(session, combos) {
@@ -1386,8 +1430,11 @@ const TOOLS = [
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
+      const pkAt = Date.now();
       await click(session, x, y, args.double ? 2 : 1);
       await settle(session, before);
+      const pk = await passkeyRefusal(args, session, pkAt);
+      if (pk) throw pk;
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
   },
@@ -1433,7 +1480,9 @@ const TOOLS = [
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (args.submit) { await pressKeys(session, 'Enter'); await settle(session, before); }
+      let pkAt = 0;
+      if (args.submit) { pkAt = Date.now(); await pressKeys(session, 'Enter'); await settle(session, before); }
+      if (pkAt) { const pk = await passkeyRefusal(args, session, pkAt); if (pk) throw pk; }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
       return `Typed into ${field.desc}${value !== null ? `; value is now ${JSON.stringify(value)}` : ' and pressed Enter'}\n${await pageLine(info, session)}`;
     },
@@ -1487,8 +1536,11 @@ const TOOLS = [
           if (ask) throw ask;
         }
       }
+      const pkAt = Date.now();
       await pressKeys(session, keys);
       await settle(session, before);
+      const pk = await passkeyRefusal(rest, session, pkAt);
+      if (pk) throw pk;
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
   },
