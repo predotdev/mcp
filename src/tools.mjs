@@ -1696,7 +1696,7 @@ const TOOLS = [
         // on a page the user is signed in to.
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
-          throw new Error(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`);
+          throw refused(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`, { kind: 'keep_signin', site });
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
