@@ -293,6 +293,11 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     if (!WEB_TOOLS.has(name) && name !== HANDOFF_TOOL) return text(`${name || 'That tool'} isn't available to web runs in the user's Chrome.`);
     const args = {};
     for (const [k, v] of Object.entries(body?.args || {})) if (!k.startsWith('__')) args[k] = v;
+    // The sign-ins this run's handoffs made, kept here too (handoff rule 3), and the ones the user's
+    // own messages asked to give up: pre.dev's brain works these out, never the model.
+    for (const k of ['__predev_signed_in', '__predev_signout_ok']) {
+      if (Array.isArray(body?.args?.[k])) args[k] = body.args[k].filter(x => typeof x === 'string').slice(0, 50).map(x => x.slice(0, 255));
+    }
     const runKey = String(body?.run?.key || '').replace(/[^A-Za-z0-9:_-]/g, '').slice(0, 100);
     if (!runKey) return text('A web run must say which run it is.');
     // This computer's rules for every web run: the guard on, the run's own tabs.
