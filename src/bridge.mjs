@@ -568,6 +568,8 @@ async function updateInstalledCopy() {
 
 /** Set while serving MCP: tells the agent to re-list when the hosted tools change handoffs. */
 let featuresChanged = null;
+/** How long initialize waits for pre.dev's first answer when nothing is saved for the key. */
+const FIRST_ANSWER_WAIT_MS = 1500;
 const remote = createRemote({
   version: PKG.version || '0.0.0',
   onFeatures: (apiKey, list) => { saveFeatures(apiKey, list); featuresChanged?.(); },
@@ -610,13 +612,27 @@ function runMcp() {
     const reply = result => write({ jsonrpc: '2.0', id: message.id, result });
     try {
       switch (message.method) {
-        case 'initialize':
+        case 'initialize': {
+          // The instructions say whether handoffs are on, which pre.dev's hosted tools list tells.
+          // Ask for it now (tools/list then uses the same answer). With nothing saved for this key,
+          // wait for it briefly, so the first start after pre.dev turns handoffs on already says so;
+          // with a saved answer, reply at once and let the list refresh it.
+          const ctx = keyCtx();
+          if (CLOUD && ctx.apiKey && !HANDOFF_ENV && remote.featuresFor(ctx.apiKey) === undefined) {
+            const listed = remote.listTools(ctx).catch(() => []);
+            if (!savedFeatures(ctx.apiKey).length) {
+              let timer;
+              await Promise.race([listed, new Promise(resolve => { timer = setTimeout(resolve, FIRST_ANSWER_WAIT_MS); })]);
+              clearTimeout(timer);
+            }
+          }
           return reply({
             protocolVersion: message.params?.protocolVersion || '2025-06-18',
             capabilities: { tools: { listChanged: true } },
             serverInfo: { name: 'predev', version: PKG.version || '0.0.0' },
             instructions: (await loadTools()).instructions(shimCtx()),
           });
+        }
         case 'tools/list': {
           // The hosted tools first: their answer says whether handoffs are on for this account.
           const hosted = CLOUD ? await remote.listTools(shimCtx()) : [];

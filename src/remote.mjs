@@ -18,6 +18,8 @@ class PlanRequired extends Error {}
 
 export function createRemote({ version, onFeatures = () => {} }) {
   let cache = { key: null, at: 0, tools: [], locked: null };
+  /** The list being fetched, so a caller that starts one early (initialize) and tools/list share it. */
+  let pending = null;
   let nextId = 0;
   const base = ctx => (ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
   /** key -> the features pre.dev's last answer named for it. */
@@ -74,9 +76,16 @@ export function createRemote({ version, onFeatures = () => {} }) {
   }
 
   /** The hosted tools for this key, cached for a while; listed even when locked, so agents can offer them. */
-  async function listTools(ctx) {
+  function listTools(ctx) {
     const key = ctx.apiKey || '';
-    if (cache.key === key && Date.now() - cache.at < LIST_TTL_MS) return cache.tools;
+    if (cache.key === key && Date.now() - cache.at < LIST_TTL_MS) return Promise.resolve(cache.tools);
+    if (pending?.key === key) return pending.promise;
+    const promise = fetchTools(ctx, key).finally(() => { if (pending?.promise === promise) pending = null; });
+    pending = { key, promise };
+    return promise;
+  }
+
+  async function fetchTools(ctx, key) {
     let tools = [];
     let locked = null;
     try {
