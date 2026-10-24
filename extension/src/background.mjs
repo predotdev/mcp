@@ -118,7 +118,13 @@ function describe(name, args) {
     case 'chrome_close': return 'Closed a tab';
     case 'chrome_tabs': return 'Listed its tabs';
     case 'chrome_profiles': return 'Looked at this Chrome';
-    case HANDOFF_TOOL: return args.reason ? `Handed you a step (${String(args.reason)})` : 'Checked a handed step';
+    case 'chrome_screenshot': return 'Looked at the tab';
+    case HANDOFF_TOOL: {
+      if (args.resume === true) return 'Took the tab back after your step';
+      if (args.check === true || !args.reason) return 'Checked a step it handed you';
+      const step = { login_required: 'the sign-in', step_up: 'a security check', captcha: 'a check', approval: 'a step to approve', user_control: 'the tab', chrome_dialog: "Chrome's password warning" }[String(args.reason)];
+      return `Handed you ${step || 'a step'}`;
+    }
     default: return name;
   }
 }
