@@ -446,6 +446,25 @@ async function touchRun(runKey, name, args, turn = '') {
   await session.set('runs', runs);
 }
 
+/** A new browser session (every window was closed, or Chrome restarted) starts with no runs or stops on record. The
+ *  tasks still handed here get their rows back, cut off (their runs here stopped with the windows), so the popup
+ *  lists them and a task the cloud takes back reads as Ended, not Finished. A run that carries on here clears it. */
+async function restoreTaskRuns(list) {
+  if (!list.length) return;
+  const runs = await session.get('runs', {});
+  const stopped = await session.get('stopped', {});
+  for (const t of list) {
+    const taskId = cleanTaskId(t.taskId);
+    const key = `task:${taskId}`;
+    if (!taskId || runs[key]) continue;
+    const at = Date.parse(t.at || '') || Date.now();
+    runs[key] = { first: at, last: at, calls: 0, hosts: t.site ? [String(t.site)] : [], cut: true };
+    if (t.stopped && !stopped[key]) stopped[key] = { at: Number(t.stopped) || Date.now() };
+  }
+  await session.set('runs', runs);
+  await session.set('stopped', stopped);
+}
+
 /** This Chrome stopped answering a handed task's run (a call refused here while paused, stopped or blocked; the
  *  connection to pre.dev dropped; or the extension started again after being away). pre.dev tells this Chrome the
  *  same thing when its run here finished the task and when the cloud took the task back, so this is what tells the
@@ -1018,6 +1037,7 @@ async function boot() {
     await session.set('session', true);
     const list = await handedTasks.list();
     if (list.some(t => t.tab)) await handedTasks.save(list.map(t => (t.tab ? { ...t, reopen: true } : t)));
+    await restoreTaskRuns(list);
   }
   paused = !!(await local.get('paused', false));
   devtoolsBlocked = String(await session.get('devtoolsBlocked', ''));
