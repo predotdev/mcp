@@ -40,10 +40,13 @@ const PAUSED_TEXT = "The user paused pre.dev in their Chrome. Don't retry: tell 
  *  turn on every call (the person's latest message in that chat), and only a new message there ends the stop. */
 const STOPPED_TEXT = "The user stopped this run in their Chrome. Don't use their Chrome again for the rest of this turn (until they send a new message): tell them in one line what is left, and finish with what you have.";
 const BLOCKED_TEXT = "This Chrome's settings (set by the user's company) turn off developer tools, which pre.dev needs to work in it. Don't retry here: tell the user in one line, and continue with what you have.";
-/** The code a handed task's call carries when the person ended it here (Stop or Pause), so pre.dev's runner reads
- *  the reason from a field and not from the wording. A company policy (developer tools off) has none. */
-const personCode = why => (why === STOPPED_TEXT ? 'STOPPED_BY_USER' : why === PAUSED_TEXT ? 'PAUSED_BY_USER' : null);
-const unavailableBody = why => ({ unavailable: true, ...(personCode(why) ? { code: personCode(why) } : {}) });
+/** The code a handed task's call carries when it can't run here, so pre.dev's runner reads the reason from a field
+ *  and not from the wording: the person ended it (Stop or Pause), or a company policy turns developer tools off. */
+const TASK_CODES = new Map([[STOPPED_TEXT, 'STOPPED_BY_USER'], [PAUSED_TEXT, 'PAUSED_BY_USER'], [BLOCKED_TEXT, 'POLICY_BLOCKED']]);
+/** What a handed task's run is told when developer tools are off here: plain, for the person's card and log. */
+const POLICY_TEXT = "Developer tools are turned off in this Chrome by a company setting, so pre.dev can't work in it.";
+const taskWords = why => (why === BLOCKED_TEXT ? POLICY_TEXT : why);
+const unavailableBody = why => ({ unavailable: true, ...(TASK_CODES.has(why) ? { code: TASK_CODES.get(why) } : {}) });
 
 // ---------------------------------------------------------------- state
 
@@ -691,8 +694,11 @@ async function taskCallHere(body) {
     inflight.delete(call);
     ui();
   }
+  // Chrome refused to attach during this call and developer tools turned out to be off here (a company setting):
+  // the run is told so by its code, like a press of Stop or Pause, and never takes it for a failed step.
+  if (!result.unavailable && devtoolsBlocked && result.result?.isError) result = { unavailable: BLOCKED_TEXT };
   if (result.unavailable) await cutTaskRuns(runKey);
-  const o = result.unavailable ? { ok: false, kind: 'ended', text: 'Ended here' } : outcomeOf(result.result);
+  const o = result.unavailable ? { ok: false, kind: 'ended', text: result.unavailable === BLOCKED_TEXT ? 'Refused: developer tools are off' : 'Ended here' } : outcomeOf(result.result);
   await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: o.ok, outcome: o.kind || 'ok', text: o.text, ms: Date.now() - started });
   log('task call', name, result.unavailable ? 'ended' : result.result?.refusal ? `refused (${result.result.refusal.kind})` : result.result?.isError ? 'failed' : 'ok', `${Date.now() - started}ms`);
   return result;
@@ -763,11 +769,11 @@ async function onRequest(socket, m) {
   try { body = m.body ? JSON.parse(fromBase64(m.body)) : null; } catch {}
   const route = `${m.method} ${String(m.path || '').split('?')[0]}`;
   try {
-    // A handed task's call while this Chrome is paused, blocked or stopped for it: unavailable (503), so pre.dev's
-    // cloud run waits a moment and then stops with its progress saved.
+    // A handed task's call while this Chrome is paused, blocked or stopped for it: unavailable (503) with the reason's
+    // code, so pre.dev's cloud run holds for a pause, and stops with its progress saved for a stop or a policy.
     if (route === 'POST /tasks/call') {
       const out = await taskCallHere({ ...body, __checkOnly: true });
-      if (out.unavailable) { head(503); end({ error: out.unavailable, ...unavailableBody(out.unavailable) }); return; }
+      if (out.unavailable) { head(503); end({ error: taskWords(out.unavailable), ...unavailableBody(out.unavailable) }); return; }
     }
     head(200);
     await loadPairing();
@@ -790,7 +796,7 @@ async function onRequest(socket, m) {
     } else if (route === 'POST /tasks/call') {
       const out = await taskCallHere(body);
       // Ended while it ran (Pause, Stop, Unpair): the next call finds this Chrome unavailable.
-      end(out.unavailable ? { result: text(out.unavailable), ...unavailableBody(out.unavailable) } : { result: out.result });
+      end(out.unavailable ? { result: text(taskWords(out.unavailable)), ...unavailableBody(out.unavailable) } : { result: out.result });
     } else if (route === 'POST /tasks/driver') {
       end(await taskDriverHere(body));
     } else {
