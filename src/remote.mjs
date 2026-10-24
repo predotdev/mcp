@@ -5,6 +5,9 @@
 // request is one POST, and the reply is JSON or a short event stream ending in the result.
 // Signed out, or on a plan without the hosted tools, they are still listed (from the public
 // /mcp/info) and a call says how to unlock them, so the agent can tell the user.
+//
+// Its answers also say which per-account features pre.dev has on for the key (the
+// X-Predev-Features header, e.g. "handoff"), sent only when one is on: no header means none.
 
 const LIST_TTL_MS = 10 * 60_000;
 /** Kept callable for old prompts, but not listed: the hosted server marks them deprecated. */
@@ -13,10 +16,21 @@ const SIGN_IN = 'Sign in to pre.dev (free) by running `npx -y @predotdev/mcp log
 
 class PlanRequired extends Error {}
 
-export function createRemote({ version }) {
+export function createRemote({ version, onFeatures = () => {} }) {
   let cache = { key: null, at: 0, tools: [], locked: null };
+  /** The list being fetched, so a caller that starts one early (initialize) and tools/list share it. */
+  let pending = null;
   let nextId = 0;
   const base = ctx => (ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
+  /** key -> the features pre.dev's last answer named for it. */
+  const features = new Map();
+
+  function noteFeatures(key, header) {
+    const list = String(header || '').split(',').map(s => s.trim()).filter(Boolean);
+    const before = features.get(key);
+    features.set(key, list);
+    if (!before || before.join(',') !== list.join(',')) onFeatures(key, list);
+  }
 
   async function rpc(ctx, method, params, timeout) {
     const id = ++nextId;
@@ -32,6 +46,7 @@ export function createRemote({ version }) {
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
       signal: AbortSignal.timeout(timeout),
     });
+    if (response.ok) noteFeatures(ctx.apiKey || '', response.headers.get('x-predev-features'));
     const text = await response.text();
     if (response.status === 401) {
       let message = '';
@@ -61,9 +76,16 @@ export function createRemote({ version }) {
   }
 
   /** The hosted tools for this key, cached for a while; listed even when locked, so agents can offer them. */
-  async function listTools(ctx) {
+  function listTools(ctx) {
     const key = ctx.apiKey || '';
-    if (cache.key === key && Date.now() - cache.at < LIST_TTL_MS) return cache.tools;
+    if (cache.key === key && Date.now() - cache.at < LIST_TTL_MS) return Promise.resolve(cache.tools);
+    if (pending?.key === key) return pending.promise;
+    const promise = fetchTools(ctx, key).finally(() => { if (pending?.promise === promise) pending = null; });
+    pending = { key, promise };
+    return promise;
+  }
+
+  async function fetchTools(ctx, key) {
     let tools = [];
     let locked = null;
     try {
@@ -108,5 +130,8 @@ export function createRemote({ version }) {
     }
   }
 
-  return { listTools, isRemote, callTool };
+  /** The features pre.dev named for this key in its last answer; undefined before the first one. */
+  const featuresFor = key => features.get(key || '');
+
+  return { listTools, isRemote, callTool, featuresFor };
 }
