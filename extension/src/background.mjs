@@ -59,6 +59,11 @@ const session = {
   async get(key, fallback) { try { const v = (await chrome.storage.session.get(key))[key]; return v === undefined ? fallback : v; } catch { return fallback; } },
   set: (key, value) => chrome.storage.session.set({ [key]: value }),
 };
+/** One account's activity here (its runs, their stops and log lines, the tasks handed here) is written only while
+ *  this Chrome is paired, checked right before the write: a call that began before an Unpair lands nothing after it,
+ *  and forget() clears what came before. Another account paired next never sees any of it. */
+const paired = async () => !!(await local.get('pairing', null));
+const accountSession = { set: async (key, value) => { if (await paired()) await session.set(key, value); } };
 
 /** This Chrome's id for pre.dev: random, made once, not a secret. */
 async function computerId() {
@@ -96,8 +101,9 @@ async function platform() {
 // ---------------------------------------------------------------- the log the popup shows
 
 let logQueue = Promise.resolve();
-function note(entry) {
+function note(entry, { always = false } = {}) {
   logQueue = logQueue.then(async () => {
+    if (!always && !(await paired())) return;
     const list = await session.get('log', []);
     list.push({ at: Date.now(), ...entry });
     await session.set('log', list.slice(-LOG_MAX));
@@ -179,7 +185,7 @@ function ui() {
       error: lastError,
       pairing: pairingFlow ? { userCode: pairingFlow.userCode, link: pairingFlow.link } : null,
       asking: [...asking.values()].filter(e => !e.decided).map(e => e.site),
-      runs: Object.entries(runs).map(([key, r]) => ({ key, ...r, stopped: !!stopped[key], active: [...inflight].some(c => c.runKey === key) }))
+      runs: !p ? [] : Object.entries(runs).map(([key, r]) => ({ key, ...r, stopped: !!stopped[key], active: [...inflight].some(c => c.runKey === key) }))
         .sort((a, b) => b.last - a.last).slice(0, 5),
       dev: CONFIG.dev,
       apiUrl: apiBase(p),
@@ -246,7 +252,7 @@ async function markBlocked(message) {
   if (devtoolsBlocked) return;
   devtoolsBlocked = String(message || 'Developer tools are turned off in this Chrome.').slice(0, 200);
   await session.set('devtoolsBlocked', devtoolsBlocked);
-  await note({ kind: 'control', text: "Can't work here: this Chrome's settings turn off developer tools" });
+  await note({ kind: 'control', text: "Can't work here: this Chrome's settings turn off developer tools" }, { always: true });
   ui();
 }
 
@@ -297,6 +303,7 @@ async function setSite(site, on) {
   if (!site) return;
   const list = { ...(await sites()) };
   list[site] = { ...(list[site] || {}), on: !!on, ...(on ? { allowedAt: new Date().toISOString() } : { offAt: new Date().toISOString() }) };
+  if (!(await paired())) return;
   sitesCache = list;
   await local.set('sites', list);
   await note({ kind: 'control', text: on ? `Allowed ${site}` : `Unticked ${site}: web runs can't use it here` });
@@ -314,7 +321,7 @@ async function keepOnly(atPredev) {
   const list = { ...(await sites()) };
   let dropped = 0;
   for (const [site, s] of Object.entries(list)) if (s.on && !keep.has(site)) { delete list[site]; dropped++; }
-  if (dropped) { sitesCache = list; await local.set('sites', list); await note({ kind: 'control', text: `${dropped} site(s) revoked on pre.dev while this Chrome was away` }); }
+  if (dropped && (await paired())) { sitesCache = list; await local.set('sites', list); await note({ kind: 'control', text: `${dropped} site(s) revoked on pre.dev while this Chrome was away` }); }
 }
 
 /** The registrable domain of a host, as pre.dev computes every site; the host itself if pre.dev can't
@@ -446,7 +453,7 @@ async function touchRun(runKey, name, args, turn = '') {
   runs[runKey] = r;
   const keys = Object.keys(runs).sort((a, b) => runs[b].last - runs[a].last);
   for (const k of keys.slice(20)) delete runs[k];
-  await session.set('runs', runs);
+  await accountSession.set('runs', runs);
 }
 
 /** A new browser session (every window was closed, or Chrome restarted) starts with no runs or stops on record. The
@@ -464,8 +471,8 @@ async function restoreTaskRuns(list) {
     runs[key] = { first: at, last: at, calls: 0, hosts: t.site ? [String(t.site)] : [], cut: true };
     if (t.stopped && !stopped[key]) stopped[key] = { at: Number(t.stopped) || Date.now() };
   }
-  await session.set('runs', runs);
-  await session.set('stopped', stopped);
+  await accountSession.set('runs', runs);
+  await accountSession.set('stopped', stopped);
 }
 
 /** This Chrome stopped answering a handed task's run (a call refused here while paused, stopped or blocked; the
@@ -480,7 +487,7 @@ async function cutTaskRuns(runKey = '') {
     r.cut = true;
     changed = true;
   }
-  if (changed) await session.set('runs', runs);
+  if (changed) await accountSession.set('runs', runs);
 }
 
 /** A handed task is over here (its run finished, or this Chrome no longer has it): the popup shows how it ended. */
@@ -488,7 +495,7 @@ async function endRun(runKey, how) {
   const runs = await session.get('runs', {});
   if (!runs[runKey]) return;
   runs[runKey].ended = { at: Date.now(), how };
-  await session.set('runs', runs);
+  await accountSession.set('runs', runs);
 }
 
 async function webCall(body) {
@@ -566,13 +573,13 @@ async function stillStopped(runKey, turn) {
   if (!stop) return false;
   if (turn && stop.turn && turn !== stop.turn) {
     delete stopped[runKey];
-    await session.set('stopped', stopped);
+    await accountSession.set('stopped', stopped);
     await note({ kind: 'control', run: runKey, text: 'A new message in that chat: its run may use this Chrome again' });
     ui();
     return false;
   }
   // Stopped before the run named its turn: this call's turn is the one stopped.
-  if (turn && !stop.turn) { stopped[runKey] = { ...stop, turn }; await session.set('stopped', stopped); }
+  if (turn && !stop.turn) { stopped[runKey] = { ...stop, turn }; await accountSession.set('stopped', stopped); }
   return true;
 }
 
@@ -583,7 +590,7 @@ async function stopRun(runKey) {
   const runs = await session.get('runs', {});
   const stopped = await session.get('stopped', {});
   stopped[runKey] = { at: Date.now(), turn: runs[runKey]?.turn || '' };
-  await session.set('stopped', stopped);
+  await accountSession.set('stopped', stopped);
   await endCalls(STOPPED_TEXT, runKey);
   await note({ kind: 'control', run: runKey, text: 'Stopped this run in this Chrome for the rest of its turn' });
   ui();
@@ -600,7 +607,7 @@ const handedTasks = {
     const list = await local.get('tasks', []);
     return (Array.isArray(list) ? list : []).filter(t => Date.now() - Date.parse(t.at || 0) < TASK_KEEP_MS);
   },
-  save: list => local.set('tasks', list),
+  save: async list => { if (await paired()) await local.set('tasks', list); },
 };
 const taskInflight = new Map();
 const taskCalls = createTaskCalls({
@@ -648,11 +655,11 @@ async function takeTaskHere(body) {
   const out = await taskCalls.takeTask(body);
   if (out.accepted) {
     const stopped = await session.get('stopped', {});
-    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await session.set('stopped', stopped); }
+    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await accountSession.set('stopped', stopped); }
     await touchRun(`task:${taskId}`, 'chrome_open', { url: body?.checkpoint?.url });
     // Handed here again after it ended: it is live again.
     const runs = await session.get('runs', {});
-    if (runs[`task:${taskId}`]?.ended) { delete runs[`task:${taskId}`].ended; await session.set('runs', runs); }
+    if (runs[`task:${taskId}`]?.ended) { delete runs[`task:${taskId}`].ended; await accountSession.set('runs', runs); }
   }
   await note({ kind: 'control', run: `task:${taskId}`, text: out.accepted ? `A Browser Agents task was handed to this Chrome (${hostOf(String(body?.checkpoint?.url || '')) || 'its page'})` : `A handed task was not taken: ${out.error}` });
   ui();
@@ -727,7 +734,7 @@ async function stopTask(taskId) {
   if ((await session.get('runs', {}))[`task:${taskId}`]?.ended) return ui();
   const stopped = await session.get('stopped', {});
   stopped[`task:${taskId}`] = { at: Date.now() };
-  await session.set('stopped', stopped);
+  await accountSession.set('stopped', stopped);
   await cutTaskRuns(`task:${taskId}`);
   const list = await handedTasks.list();
   const t = list.find(x => x.taskId === taskId);
@@ -786,7 +793,7 @@ async function onRequest(socket, m) {
       const site = String(body?.site || '');
       const list = { ...(await sites()) };
       const had = !!list[site]?.on;
-      if (had) { delete list[site]; sitesCache = list; await local.set('sites', list); await note({ kind: 'control', text: `${site} revoked on pre.dev` }); }
+      if (had && (await paired())) { delete list[site]; sitesCache = list; await local.set('sites', list); await note({ kind: 'control', text: `${site} revoked on pre.dev` }); }
       end({ ok: true, revoked: had });
       ui();
     } else if (route === 'POST /call') {
@@ -825,7 +832,7 @@ async function connectOnce() {
     if (r.status === 401 || r.status === 403) { status = 'signed_out'; lastError = r.json?.error || 'pre.dev did not accept the saved sign-in. Unpair and pair again.'; return 'later'; }
     if (!r.json?.grant?.url) { status = 'offline'; return 'retry'; }
     grant = r.json.grant;
-    if (r.json.account && JSON.stringify(r.json.account) !== JSON.stringify(p.account)) await local.set('pairing', { ...p, account: r.json.account });
+    if (r.json.account && JSON.stringify(r.json.account) !== JSON.stringify(p.account) && (await local.get('pairing', null))?.key === p.key) await local.set('pairing', { ...p, account: r.json.account });
     await keepOnly(r.json.sites);
   } catch (error) {
     log('grant failed', error.message);
@@ -983,13 +990,29 @@ async function forget(why) {
   stopLoop();
   await endCalls(why === 'unpaired' ? 'The user unpaired their Chrome from pre.dev.' : 'This Chrome is no longer paired with pre.dev.');
   for (const entry of [...asking.values()]) if (!entry.decided) await decide(entry.nonce, false);
-  await local.remove(['pairing', 'sites', 'paused', 'tasks']);
+  // Everything tied to the account goes with it, so this Chrome paired again (maybe as someone else) shows and keeps
+  // none of it: the key, the sites and tasks handed here, this Chrome's id on pre.dev (a new pairing is a new
+  // computer), this session's runs, stops and log, and the runs' tabs and approvals. Writes check the pairing first
+  // (accountSession, note), so once it is gone nothing a call began before lands after this.
+  await local.remove(['pairing', 'sites', 'paused', 'tasks', 'computerId']);
   sitesCache = {};
   pairingCache = null;
   pairingKey = '';
   paused = false;
   status = 'unpaired';
-  await note({ kind: 'control', text: why === 'unpaired' ? 'Unpaired: web runs can no longer reach this Chrome' : why });
+  await logQueue;
+  await chrome.storage.session.remove(['runs', 'stopped', 'log', 'ui']).catch(() => {});
+  const H = conn.__predevHandoff;
+  if (H) {
+    H.owned?.clear();
+    H.checks?.clear();
+    H.cancel?.clear();
+    if (Array.isArray(H.queue)) H.queue.length = 0;
+    H.active = null;
+  }
+  conn.__predevApproved?.clear();
+  taskInflight.clear();
+  await note({ kind: 'control', text: why === 'unpaired' ? 'Unpaired: web runs can no longer reach this Chrome' : why }, { always: true });
   ui();
 }
 
