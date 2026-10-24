@@ -40,6 +40,10 @@ const PAUSED_TEXT = "The user paused pre.dev in their Chrome. Don't retry: tell 
  *  turn on every call (the person's latest message in that chat), and only a new message there ends the stop. */
 const STOPPED_TEXT = "The user stopped this run in their Chrome. Don't use their Chrome again for the rest of this turn (until they send a new message): tell them in one line what is left, and finish with what you have.";
 const BLOCKED_TEXT = "This Chrome's settings (set by the user's company) turn off developer tools, which pre.dev needs to work in it. Don't retry here: tell the user in one line, and continue with what you have.";
+/** The code a handed task's call carries when the person ended it here (Stop or Pause), so pre.dev's runner reads
+ *  the reason from a field and not from the wording. A company policy (developer tools off) has none. */
+const personCode = why => (why === STOPPED_TEXT ? 'STOPPED_BY_USER' : why === PAUSED_TEXT ? 'PAUSED_BY_USER' : null);
+const unavailableBody = why => ({ unavailable: true, ...(personCode(why) ? { code: personCode(why) } : {}) });
 
 // ---------------------------------------------------------------- state
 
@@ -744,7 +748,7 @@ async function onRequest(socket, m) {
     // cloud run waits a moment and then stops with its progress saved.
     if (route === 'POST /tasks/call') {
       const out = await taskCallHere({ ...body, __checkOnly: true });
-      if (out.unavailable) { head(503); end({ error: out.unavailable, unavailable: true }); return; }
+      if (out.unavailable) { head(503); end({ error: out.unavailable, ...unavailableBody(out.unavailable) }); return; }
     }
     head(200);
     await loadPairing();
@@ -767,7 +771,7 @@ async function onRequest(socket, m) {
     } else if (route === 'POST /tasks/call') {
       const out = await taskCallHere(body);
       // Ended while it ran (Pause, Stop, Unpair): the next call finds this Chrome unavailable.
-      end({ result: out.unavailable ? text(out.unavailable) : out.result });
+      end(out.unavailable ? { result: text(out.unavailable), ...unavailableBody(out.unavailable) } : { result: out.result });
     } else if (route === 'POST /tasks/driver') {
       end(await taskDriverHere(body));
     } else {
