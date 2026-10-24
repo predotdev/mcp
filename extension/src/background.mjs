@@ -540,11 +540,16 @@ async function stopRun(runKey) {
 
 // ---------------------------------------------------------------- Finish on my computer
 
-/** The tasks handed to this Chrome: only id, site, tab and who drives, for this browser session (never the
- *  task's instruction or progress, and nothing is written to disk). */
+/** The tasks handed to this Chrome: only id, site, tab, the page its tab is on (origin and path) and who drives,
+ *  never the task's instruction or progress. They outlast the browser session (every window closed, or Chrome
+ *  restarted) so a run can carry on there, and are dropped after TASK_KEEP_MS, when the run ends, or on Unpair. */
+const TASK_KEEP_MS = 6 * 3600000;
 const handedTasks = {
-  list: () => session.get('tasks', []),
-  save: list => session.set('tasks', list),
+  async list() {
+    const list = await local.get('tasks', []);
+    return (Array.isArray(list) ? list : []).filter(t => Date.now() - Date.parse(t.at || 0) < TASK_KEEP_MS);
+  },
+  save: list => local.set('tasks', list),
 };
 const taskInflight = new Map();
 const taskCalls = createTaskCalls({
@@ -577,7 +582,9 @@ async function taskUnavailable(taskId) {
   if (paused) return PAUSED_TEXT;
   if (devtoolsBlocked) return BLOCKED_TEXT;
   const stopped = await session.get('stopped', {});
-  return stopped[`task:${taskId}`] ? STOPPED_TEXT : '';
+  if (stopped[`task:${taskId}`]) return STOPPED_TEXT;
+  // Stopped here before every window closed: it stays stopped (the task keeps the mark).
+  return (await handedTasks.list()).find(t => t.taskId === taskId)?.stopped ? STOPPED_TEXT : '';
 }
 
 /** A task handed here: the person sees it in the popup's runs and log. */
@@ -652,6 +659,9 @@ async function stopTask(taskId) {
   const stopped = await session.get('stopped', {});
   stopped[`task:${taskId}`] = { at: Date.now() };
   await session.set('stopped', stopped);
+  const list = await handedTasks.list();
+  const t = list.find(x => x.taskId === taskId);
+  if (t) { t.stopped = Date.now(); await handedTasks.save(list); }
   await endCalls(STOPPED_TEXT, `task:${taskId}`);
   await note({ kind: 'control', run: `task:${taskId}`, text: 'Stopped this task in this Chrome' });
   ui();
@@ -902,7 +912,7 @@ async function forget(why) {
   stopLoop();
   await endCalls(why === 'unpaired' ? 'The user unpaired their Chrome from pre.dev.' : 'This Chrome is no longer paired with pre.dev.');
   for (const entry of [...asking.values()]) if (!entry.decided) await decide(entry.nonce, false);
-  await local.remove(['pairing', 'sites', 'paused']);
+  await local.remove(['pairing', 'sites', 'paused', 'tasks']);
   sitesCache = {};
   pairingCache = null;
   pairingKey = '';
@@ -954,6 +964,13 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 // ---------------------------------------------------------------- start, and stay up
 
 async function boot() {
+  // A new browser session (every window of this Chrome was closed, or it restarted): the tabs of tasks handed here
+  // are gone, so a run's next call on one opens it again on the page it was on (web_rules.mjs reopenTab).
+  if (!(await session.get('session', false))) {
+    await session.set('session', true);
+    const list = await handedTasks.list();
+    if (list.some(t => t.tab)) await handedTasks.save(list.map(t => (t.tab ? { ...t, reopen: true } : t)));
+  }
   paused = !!(await local.get('paused', false));
   devtoolsBlocked = String(await session.get('devtoolsBlocked', ''));
   await sites();

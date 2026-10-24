@@ -206,14 +206,21 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       else if ((args.reason === 'login_required' || args.reason === 'step_up') && args.wait === false) handoffArgs = { ...base, reason: args.reason, wait: false, done };
       else return text('Only the hand-back of the tab, a sign-in step handed to the user in it, and its check are available to this run.');
     } else if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
+    let reopened = '';
     if (args.tab) {
-      const info = tabInfo(args.tab);
+      // The tab this Chrome opened again for the task (below) answers to the run's old name for it too.
+      if (t.was?.some(w => sameTab(args.tab, w))) args.tab = t.tab;
+      let info = tabInfo(args.tab);
+      if (!info && t.reopen && sameTab(args.tab, t.tab)) {
+        reopened = await reopenTab(t, agent);
+        if (reopened) { args.tab = reopened; info = tabInfo(reopened); }
+      }
       if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
       if (isPrivate(info.targetId)) return refusedText(PRIVATE_TAB, { kind: 'scope' });
       // The tab opened for this task stays this run's, also after this client restarted (the list says so).
       if (t.tab && info.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) owned(agent)?.add(info.targetId);
     } else if (name !== 'chrome_open') return text('A call for this task must name its tab.');
-    if (handoffArgs) return callTool(HANDOFF_TOOL, handoffArgs, ctx());
+    if (handoffArgs) return withReopened(t, reopened, await callTool(HANDOFF_TOOL, { ...handoffArgs, tab: args.tab }, ctx()));
     if (name === 'chrome_open' && !args.profile) args.profile = defaultProfile();
     const blocked = await webCalls.sitesAllowed(name, args, body);
     if (blocked) return blocked;
@@ -233,7 +240,48 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       inflight.set(taskId, Math.max(0, (inflight.get(taskId) || 1) - 1));
       if (ok && approved.get(agent) === ok) approved.delete(agent);
     }
-    return (await webCalls.movedTo(name, args, result)) || result;
+    if (cloudOnly) await notePage(taskId, args.tab, result);
+    return withReopened(t, reopened, (await webCalls.movedTo(name, args, result)) || result);
+  }
+
+  /** A call that opened the task's tab again says so first, so the run reads the page before it acts. */
+  const withReopened = (t, tab, out) => (tab ? { ...out, content: [{ type: 'text', text: `Every window of this Chrome was closed (or Chrome restarted) since the run's last call, so the task's tab was opened again on ${t.page} as tab ${tab}, and the page loaded fresh: read it before acting.` }, ...(out?.content || [])] } : out);
+
+  const sameTab = (a, b) => !!a && !!b && String(a).toUpperCase() === String(b).toUpperCase();
+  // Where a task's tab was, as origin and path only (no query or fragment, which can carry a token).
+  const pageOf = url => { try { const u = new URL(url); return /^https?:$/.test(u.protocol) ? `${u.origin}${u.pathname}` : ''; } catch { return ''; } };
+
+  /** The extension: the page the task's tab is on after a call, so the tab can be opened there again. */
+  async function notePage(taskId, tab, result) {
+    const list = await tasks.list();
+    const t = list.find(x => x.taskId === taskId);
+    const id = tabInResult(result) || tab;
+    if (!t || !sameTab(id, t.tab)) return;
+    const page = pageOf(tabInfo(id)?.url || '');
+    if (page && page !== t.page) { t.page = page; await tasks.save(list); }
+  }
+
+  /** The extension, after every window of this Chrome closed or Chrome restarted (it marks the task `reopen`): the
+   *  task's tab is gone, so it opens again on the page it was on, once, if that site is still allowed. The run's old
+   *  name for the tab keeps working. Returns the new tab, or ''. */
+  async function reopenTab(t, agent) {
+    const page = pageOf(t.page || '');
+    const site = page ? await siteFor(hostOf(page)) : '';
+    if (!site || !isAllowed(site)) return '';
+    let tab = '';
+    try {
+      const opened = await callTool('chrome_open', { profile: defaultProfile(), url: page, foreground: false, __agent: agent, __predev_handoff: true, __via: 'web' },
+        { ...ctx(), signal: AbortSignal.timeout(60000) });
+      tab = tabInResult(opened);
+    } catch (error) { log(`handed task reopen failed: ${error.message}`); }
+    if (!tab) return '';
+    const list = await tasks.list();
+    const now = list.find(x => x.taskId === t.taskId);
+    if (now) { now.was = [...(now.was || []), now.tab].filter(Boolean).slice(-5); now.tab = tab; now.reopen = false; await tasks.save(list); }
+    t.was = now?.was || [t.tab]; t.tab = tab; t.reopen = false;
+    await refresh().catch(() => {});
+    log(`task ${t.taskId}: its tab opened again on ${site}`);
+    return tab;
   }
 
   /** pre.dev: the cloud run of a handed task ended (or never started): it comes off the list, or waits for an agent here. */
@@ -289,8 +337,9 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       taskId, batchId: String(body?.batchId || ''), site, tab, at: new Date().toISOString(),
       // 'cloud': pre.dev's cloud carries it on in that tab by itself; else it waits for an agent here.
       driver: body?.runner === 'cloud' ? 'cloud' : 'local',
-      // What an agent here needs to take it over (chrome_handed_off): only where one can.
-      ...(cloudOnly ? {} : {
+      // What an agent here needs to take it over (chrome_handed_off): only where one can. The extension keeps the
+      // page the tab is on (origin and path), to open it there again after its windows closed.
+      ...(cloudOnly ? { page: pageOf(url) } : {
         instruction: String(body?.instruction || '').slice(0, 20000),
         checkpoint: { url, step: Number(checkpoint.step) || 0, reason: String(checkpoint.reason || ''), memory: String(checkpoint.memory || '').slice(0, 8000),
           history: (Array.isArray(checkpoint.history) ? checkpoint.history : []).slice(-60) },
