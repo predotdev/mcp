@@ -213,16 +213,17 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       let info = tabInfo(args.tab);
       if (!info && t.reopen && sameTab(args.tab, t.tab)) {
         reopened = await reopenTab(t, agent);
-        if (reopened) {
-          args.tab = reopened; info = tabInfo(reopened);
-          // The page asks to sign in again: that sign-in lived only in the browser session that ended (a session
-          // cookie). The run hands the sign-in to the person, as for any password field, and never takes this page
-          // for its result.
-          if (name !== HANDOFF_TOOL && await signInWall(reopened, agent)) {
-            const site = await siteFor(hostOf(tabInfo(reopened)?.url || t.page || '')) || t.site;
-            return refusedText(`Every window of this Chrome was closed (or Chrome restarted) since the run's last call, so the task's tab was opened again as tab ${reopened}, and it now shows a sign-in page on ${site}: this Chrome lost that sign-in when its windows closed. This page is not the task's result, and pre.dev never types the password: the person signs in again in that tab, then the run reads the page and carries on.`,
-              { kind: 'secret', field: 'password', reopened: true });
-          }
+        if (reopened) { args.tab = reopened; info = tabInfo(reopened); }
+      }
+      // A tab opened again (above, or in an earlier hand-back of the tab) that asks to sign in: that sign-in lived
+      // only in the browser session that ended (a session cookie). The run's next call, other than a hand-back,
+      // hands the sign-in to the person, as for any password field, and never takes this page for its result.
+      if (info && t.wallCheck && name !== HANDOFF_TOOL && sameTab(args.tab, t.tab)) {
+        await clearWallCheck(t);
+        if (await signInWall(args.tab, agent)) {
+          const site = await siteFor(hostOf(info.url || t.page || '')) || t.site;
+          return refusedText(`Every window of this Chrome was closed (or Chrome restarted) while the run had this task, so its tab was opened again as tab ${args.tab}, and the page now asks to sign in on ${site}: a sign-in that lived only in the closed browser session is gone. This page is not the task's result, and pre.dev never types the password: the person signs in again in that tab, then the run reads the page and carries on.`,
+            { kind: 'secret', field: 'password', reopened: true });
         }
       }
       if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
@@ -275,6 +276,14 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     if (page && page !== t.page) { t.page = page; await tasks.save(list); }
   }
 
+  /** The reopened tab's sign-in check is asked once. */
+  async function clearWallCheck(t) {
+    t.wallCheck = false;
+    const list = await tasks.list();
+    const now = list.find(x => x.taskId === t.taskId);
+    if (now?.wallCheck) { delete now.wallCheck; await tasks.save(list); }
+  }
+
   /** Does this tab show a sign-in form (a password field)? Asked only of a tab just opened again (below). */
   async function signInWall(tab, agent) {
     try {
@@ -300,8 +309,8 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     if (!tab) return '';
     const list = await tasks.list();
     const now = list.find(x => x.taskId === t.taskId);
-    if (now) { now.was = [...(now.was || []), now.tab].filter(Boolean).slice(-5); now.tab = tab; now.reopen = false; await tasks.save(list); }
-    t.was = now?.was || [t.tab]; t.tab = tab; t.reopen = false;
+    if (now) { now.was = [...(now.was || []), now.tab].filter(Boolean).slice(-5); now.tab = tab; now.reopen = false; now.wallCheck = true; await tasks.save(list); }
+    t.was = now?.was || [t.tab]; t.tab = tab; t.reopen = false; t.wallCheck = true;
     await refresh().catch(() => {});
     log(`task ${t.taskId}: its tab opened again on ${site}`);
     return tab;
