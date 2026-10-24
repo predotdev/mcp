@@ -884,7 +884,11 @@ async function passkeyRefusal(args, session, startedAt) {
   if (!seen || typeof seen !== 'object' || Number(seen.at) < startedAt) return null;
   await evaluate(session, 'window.__predevPasskey = null', 3000).catch(() => {});
   const how = handTo(args, 'step_up', ' and a done check like {"kind":"url_changes"}');
-  return refused(`That started a passkey sign-in (WebAuthn), which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: seen.ceremony === 'create' ? 'create' : 'get' });
+  // The page asked to make a passkey (create) or to use one (get): the user is told the step it really is.
+  const create = seen.ceremony === 'create';
+  return refused(create
+    ? `That started creating a passkey (WebAuthn), which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
+    : `That started a passkey sign-in (WebAuthn), which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
 }
 // Wraps the agent's own input so the watcher above doesn't count it as the user's.
 async function asAgent(info, session, fn) {
