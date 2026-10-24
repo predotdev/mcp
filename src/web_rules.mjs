@@ -213,14 +213,28 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       let info = tabInfo(args.tab);
       if (!info && t.reopen && sameTab(args.tab, t.tab)) {
         reopened = await reopenTab(t, agent);
-        if (reopened) { args.tab = reopened; info = tabInfo(reopened); }
+        if (reopened) {
+          args.tab = reopened; info = tabInfo(reopened);
+          // The page asks to sign in again: that sign-in lived only in the browser session that ended (a session
+          // cookie). The run hands the sign-in to the person, as for any password field, and never takes this page
+          // for its result.
+          if (name !== HANDOFF_TOOL && await signInWall(reopened, agent)) {
+            const site = await siteFor(hostOf(tabInfo(reopened)?.url || t.page || '')) || t.site;
+            return refusedText(`Every window of this Chrome was closed (or Chrome restarted) since the run's last call, so the task's tab was opened again as tab ${reopened}, and it now shows a sign-in page on ${site}: this Chrome lost that sign-in when its windows closed. This page is not the task's result, and pre.dev never types the password: the person signs in again in that tab, then the run reads the page and carries on.`,
+              { kind: 'secret', field: 'password', reopened: true });
+          }
+        }
       }
       if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
       if (isPrivate(info.targetId)) return refusedText(PRIVATE_TAB, { kind: 'scope' });
       // The tab opened for this task stays this run's, also after this client restarted (the list says so).
       if (t.tab && info.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) owned(agent)?.add(info.targetId);
     } else if (name !== 'chrome_open') return text('A call for this task must name its tab.');
-    if (handoffArgs) return withReopened(t, reopened, await callTool(HANDOFF_TOOL, { ...handoffArgs, tab: args.tab }, ctx()));
+    if (handoffArgs) {
+      const r = await callTool(HANDOFF_TOOL, { ...handoffArgs, tab: args.tab }, ctx());
+      if (cloudOnly) await notePage(taskId, args.tab, r);
+      return withReopened(t, reopened, r);
+    }
     if (name === 'chrome_open' && !args.profile) args.profile = defaultProfile();
     const blocked = await webCalls.sitesAllowed(name, args, body);
     if (blocked) return blocked;
@@ -259,6 +273,15 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     if (!t || !sameTab(id, t.tab)) return;
     const page = pageOf(tabInfo(id)?.url || '');
     if (page && page !== t.page) { t.page = page; await tasks.save(list); }
+  }
+
+  /** Does this tab show a sign-in form (a password field)? Asked only of a tab just opened again (below). */
+  async function signInWall(tab, agent) {
+    try {
+      const r = await callTool('chrome_wait', { tab, selector: 'input[type=password]', timeout: 3, __agent: agent, __predev_handoff: true, __via: 'web' },
+        { ...ctx(), signal: AbortSignal.timeout(15000) });
+      return !r?.isError && /Condition met/.test((r?.content || []).map(c => c.text || '').join(' '));
+    } catch { return false; }
   }
 
   /** The extension, after every window of this Chrome closed or Chrome restarted (it marks the task `reopen`): the

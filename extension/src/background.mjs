@@ -150,6 +150,7 @@ function outcomeOf(result) {
   if (all.includes(PAUSED_TEXT)) return { ok: false, kind: 'ended', text: 'Refused: paused' };
   if (all.includes(STOPPED_TEXT)) return { ok: false, kind: 'ended', text: 'Refused: you stopped this run' };
   if (kind === 'not_allowed' && result.refusal?.answer === 'none') return { ok: false, kind, text: `No answer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes` };
+  if (kind === 'secret' && result.refusal?.reopened) return { ok: false, kind, text: 'Opened the tab again: its sign-in was lost when the windows closed, so it goes to you' };
   return { ok: false, kind: kind || 'error', text: REFUSED_AS[kind] || all.split('\n')[0].slice(0, 160) };
 }
 
