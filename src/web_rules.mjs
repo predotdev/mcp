@@ -178,7 +178,11 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     const taskId = cleanTaskId(body?.taskId);
     const name = String(body?.name || '');
     const t = taskId ? await handedTask(taskId) : null;
-    if (!t) return refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
+    // In the extension (cloudOnly) no agent on this computer takes a task over, so a task it no longer has lost its tab:
+    // every window of this Chrome was closed, or Chrome restarted. The run stops with its progress saved, to resume in the cloud or here.
+    if (!t) return cloudOnly
+      ? refusedText("This Chrome doesn't have this task any more: its windows were closed or Chrome restarted, so the run's tab is gone.", { kind: 'tab_closed' })
+      : refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
     if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
     if (name === 'ping') return text('ok', false);
     const agent = taskAgent(taskId);

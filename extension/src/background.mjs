@@ -604,9 +604,11 @@ async function taskCallHere(body) {
   const taskId = cleanTaskId(body?.taskId);
   const runKey = `task:${taskId}`;
   const args = body?.args && typeof body.args === 'object' ? body.args : {};
-  const why = taskId && name !== 'ping' ? await taskUnavailable(taskId) : '';
+  // A ping too: while paused, blocked or stopped here the run must find this Chrome away (it waits, then stops with
+  // its progress saved), so a ping that answered would send it straight back into the next refused call.
+  const why = taskId ? await taskUnavailable(taskId) : '';
   if (why) {
-    await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: why === PAUSED_TEXT ? 'Refused: paused' : why === STOPPED_TEXT ? 'Refused: you stopped this task' : 'Refused: developer tools are off', ms: 0 });
+    if (name !== 'ping') await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: why === PAUSED_TEXT ? 'Refused: paused' : why === STOPPED_TEXT ? 'Refused: you stopped this task' : 'Refused: developer tools are off', ms: 0 });
     return { unavailable: why };
   }
   if (body?.__checkOnly) return {};
@@ -689,7 +691,7 @@ async function onRequest(socket, m) {
   try {
     // A handed task's call while this Chrome is paused, blocked or stopped for it: unavailable (503), so pre.dev's
     // cloud run waits a moment and then stops with its progress saved.
-    if (route === 'POST /tasks/call' && String(body?.name || '') !== 'ping') {
+    if (route === 'POST /tasks/call') {
       const out = await taskCallHere({ ...body, __checkOnly: true });
       if (out.unavailable) { head(503); end({ error: out.unavailable, unavailable: true }); return; }
     }
