@@ -649,7 +649,9 @@ async function taskUnavailable(taskId) {
 async function takeTaskHere(body) {
   const taskId = cleanTaskId(body?.taskId);
   const why = await taskUnavailable(taskId);
-  if (why) return { accepted: false, error: why === PAUSED_TEXT ? 'the person paused pre.dev in this Chrome' : why === BLOCKED_TEXT ? "this Chrome's settings turn off developer tools" : 'the person stopped this task in this Chrome' };
+  // The refusal says why in a code too (POLICY_BLOCKED, PAUSED_BY_USER, STOPPED_BY_USER): pre.dev records a policy
+  // refusal from it and not from the wording.
+  if (why) return { accepted: false, error: why === PAUSED_TEXT ? 'the person paused pre.dev in this Chrome' : why === BLOCKED_TEXT ? "this Chrome's settings turn off developer tools" : 'the person stopped this task in this Chrome', ...(TASK_CODES.has(why) ? { code: TASK_CODES.get(why) } : {}) };
   await sites();
   await loadPairing();
   const out = await taskCalls.takeTask(body);
