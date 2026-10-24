@@ -441,6 +441,14 @@ async function touchRun(runKey, name, args, turn = '') {
   await session.set('runs', runs);
 }
 
+/** A handed task is over here (its run finished, or this Chrome no longer has it): the popup shows how it ended. */
+async function endRun(runKey, how) {
+  const runs = await session.get('runs', {});
+  if (!runs[runKey]) return;
+  runs[runKey].ended = { at: Date.now(), how };
+  await session.set('runs', runs);
+}
+
 async function webCall(body) {
   const name = String(body?.name || '');
   const runKey = runKeyOf(body);
@@ -600,6 +608,9 @@ async function takeTaskHere(body) {
     const stopped = await session.get('stopped', {});
     if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await session.set('stopped', stopped); }
     await touchRun(`task:${taskId}`, 'chrome_open', { url: body?.checkpoint?.url });
+    // Handed here again after it ended: it is live again.
+    const runs = await session.get('runs', {});
+    if (runs[`task:${taskId}`]?.ended) { delete runs[`task:${taskId}`].ended; await session.set('runs', runs); }
   }
   await note({ kind: 'control', run: `task:${taskId}`, text: out.accepted ? `A Browser Agents task was handed to this Chrome (${hostOf(String(body?.checkpoint?.url || '')) || 'its page'})` : `A handed task was not taken: ${out.error}` });
   ui();
@@ -649,7 +660,12 @@ async function taskCallHere(body) {
 /** pre.dev: the cloud run of a handed task ended. */
 async function taskDriverHere(body) {
   const out = await taskCalls.taskDriver(body);
-  if (out.removed) { await note({ kind: 'control', run: `task:${cleanTaskId(body?.taskId)}`, text: 'The handed task ended here' }); ui(); }
+  if (out.removed) {
+    const runKey = `task:${cleanTaskId(body?.taskId)}`;
+    await endRun(runKey, body?.finished === true ? 'finished' : 'ended');
+    await note({ kind: 'control', run: runKey, text: body?.finished === true ? 'The handed task finished' : 'The handed task ended here' });
+    ui();
+  }
   return out;
 }
 
@@ -657,6 +673,8 @@ async function taskDriverHere(body) {
 async function stopTask(taskId) {
   taskId = cleanTaskId(taskId);
   if (!taskId) return;
+  // Already over (a popup opened before it finished): nothing to stop.
+  if ((await session.get('runs', {}))[`task:${taskId}`]?.ended) return ui();
   const stopped = await session.get('stopped', {});
   stopped[`task:${taskId}`] = { at: Date.now() };
   await session.set('stopped', stopped);

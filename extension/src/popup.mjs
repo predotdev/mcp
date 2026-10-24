@@ -30,6 +30,9 @@ const runName = key => {
   if (parts[0] === 'task') return `Browser Agents task ${String(parts[1] || '').slice(-6)}`;
   return parts.length >= 2 ? `Web run in project ${parts[1].slice(0, 6)}` : 'Web run';
 };
+const endedNote = e => (e.how === 'finished'
+  ? `Finished ${timeOf(e.at)}: pre.dev's run of this task is over.`
+  : `Ended ${timeOf(e.at)}: this Chrome no longer has this task.`);
 const stoppedNote = key => (String(key).startsWith('task:')
   ? 'Stopped here: pre.dev keeps its progress.'
   : "Stopped for the rest of this turn: it can use this Chrome again when you send a new message in that chat.");
@@ -57,10 +60,13 @@ function render() {
 
   const runs = $('runs');
   runs.replaceChildren(...(view.runs || []).filter(r => Date.now() - r.last < 30 * 60000).slice(0, 3).map(r => el('div', { class: 'run' },
-    el('div', { class: 'what' }, el('b', {}, runName(r.key)), el('br'), el('span', { class: 'dim small' }, r.stopped
-      ? stoppedNote(r.key)
-      : `${r.active ? 'Working now' : `Last step ${timeOf(r.last)}`}${r.hosts?.length ? ` on ${r.hosts.join(', ')}` : ''}`)),
-    ...(r.stopped ? [] : [el('button', { onclick: () => send({ type: 'stopRun', runKey: r.key }) }, String(r.key).startsWith('task:') ? 'Stop this task' : 'Stop this run')]),
+    el('div', { class: 'what' }, el('b', {}, runName(r.key)), el('br'), el('span', { class: 'dim small' }, r.ended
+      ? endedNote(r.ended)
+      : r.stopped
+        ? stoppedNote(r.key)
+        : `${r.active ? 'Working now' : `Last step ${timeOf(r.last)}`}${r.hosts?.length ? ` on ${r.hosts.join(', ')}` : ''}`)),
+    // A finished task has nothing left to stop.
+    ...(r.stopped || r.ended ? [] : [el('button', { onclick: () => send({ type: 'stopRun', runKey: r.key }) }, String(r.key).startsWith('task:') ? 'Stop this task' : 'Stop this run')]),
   )));
 
   const names = Object.keys(sites).sort();
