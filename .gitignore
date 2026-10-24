@@ -1,3 +1,6 @@
 node_modules/
 *.tgz
 .DS_Store
+extension/dist/
+extension/*.zip
+extension/dist-dev/
