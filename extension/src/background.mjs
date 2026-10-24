@@ -432,6 +432,7 @@ async function touchRun(runKey, name, args, turn = '') {
   const r = runs[runKey] || { first: Date.now(), calls: 0, hosts: [] };
   r.last = Date.now();
   r.calls++;
+  delete r.cut;
   if (turn) r.turn = turn;
   const host = (name === 'chrome_open' || name === 'chrome_navigate') ? hostOf(/^[a-z][a-z0-9+.-]*:/i.test(String(args?.url || '')) ? args.url : `https://${args?.url || ''}`) : '';
   if (host && !r.hosts.includes(host)) r.hosts = [...r.hosts, host].slice(-6);
@@ -439,6 +440,21 @@ async function touchRun(runKey, name, args, turn = '') {
   const keys = Object.keys(runs).sort((a, b) => runs[b].last - runs[a].last);
   for (const k of keys.slice(20)) delete runs[k];
   await session.set('runs', runs);
+}
+
+/** This Chrome stopped answering a handed task's run (a call refused here while paused, stopped or blocked; the
+ *  connection to pre.dev dropped; or the extension started again after being away). pre.dev tells this Chrome the
+ *  same thing when its run here finished the task and when the cloud took the task back, so this is what tells the
+ *  two apart: a task whose run here was cut off, and that no call reached since, did not finish here. */
+async function cutTaskRuns(runKey = '') {
+  const runs = await session.get('runs', {});
+  let changed = false;
+  for (const [k, r] of Object.entries(runs)) {
+    if (!k.startsWith('task:') || (runKey && k !== runKey) || r.ended || r.cut) continue;
+    r.cut = true;
+    changed = true;
+  }
+  if (changed) await session.set('runs', runs);
 }
 
 /** A handed task is over here (its run finished, or this Chrome no longer has it): the popup shows how it ended. */
@@ -627,6 +643,7 @@ async function taskCallHere(body) {
   // its progress saved), so a ping that answered would send it straight back into the next refused call.
   const why = taskId ? await taskUnavailable(taskId) : '';
   if (why) {
+    await cutTaskRuns(runKey);
     if (name !== 'ping') await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: why === PAUSED_TEXT ? 'Refused: paused' : why === STOPPED_TEXT ? 'Refused: you stopped this task' : 'Refused: developer tools are off', ms: 0 });
     return { unavailable: why };
   }
@@ -651,6 +668,7 @@ async function taskCallHere(body) {
     inflight.delete(call);
     ui();
   }
+  if (result.unavailable) await cutTaskRuns(runKey);
   const o = result.unavailable ? { ok: false, kind: 'ended', text: 'Ended here' } : outcomeOf(result.result);
   await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: o.ok, outcome: o.kind || 'ok', text: o.text, ms: Date.now() - started });
   log('task call', name, result.unavailable ? 'ended' : result.result?.refusal ? `refused (${result.result.refusal.kind})` : result.result?.isError ? 'failed' : 'ok', `${Date.now() - started}ms`);
@@ -662,8 +680,11 @@ async function taskDriverHere(body) {
   const out = await taskCalls.taskDriver(body);
   if (out.removed) {
     const runKey = `task:${cleanTaskId(body?.taskId)}`;
-    await endRun(runKey, body?.finished === true ? 'finished' : 'ended');
-    await note({ kind: 'control', run: runKey, text: body?.finished === true ? 'The handed task finished' : 'The handed task ended here' });
+    // Finished here only if its run here was never cut off since its last call (see cutTaskRuns): after a stop
+    // here, Resume on pre.dev's card carries the task on in the cloud, and this Chrome just no longer has it.
+    const finished = body?.finished === true && !(await session.get('runs', {}))[runKey]?.cut;
+    await endRun(runKey, finished ? 'finished' : 'ended');
+    await note({ kind: 'control', run: runKey, text: finished ? 'The handed task finished' : 'The handed task ended here' });
     ui();
   }
   return out;
@@ -678,6 +699,7 @@ async function stopTask(taskId) {
   const stopped = await session.get('stopped', {});
   stopped[`task:${taskId}`] = { at: Date.now() };
   await session.set('stopped', stopped);
+  await cutTaskRuns(`task:${taskId}`);
   const list = await handedTasks.list();
   const t = list.find(x => x.taskId === taskId);
   if (t) { t.stopped = Date.now(); await handedTasks.save(list); }
@@ -801,6 +823,7 @@ async function connectOnce() {
       clearTimeout(connectTimer);
       if (ws === socket) ws = null;
       if (status === 'online') status = 'offline';
+      void cutTaskRuns();
       log('closed', why);
       try { socket.close(1000, 'reconnect'); } catch {}
       ui();
@@ -983,6 +1006,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 // ---------------------------------------------------------------- start, and stay up
 
 async function boot() {
+  // Away until now (the service worker was not running): a handed task's run here may have stopped meanwhile.
+  await cutTaskRuns();
   // A new browser session (every window of this Chrome was closed, or it restarted): the tabs of tasks handed here
   // are gone, so a run's next call on one opens it again on the page it was on (web_rules.mjs reopenTab).
   if (!(await session.get('session', false))) {
