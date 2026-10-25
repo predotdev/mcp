@@ -661,6 +661,21 @@ function find(q) {
   }
   return { error: 'Pass ref (from chrome_snapshot), selector, or text.' };
 }
+// A cover that paints nothing where it sits (a transparent layer that only catches the pointer).
+function paintsNothing(hit) {
+  if (/^(IMG|SVG|CANVAS|VIDEO|IFRAME|INPUT|SELECT|TEXTAREA|BUTTON|PICTURE|OBJECT|EMBED)$/i.test(hit.tagName)) return false;
+  let op = 1;
+  for (let n = hit; n && n.nodeType === 1; n = n.parentNode || n.host) op *= Number(getComputedStyle(n).opacity) || 0;
+  if (op < 0.05) return true;
+  const cs = getComputedStyle(hit);
+  if (cs.visibility === 'hidden') return true;
+  const alpha = c => { const m = /rgba?\(([^)]+)\)/.exec(c); if (!m) return c === 'transparent' ? 0 : 1; const p = m[1].split(/[ ,\/]+/).filter(Boolean); return p.length >= 4 ? Number(p[3]) : 1; };
+  if (alpha(cs.backgroundColor) > 0.05 || cs.backgroundImage !== 'none' || cs.boxShadow !== 'none') return false;
+  if (['Top', 'Right', 'Bottom', 'Left'].some(k => parseFloat(cs['border' + k + 'Width']) > 0 && cs['border' + k + 'Style'] !== 'none' && alpha(cs['border' + k + 'Color']) > 0.05)) return false;
+  return !clean(hit.innerText);
+}
+// Where a click on the element lands: its center when that is its own, else the clear point of it nearest
+// the center (a 7x7 grid over each of its boxes on screen). coveredAll: no point of it on screen is its own.
 function point(q) {
   const f = find(q);
   if (f.error) return f;
@@ -668,14 +683,31 @@ function point(q) {
   el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const r = topRect(el);
   if (r.w < 1 || r.h < 1) return { error: 'Element is not visible: ' + describe(el) };
-  const x = r.x + r.w / 2, y = r.y + r.h / 2;
-  let covered = null;
+  let x = r.x + r.w / 2, y = r.y + r.h / 2;
+  let covered = null, moved = false, coveredAll = false, blank = false;
   if (el.ownerDocument === document) {
-    let hit = document.elementFromPoint(x, y);
-    while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
-    if (hit && !contains(el, hit) && !contains(hit, el)) covered = describe(hit);
+    const topAt = (px, py) => {
+      let hit = document.elementFromPoint(px, py);
+      while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(px, py); if (!inner || inner === hit) break; hit = inner; }
+      return hit;
+    };
+    const hit = topAt(x, y);
+    if (hit && !contains(el, hit) && !contains(hit, el)) {
+      // Named as the control it belongs to (the ribbon's image is the link "Fork me on GitHub").
+      covered = describe(hit.closest?.('a[href],button,[role=button],[role=link]') || hit);
+      const pts = [];
+      for (const b of el.getClientRects()) {
+        const L = Math.max(0, b.left), T = Math.max(0, b.top), R = Math.min(innerWidth, b.right), B = Math.min(innerHeight, b.bottom);
+        if (R - L < 1 || B - T < 1) continue;
+        for (let i = 0; i < 7; i++) for (let j = 0; j < 7; j++) pts.push([L + Math.min(R - L - 0.5, Math.max(0.5, (i + 0.5) * (R - L) / 7)), T + Math.min(B - T - 0.5, Math.max(0.5, (j + 0.5) * (B - T) / 7))]);
+      }
+      pts.sort((a, b) => (a[0] - x) ** 2 + (a[1] - y) ** 2 - ((b[0] - x) ** 2 + (b[1] - y) ** 2));
+      const clear = pts.find(([px, py]) => { const h = topAt(px, py); return h && contains(el, h); });
+      if (clear) { [x, y] = clear; moved = true; }
+      else { coveredAll = true; blank = paintsNothing(hit); }
+    }
   }
-  return { x, y, desc: describe(el), covered, select: el.tagName === 'SELECT' };
+  return { x, y, desc: describe(el), covered, moved, coveredAll, blank, select: el.tagName === 'SELECT' };
 }
 function focus(q, clear) {
   const f = find(q);
@@ -823,6 +855,10 @@ const INPUT_WATCH = `(() => {
   window.__predevInputWatch = true;
   const mark = e => { if (e.isTrusted && !window.__predevAgentActing) window.__predevUserAt = Date.now(); };
   for (const type of ['pointerdown', 'keydown', 'input', 'paste']) addEventListener(type, mark, true);
+  // Every trusted click or key that reaches this page, the agent's too: Chrome's own dialogs over a
+  // tab swallow input before it gets here (inputBlocked).
+  const seen = e => { if (e.isTrusted) window.__predevSeen = (window.__predevSeen || 0) + 1; };
+  for (const type of ['pointerdown', 'mousedown', 'keydown', 'keyup', 'beforeinput']) addEventListener(type, seen, true);
 })()`;
 async function watchInput(info, session) {
   if (!H.watched.has(info.targetId)) {
@@ -941,6 +977,19 @@ function keepsSignIn(args, href) {
 }
 const hostOf = href => { try { return new URL(String(href)).hostname; } catch { return String(href || ''); } };
 const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the agent keeps that sign-in for the rest of the run: don't log out, switch accounts or re-trigger the sign-in, carry on signed in. If the task needs it, ask the user; they can do it in the tab themselves.`;
+// A click, key or script needs the page to answer the guard's checks first. While a dialog the page
+// opened (an alert, a confirm or a prompt) is up, or the page is busy, it doesn't: the checks would
+// go without their facts, and the input would wait in Chrome and land once the page answers, past
+// every check. So the guard refuses at once, from the tab's last known address.
+const pageAnswers = session => evaluate(session, '1', 3000).then(() => true, () => false);
+async function pageMustAnswer(args, session, info, what) {
+  if (!handoffOn(args)) return;
+  if (await pageAnswers(session)) return;
+  const site = keepsSignIn(args, info.url) ? hostOf(info.url) : '';
+  if (site) throw new Error(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`);
+  throw new Error(pageBusy(hostOf(info.url), what));
+}
+const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict: allowed.
 async function accountRefusal(args, session, action, target, url, ctx) {
@@ -1018,10 +1067,57 @@ async function clickInner(session, x, y, count) {
 }
 
 // The page's address and an id for its document, taken before an action so settle can tell whether
-// the action loaded a new page.
-function docState(session) {
-  return evaluate(session, '[location.href, window.__agentDoc || (window.__agentDoc = Math.random().toString(36).slice(2))]', 5000).catch(() => [null, null]);
+// the action loaded a new page. When the page doesn't answer in time (a dialog, a busy page), the
+// address is `fallbackUrl`, the tab's last known one, so the guard's site checks still apply.
+function docState(session, fallbackUrl = null) {
+  return evaluate(session, '[location.href, window.__agentDoc || (window.__agentDoc = Math.random().toString(36).slice(2))]', 5000).catch(() => [fallbackUrl, null]);
 }
+
+// Chrome's own dialogs over a tab (most often its password warning, "Change your password", after a
+// sign-in with a password Chrome found in a data breach) swallow every click and key sent to the
+// tab, while the page itself still answers scripts and screenshots. With handoffs on, the page
+// counts the trusted input that reaches it (INPUT_WATCH). An action whose input never arrived, on a
+// page that didn't change and with no frame in the way, gets one probe key (Shift, which types
+// nothing); when that doesn't arrive either, such a dialog is open.
+const seenCount = session => evaluate(session, 'window.__predevSeen || 0', 3000).then(Number).catch(() => null);
+const FRAMED_AT = (x, y) => `(() => { const el = document.elementFromPoint(${Number(x)}, ${Number(y)}); return !!el && /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(el.tagName); })()`;
+const FRAMED_FOCUS = '(() => { const el = document.activeElement; return !!el && /^(IFRAME|FRAME|EMBED|OBJECT)$/.test(el.tagName); })()';
+// Does input reach the page now? true, false, or null when the page doesn't answer (can't tell).
+// The probe is the agent's own input, so the watcher never counts it as the user's.
+const PROBE_START = `(${INPUT_WATCH}, window.__predevAgentActing = true, [Number(window.__predevSeen || 0), ${FRAMED_FOCUS}])`;
+async function inputReaches(session) {
+  const start = await evaluate(session, PROBE_START, 3000).catch(() => null);
+  const done = () => evaluate(session, 'window.__predevAgentActing = false', 3000).catch(() => {});
+  if (!Array.isArray(start)) return null;
+  if (start[1]) { await done(); return null; }
+  let out = false;
+  try {
+    await chrome.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
+    await chrome.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
+    for (let i = 0; i < 6; i++) {
+      const now = await seenCount(session);
+      if (now === null) { out = null; break; }
+      if (now > start[0]) { out = true; break; }
+      await sleep(60);
+    }
+  } catch { out = null; }
+  await done();
+  return out;
+}
+// After an action: did its input go nowhere because a Chrome dialog is over the tab?
+async function inputBlocked(session, seen0, before, framed) {
+  if (seen0 === null) return false;
+  const seen1 = await seenCount(session);
+  if (seen1 === null || seen1 > seen0) return false;
+  const [, doc] = await docState(session);
+  if (!doc || doc !== before[1]) return false;
+  if (await evaluate(session, framed, 3000).catch(() => true)) return false;
+  return (await inputReaches(session)) === false;
+}
+const CHROME_DIALOG = 'chrome_dialog';
+// A handoff that ends once input reaches the page again (the user closed Chrome's dialog).
+const waitsForInput = (reason, done) => reason === CHROME_DIALOG || done?.kind === 'input_reaches';
+const dialogRefusal = (args, what = "this call's didn't either") => `Chrome's own dialog is open over this tab, most likely its password warning ("Change your password"), so clicks and typing don't reach the page (${what}). Don't retry, and don't open another tab for it: hand this step to the user, who closes Chrome's dialog: ${handTo(args, CHROME_DIALOG)}.`;
 
 // Waits for whatever an action set off, without assuming it did anything. A new page gets the full
 // load wait; on the same page, scripts get up to 2 s to finish showing the change (it returns as soon
@@ -1340,7 +1436,8 @@ const TOOLS = [
     async run(args, ctx = {}) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);
-      const before = await docState(session);
+      await pageMustAnswer(args, session, info, 'this click');
+      const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
       if (handoffOn(args) && x !== undefined && y !== undefined && keepsSignIn(args, before[0])) {
@@ -1361,13 +1458,19 @@ const TOOLS = [
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
           if (ask) throw new Error(ask);
         }
+        // Nothing of it is clear on screen: a click would only reach what is on top, so none is sent (a cover that
+        // paints nothing keeps the old way: the click goes there, with the note).
+        if (hit.coveredAll && !hit.blank) throw new Error(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`);
         ({ x, y } = hit);
         what = hit.desc;
-        if (hit.covered) note = `\nNote: ${hit.covered} was on top of it at that point; the click went there.`;
+        if (hit.moved) note = `\nNote: ${hit.covered} covers the middle of it, so the click went to a clear part of it.`;
+        else if (hit.covered) note = `\nNote: ${hit.covered} was on top of it at that point; the click went there.`;
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
+      const seen0 = handoffOn(args) ? await seenCount(session) : null;
       await click(session, x, y, args.double ? 2 : 1);
+      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(dialogRefusal(args));
       await settle(session, before);
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1387,7 +1490,8 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       const q = target(args.ref || args.selector ? args : { ...args, text: undefined });
       if (q === '{}') throw new Error('Pass ref (from chrome_snapshot) or selector for the field.');
-      const before = await docState(session);
+      await pageMustAnswer(args, session, info, 'typing here');
+      const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
         if (secret) throw new Error(secret);
@@ -1410,11 +1514,18 @@ const TOOLS = [
         return `Selected "${picked.chosen}" in ${picked.desc}`;
       }
       if (field.isPassword && !isLocalDev(before[0])) throw new Error('Refusing to type into a password field outside local dev sites; the user should enter it.');
+      const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
       if (args.text) {
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (args.submit) { await pressKeys(session, 'Enter'); await settle(session, before); }
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args));
+      if (args.submit) {
+        const seen1 = handoffOn(args) ? await seenCount(session) : null;
+        await pressKeys(session, 'Enter');
+        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args, "the text went in, but this call's Enter didn't"));
+        await settle(session, before);
+      }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
       return `Typed into ${field.desc}${value !== null ? `; value is now ${JSON.stringify(value)}` : ' and pressed Enter'}\n${await pageLine(info, session)}`;
     },
@@ -1452,7 +1563,8 @@ const TOOLS = [
     async run({ tab, keys, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      const before = await docState(session);
+      await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
+      const before = await docState(session, info.url);
       if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
         // Enter (or Space) on a focused link or button activates it, like a click.
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
@@ -1468,7 +1580,9 @@ const TOOLS = [
           if (ask) throw new Error(ask);
         }
       }
+      const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       await pressKeys(session, keys);
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(rest));
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
@@ -1618,7 +1732,8 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       let expression = js;
       if (handoffOn(rest)) {
-        const [href] = await docState(session);
+        const answers = await pageAnswers(session);
+        const [href] = answers ? await docState(session, info.url) : [info.url];
         // Where a handoff signed the user in (rule 3), no script runs. Not a read-only run under V8's
         // side-effect check: that check lets a script keep a change on an object Chrome builds on first
         // use (navigator.credentials, navigator.clipboard, an element's own wrapper), and it would stay
@@ -1626,6 +1741,7 @@ const TOOLS = [
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
           throw new Error(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`);
+        if (!answers) throw new Error(pageBusy(hostOf(info.url), 'this script'));
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
@@ -1703,15 +1819,15 @@ const TOOLS = [
   },
   {
     name: 'chrome_handoff',
-    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. With reason "user_control" and resume: true it takes the tab back after the user said to keep going.',
+    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. With reason "user_control" and resume: true it takes the tab back after the user said to keep going. With reason "chrome_dialog" (a tool said Chrome\'s own dialog, such as its password warning, is over the tab) the user closes that dialog, and it is done once clicks and keys reach the page again.',
     inputSchema: {
       type: 'object', required: ['tab'],
       properties: {
         tab: { type: 'string' },
-        reason: { type: 'string', enum: ['login_required', 'step_up', 'captcha', 'consent', 'approval', 'user_control'] },
+        reason: { type: 'string', enum: ['login_required', 'step_up', 'captcha', 'consent', 'approval', 'user_control', CHROME_DIALOG] },
         done: {
-          type: 'object', description: 'When the step is done, from the URL or the page structure: {"kind":"url_changes"} (default), {"kind":"url_leaves","value":"/login"}, {"kind":"element_gone","value":"input[type=password]"}, {"kind":"element_present","value":"<CSS selector>"}.',
-          properties: { kind: { type: 'string', enum: ['url_changes', 'url_leaves', 'element_gone', 'element_present'] }, value: { type: 'string' } },
+          type: 'object', description: 'When the step is done, from the URL or the page structure: {"kind":"url_changes"} (default), {"kind":"url_leaves","value":"/login"}, {"kind":"element_gone","value":"input[type=password]"}, {"kind":"element_present","value":"<CSS selector>"}, or {"kind":"input_reaches"} (Chrome\'s dialog over the tab is closed; the default for reason chrome_dialog).',
+          properties: { kind: { type: 'string', enum: ['url_changes', 'url_leaves', 'element_gone', 'element_present', 'input_reaches'] }, value: { type: 'string' } },
         },
         timeout: { type: 'number', description: 'Seconds; omit or 0 for no limit.' },
         resume: { type: 'boolean', description: 'With reason user_control: take the tab back (the user said to keep going).' },
@@ -1756,6 +1872,11 @@ const TOOLS = [
       if (args.check) {
         const session = await chrome.session(info.targetId);
         const startUrl = String(args.start_url || H.handoff.get(info.targetId)?.startUrl || info.url);
+        const open = H.handoff.get(info.targetId);
+        if (waitsForInput(open?.reason || args.reason, args.done || open?.done)) {
+          const [href] = await docState(session, info.url);
+          return handoffLines((await inputReaches(session)) ? 'done' : 'waiting', info, href || info.url);
+        }
         const v = await evaluate(session, doneExpression(args.done || H.handoff.get(info.targetId)?.done, startUrl), 5000).catch(() => null);
         if (v?.ok) noteSignedIn(H.handoff.get(info.targetId)?.reason || reason, v.url || info.url);
         return handoffLines(v?.ok ? 'done' : 'waiting', info, v?.url || info.url);
@@ -1816,7 +1937,15 @@ const TOOLS = [
             await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
             shown = true;
           }
-          if (reason !== 'user_control') {
+          if (waitsForInput(reason, args.done)) {
+            // Chrome's dialog: done once a probe key reaches the page (one probe a second).
+            session = await chrome.session(info.targetId).catch(() => session);
+            if (await inputReaches(session)) {
+              end(info.targetId, 'done');
+              return `${handoffLines('done', info, lastUrl)}${await pageLine(info, session)}\nThe user closed Chrome's dialog; clicks and keys reach the page again. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
+            }
+            await sleep(500);
+          } else if (reason !== 'user_control') {
             // The session can go stale (a detach on navigation): re-attach after a few misses.
             session = await chrome.session(info.targetId).catch(() => session);
             const v = await evaluate(session, doneExpression(args.done, startUrl), 5000).catch(error => {
