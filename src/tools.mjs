@@ -1479,7 +1479,7 @@ const TOOLS = [
         }
         // Nothing of it is clear on screen: a click would only reach what is on top, so none is sent (a cover that
         // paints nothing keeps the old way: the click goes there, with the note).
-        if (hit.coveredAll && !hit.blank) throw new Error(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`);
+        if (hit.coveredAll && !hit.blank) throw refused(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`, { kind: 'covered', by: hit.covered, desc: hit.desc });
         ({ x, y } = hit);
         what = hit.desc;
         if (hit.moved) note = `\nNote: ${hit.covered} covers the middle of it, so the click went to a clear part of it.`;
