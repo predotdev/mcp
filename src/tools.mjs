@@ -634,6 +634,38 @@ function snapshot(max, peek, strict) {
   const more = rows.length - keep.length;
   return head + (lines.join('\n') || '(no interactive elements)') + (more > 0 ? '\n… ' + more + ' more offscreen; scroll or pass a larger max' : '');
 }
+// pre.dev's runs: what structure says about each input among the refs, for the run's check of what it types
+// (sign-in fields): the type attribute, the autocomplete tokens, and whether the input's form holds a password
+// field. Inputs only, and no names, values or page text.
+function inputFacts() {
+  const out = {};
+  for (const [ref, hit] of window.__agentRefs || []) {
+    const el = hit.__agentInput || hit;
+    if (el.tagName !== 'INPUT') continue;
+    out[ref] = { type: String(el.getAttribute('type') || '').trim().toLowerCase() || 'text', autocomplete: el.getAttribute('autocomplete') || '', formHasPassword: formHasPassword(el) };
+  }
+  return out;
+}
+// The input's form, or else the nearest box around it that also holds a button (a form with no <form> tag).
+function formBox(el) {
+  const form = el.form || el.closest('form,[role=form]');
+  if (form) return form;
+  let n = el;
+  for (let depth = 0; depth < 8; depth++) {
+    n = n.parentElement || n.getRootNode().host || null;
+    if (!n || n === document.body || n === document.documentElement) return null;
+    if (n.querySelector('button,[role=button],input[type=submit],input[type=image],input[type=button]')) return n;
+  }
+  return null;
+}
+function formHasPassword(el) {
+  const box = formBox(el);
+  return !!box && !!box.querySelector('input[type=password i]');
+}
+function snapshotWithInputs(max) {
+  const text = snapshot(max);
+  return { text, inputs: inputFacts() };
+}
 function deepQuery(root, selector) {
   const hit = root.querySelector(selector);
   if (hit) return hit;
@@ -796,7 +828,7 @@ function selectOption(q, text) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
   return { desc: describe(el), chosen: clean(opt.text) };
 }
-window.__agent = { snapshot, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts, factsAt };
+window.__agent = { snapshot, snapshotWithInputs, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts, factsAt };
 })();`;
 // Pages keep the injected helpers; a changed source gets a new version and is re-injected.
 const PAGE_LIB = PAGE_LIB_SOURCE.replaceAll('__LIBVER__', crypto.createHash('sha1').update(PAGE_LIB_SOURCE).digest('hex').slice(0, 12));
@@ -1489,10 +1521,16 @@ const TOOLS = [
       type: 'object', required: ['tab'],
       properties: { tab: { type: 'string' }, max: { type: 'number', description: 'Max elements (default 200).' } },
     },
-    async run({ tab, max = 200 }) {
+    async run(args) {
+      const { tab, max = 200 } = args;
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      return `${await pageLine(info, session)}\n${await inPage(session, `snapshot(${Math.min(Math.max(Number(max) || 200, 20), 1000)})`, 20000)}`;
+      const n = Math.min(Math.max(Number(max) || 200, 20), 1000);
+      if (!fromWeb(args)) return `${await pageLine(info, session)}\n${await inPage(session, `snapshot(${n})`, 20000)}`;
+      // pre.dev's runs also get each input's structure, by ref, next to the text (a run that does not read it
+      // sees the same text as before).
+      const snap = await inPage(session, `snapshotWithInputs(${n})`, 20000);
+      return { content: [{ type: 'text', text: `${await pageLine(info, session)}\n${snap.text}` }], inputs: snap.inputs || {} };
     },
   },
   {
