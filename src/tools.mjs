@@ -664,6 +664,21 @@ function find(q) {
   }
   return { error: 'Pass ref (from chrome_snapshot), selector, or text.' };
 }
+// A cover that paints nothing where it sits (a transparent layer that only catches the pointer).
+function paintsNothing(hit) {
+  if (/^(IMG|SVG|CANVAS|VIDEO|IFRAME|INPUT|SELECT|TEXTAREA|BUTTON|PICTURE|OBJECT|EMBED)$/i.test(hit.tagName)) return false;
+  let op = 1;
+  for (let n = hit; n && n.nodeType === 1; n = n.parentNode || n.host) op *= Number(getComputedStyle(n).opacity) || 0;
+  if (op < 0.05) return true;
+  const cs = getComputedStyle(hit);
+  if (cs.visibility === 'hidden') return true;
+  const alpha = c => { const m = /rgba?\(([^)]+)\)/.exec(c); if (!m) return c === 'transparent' ? 0 : 1; const p = m[1].split(/[ ,\/]+/).filter(Boolean); return p.length >= 4 ? Number(p[3]) : 1; };
+  if (alpha(cs.backgroundColor) > 0.05 || cs.backgroundImage !== 'none' || cs.boxShadow !== 'none') return false;
+  if (['Top', 'Right', 'Bottom', 'Left'].some(k => parseFloat(cs['border' + k + 'Width']) > 0 && cs['border' + k + 'Style'] !== 'none' && alpha(cs['border' + k + 'Color']) > 0.05)) return false;
+  return !clean(hit.innerText);
+}
+// Where a click on the element lands: its center when that is its own, else the clear point of it nearest
+// the center (a 7x7 grid over each of its boxes on screen). coveredAll: no point of it on screen is its own.
 function point(q) {
   const f = find(q);
   if (f.error) return f;
@@ -671,14 +686,31 @@ function point(q) {
   el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
   const r = topRect(el);
   if (r.w < 1 || r.h < 1) return { error: 'Element is not visible: ' + describe(el) };
-  const x = r.x + r.w / 2, y = r.y + r.h / 2;
-  let covered = null;
+  let x = r.x + r.w / 2, y = r.y + r.h / 2;
+  let covered = null, moved = false, coveredAll = false, blank = false;
   if (el.ownerDocument === document) {
-    let hit = document.elementFromPoint(x, y);
-    while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(x, y); if (!inner || inner === hit) break; hit = inner; }
-    if (hit && !contains(el, hit) && !contains(hit, el)) covered = describe(hit);
+    const topAt = (px, py) => {
+      let hit = document.elementFromPoint(px, py);
+      while (hit?.shadowRoot) { const inner = hit.shadowRoot.elementFromPoint(px, py); if (!inner || inner === hit) break; hit = inner; }
+      return hit;
+    };
+    const hit = topAt(x, y);
+    if (hit && !contains(el, hit) && !contains(hit, el)) {
+      // Named as the control it belongs to (the ribbon's image is the link "Fork me on GitHub").
+      covered = describe(hit.closest?.('a[href],button,[role=button],[role=link]') || hit);
+      const pts = [];
+      for (const b of el.getClientRects()) {
+        const L = Math.max(0, b.left), T = Math.max(0, b.top), R = Math.min(innerWidth, b.right), B = Math.min(innerHeight, b.bottom);
+        if (R - L < 1 || B - T < 1) continue;
+        for (let i = 0; i < 7; i++) for (let j = 0; j < 7; j++) pts.push([L + Math.min(R - L - 0.5, Math.max(0.5, (i + 0.5) * (R - L) / 7)), T + Math.min(B - T - 0.5, Math.max(0.5, (j + 0.5) * (B - T) / 7))]);
+      }
+      pts.sort((a, b) => (a[0] - x) ** 2 + (a[1] - y) ** 2 - ((b[0] - x) ** 2 + (b[1] - y) ** 2));
+      const clear = pts.find(([px, py]) => { const h = topAt(px, py); return h && contains(el, h); });
+      if (clear) { [x, y] = clear; moved = true; }
+      else { coveredAll = true; blank = paintsNothing(hit); }
+    }
   }
-  return { x, y, desc: describe(el), covered, select: el.tagName === 'SELECT' };
+  return { x, y, desc: describe(el), covered, moved, coveredAll, blank, select: el.tagName === 'SELECT' };
 }
 function focus(q, clear) {
   const f = find(q);
@@ -1498,9 +1530,13 @@ const TOOLS = [
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
           if (ask) throw ask;
         }
+        // Nothing of it is clear on screen: a click would only reach what is on top, so none is sent (a cover that
+        // paints nothing keeps the old way: the click goes there, with the note).
+        if (hit.coveredAll && !hit.blank) throw refused(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`, { kind: 'covered', by: hit.covered, desc: hit.desc });
         ({ x, y } = hit);
         what = hit.desc;
-        if (hit.covered) note = `\nNote: ${hit.covered} was on top of it at that point; the click went there.`;
+        if (hit.moved) note = `\nNote: ${hit.covered} covers the middle of it, so the click went to a clear part of it.`;
+        else if (hit.covered) note = `\nNote: ${hit.covered} was on top of it at that point; the click went there.`;
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
