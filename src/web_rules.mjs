@@ -61,6 +61,12 @@ export const runTurnOf = body => String(body?.run?.turn || '').replace(/[^A-Za-z
 export const webAgent = runKey => (runKey.startsWith('web:') ? runKey : `web:${runKey}`);
 /** How long one call may take: what pre.dev asked, within 5 s and 11 minutes. */
 export const callTimeout = body => Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
+/** A tool result's lines before its page line (`Tab ABC123 · ...`): what the call did, each line ending in a newline. */
+export function actionLines(result) {
+  const lines = String((result?.content || []).find(c => c.type === 'text')?.text || '').split('\n');
+  const at = lines.findIndex(l => /^Tab [0-9A-F]{6,} ·/.test(l));
+  return (at < 0 ? [] : lines.slice(0, at)).filter(l => l.trim()).map(l => `${l}\n`).join('');
+}
 /** The tab a tool result names first (`Tab ABC123 · ...`), or ''. */
 export const tabInResult = result => /^Tab ([0-9A-F]{6,}) ·/m.exec((result?.content || []).find(c => c.type === 'text')?.text || '')?.[1] || '';
 
@@ -103,7 +109,10 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
       const given = typeof body?.site === 'string' && body.site && host.endsWith(body.site) ? body.site : '';
       wanted.push(given || await siteFor(host));
     }
-    const info = args.tab ? tabInfo(args.tab) : null;
+    // The site the tab is on now counts only for a call that works on that page. Leaving it (back, forward, another
+    // address, closing the tab) needs no yes for it: the page a call ends on is checked after (movedTo).
+    const leaves = name === 'chrome_close' || (name === 'chrome_navigate' && args.url && args.url !== 'reload');
+    const info = args.tab && !leaves ? tabInfo(args.tab) : null;
     if (info) { const here = await siteFor(hostOf(info.url)); if (here && !wanted.includes(here)) wanted.push(here); }
     for (const site of wanted) {
       if (isAllowed(site)) continue;
@@ -122,7 +131,8 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
     const now = tab ? tabInfo(tab) : null;
     const site = now ? await siteFor(hostOf(now.url)) : '';
     if (site && !isAllowed(site)) {
-      return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
+      // What the call did is kept (its first lines, such as where a click went); the page it ended on is not shown.
+      return text(`${actionLines(result)}Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. A call that works on this page asks the user to allow ${site} on their computer first; going back or opening another page needs no answer.`, false);
     }
     return null;
   }
