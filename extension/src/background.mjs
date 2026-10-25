@@ -251,6 +251,7 @@ async function callTool(name, args, ctx) {
 async function markBlocked(message) {
   if (devtoolsBlocked) return;
   devtoolsBlocked = String(message || 'Developer tools are turned off in this Chrome.').slice(0, 200);
+  wakeHolds();
   await session.set('devtoolsBlocked', devtoolsBlocked);
   await note({ kind: 'control', text: "Can't work here: this Chrome's settings turn off developer tools" }, { always: true });
   ui();
@@ -263,7 +264,7 @@ async function checkDebugger() {
     tab = await chrome.tabs.create({ url: 'about:blank', active: false });
     await chrome.debugger.attach({ tabId: tab.id }, '1.3');
     await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
-    devtoolsBlocked = '';
+    if (devtoolsBlocked) { devtoolsBlocked = ''; wakeHolds(); }
     await session.set('devtoolsBlocked', '');
     return { ok: true };
   } catch (error) {
@@ -556,6 +557,7 @@ async function endCalls(why, runKey = null) {
 
 async function setPaused(on) {
   paused = !!on;
+  wakeHolds();
   await local.set('paused', paused);
   if (paused) {
     await endCalls(PAUSED_TEXT);
@@ -610,7 +612,8 @@ const handedTasks = {
     const list = await local.get('tasks', []);
     return (Array.isArray(list) ? list : []).filter(t => Date.now() - Date.parse(t.at || 0) < TASK_KEEP_MS);
   },
-  save: async list => { if (await paired()) await local.set('tasks', list); },
+  // A task taken over, dropped or stopped here is a change its held ping answers (holdPing checks what changed).
+  save: async list => { if (await paired()) { await local.set('tasks', list); wakeHolds(); } },
 };
 const taskInflight = new Map();
 const taskCalls = createTaskCalls({
@@ -648,6 +651,57 @@ async function taskUnavailable(taskId) {
   return (await handedTasks.list()).find(t => t.taskId === taskId)?.stopped ? STOPPED_TEXT : '';
 }
 
+/** Held pings. A handed task's run that is only waiting on this Chrome (a card open, or paused here) asks with
+ *  ping { hold: { ms, seen } }: "answer when this task's state here is no longer <seen>, or after ms". Its answer
+ *  comes the moment the person presses Pause, Resume or Stop this task, Chrome turns developer tools off (or back
+ *  on), or the task leaves this Chrome, in a plain ping's shapes; no change in ms answers the same state. One per
+ *  task: a newer one answers the older now. A ping without hold answers at once, as before. */
+const HOLD_MAX_MS = 30000;
+const HOLD_KINDS = new Set(['ok', 'paused', 'stopped', 'policy']);
+const holds = new Map();
+const kindOf = why => (why === PAUSED_TEXT ? 'paused' : why === STOPPED_TEXT ? 'stopped' : why === BLOCKED_TEXT ? 'policy' : 'ok');
+function holdOf(args) {
+  const h = args?.hold;
+  if (!h || typeof h !== 'object' || !HOLD_KINDS.has(h.seen)) return null;
+  const ms = Math.min(HOLD_MAX_MS, Math.floor(Number(h.ms) || 0));
+  return ms > 0 ? { ms, seen: h.seen } : null;
+}
+/** This Chrome's state for one task (or every task) may have changed: its held ping looks again now. */
+function wakeHolds(taskId = '', how = 'state') {
+  for (const [id, wake] of [...holds]) if (!taskId || id === taskId) wake(how);
+}
+/** A ping's answer for this task now: why it can't run here ('' when it can), and whether the task is still here
+ *  for this run to drive (a plain ping answers a refusal otherwise). */
+async function pingState(body) {
+  const why = await taskUnavailable(cleanTaskId(body?.taskId));
+  if (why) return { kind: kindOf(why), why };
+  return (await taskCalls.taskCall({ ...body, name: 'ping' }))?.isError ? { kind: 'gone', why } : { kind: 'ok', why };
+}
+async function holdPing(body, hold) {
+  const taskId = cleanTaskId(body?.taskId);
+  holds.get(taskId)?.('newer');
+  const started = Date.now();
+  const until = started + hold.ms;
+  let state;
+  let how = 'time';
+  let mine = null;
+  for (;;) {
+    const woke = new Promise(resolve => { mine = resolve; });
+    holds.set(taskId, mine);
+    // Set before the look, so a change made while it reads is never missed.
+    state = await pingState(body);
+    const left = until - Date.now();
+    if (state.kind !== hold.seen || left <= 0) break;
+    const timer = setTimeout(mine, left, 'time');
+    how = await woke;
+    clearTimeout(timer);
+    if (how === 'newer' || how === 'gone') break;
+  }
+  if (holds.get(taskId) === mine) holds.delete(taskId);
+  log('held ping', taskId.slice(-6), `${hold.seen} -> ${how === 'gone' ? 'unpaired' : state.kind}`, how === 'newer' ? 'superseded' : '', `${Date.now() - started}ms`);
+  return how === 'gone' ? { gone: true } : state;
+}
+
 /** A task handed here: the person sees it in the popup's runs and log. */
 async function takeTaskHere(body) {
   const taskId = cleanTaskId(body?.taskId);
@@ -660,7 +714,7 @@ async function takeTaskHere(body) {
   const out = await taskCalls.takeTask(body);
   if (out.accepted) {
     const stopped = await session.get('stopped', {});
-    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await accountSession.set('stopped', stopped); }
+    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await accountSession.set('stopped', stopped); wakeHolds(taskId); }
     await touchRun(`task:${taskId}`, 'chrome_open', { url: body?.checkpoint?.url });
     // Handed here again after it ended: it is live again.
     const runs = await session.get('runs', {});
@@ -679,7 +733,20 @@ async function taskCallHere(body) {
   const args = body?.args && typeof body.args === 'object' ? body.args : {};
   // A ping too: while paused, blocked or stopped here the run must find this Chrome away (it waits, then stops with
   // its progress saved), so a ping that answered would send it straight back into the next refused call.
-  const why = taskId ? await taskUnavailable(taskId) : '';
+  let why = '';
+  const hold = name === 'ping' && taskId ? holdOf(args) : null;
+  if (hold) {
+    // A held ping waits while this task's state here is the one its run last saw (holdPing). Its head went at once
+    // (onRequest), so only the run times it.
+    const now = await pingState(body);
+    if (now.kind === hold.seen) {
+      if (body?.__checkOnly) return {};
+      const out = await holdPing(body, hold);
+      if (out.gone) return { unavailable: 'This Chrome is no longer paired with pre.dev.' };
+      if (!out.why) return { result: await taskCalls.taskCall(body) };
+      why = out.why;
+    } else why = now.why;
+  } else if (taskId) why = await taskUnavailable(taskId);
   if (why) {
     await cutTaskRuns(runKey);
     if (name !== 'ping') await note({ kind: 'call', run: runKey, tool: name, what: describe(name, args), ok: false, outcome: 'ended', text: why === PAUSED_TEXT ? 'Refused: paused' : why === STOPPED_TEXT ? 'Refused: you stopped this task' : 'Refused: developer tools are off', ms: 0 });
@@ -740,6 +807,7 @@ async function stopTask(taskId) {
   const stopped = await session.get('stopped', {});
   stopped[`task:${taskId}`] = { at: Date.now() };
   await accountSession.set('stopped', stopped);
+  wakeHolds(taskId);
   await cutTaskRuns(`task:${taskId}`);
   const list = await handedTasks.list();
   const t = list.find(x => x.taskId === taskId);
@@ -782,7 +850,8 @@ async function onRequest(socket, m) {
   const route = `${m.method} ${String(m.path || '').split('?')[0]}`;
   try {
     // A handed task's call while this Chrome is paused, blocked or stopped for it: unavailable (503) with the reason's
-    // code, so pre.dev's cloud run holds for a pause, and stops with its progress saved for a stop or a policy.
+    // code, so pre.dev's cloud run holds for a pause, and stops with its progress saved for a stop or a policy. A held
+    // ping whose run already saw that state waits instead (holdPing).
     if (route === 'POST /tasks/call') {
       const out = await taskCallHere({ ...body, __checkOnly: true });
       if (out.unavailable) { head(503); end({ error: taskWords(out.unavailable), ...unavailableBody(out.unavailable) }); return; }
@@ -993,6 +1062,7 @@ async function pair() {
 /** Unpaired (here or on pre.dev): everything stops now, and the key and sites are gone. */
 async function forget(why) {
   stopLoop();
+  wakeHolds('', 'gone');
   await endCalls(why === 'unpaired' ? 'The user unpaired their Chrome from pre.dev.' : 'This Chrome is no longer paired with pre.dev.');
   for (const entry of [...asking.values()]) if (!entry.decided) await decide(entry.nonce, false);
   // Everything tied to the account goes with it, so this Chrome paired again (maybe as someone else) shows and keeps
@@ -1095,4 +1165,4 @@ chrome.runtime.onInstalled.addListener(() => { void boot(); });
 void boot();
 
 // For the tests in this repo's harness only (a dev build): nothing here is reachable from a web page.
-if (CONFIG.dev) globalThis.__predev = { status: () => ({ status, paused, devtoolsBlocked, running, inflight: inflight.size }), conn, sites, callTool, webCall, checkDebugger };
+if (CONFIG.dev) globalThis.__predev = { status: () => ({ status, paused, devtoolsBlocked, running, inflight: inflight.size, holds: holds.size }), conn, sites, callTool, webCall, checkDebugger };
