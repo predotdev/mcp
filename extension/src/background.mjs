@@ -448,7 +448,10 @@ async function touchRun(runKey, name, args, turn = '') {
   r.calls++;
   delete r.cut;
   if (turn) r.turn = turn;
-  const host = (name === 'chrome_open' || name === 'chrome_navigate') ? hostOf(/^[a-z][a-z0-9+.-]*:/i.test(String(args?.url || '')) ? args.url : `https://${args?.url || ''}`) : '';
+  // "back", "forward" and "reload" are moves in the tab, not sites: the row keeps the site it was on.
+  const url = String(args?.url || '');
+  const host = (name === 'chrome_open' || name === 'chrome_navigate') && url && !['back', 'forward', 'reload'].includes(url)
+    ? hostOf(/^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `https://${url}`) : '';
   if (host && !r.hosts.includes(host)) r.hosts = [...r.hosts, host].slice(-6);
   runs[runKey] = r;
   const keys = Object.keys(runs).sort((a, b) => runs[b].last - runs[a].last);
