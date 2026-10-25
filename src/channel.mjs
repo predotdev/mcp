@@ -265,7 +265,8 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
     }, allowed ? 1500 : 4000);
   }
 
-  /** Ask the person at this computer to allow a site for web runs. true once allowed. */
+  /** Ask the person at this computer to allow a site for web runs: true once allowed, false when they
+   *  said no, 'no_answer' when nobody answered in time (the question closes; the next call asks again). */
   async function askToAllow(site, port, inFront, reach = null) {
     if (!reach && isAllowed(site)) return true;
     const key = reach ? `net:${reach.site}` : site;
@@ -307,7 +308,7 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
       if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
       privateTabs.delete(entry.targetId);
     }
-    return answer === true;
+    return answer === true ? true : answer === null ? 'no_answer' : false;
   }
 
   // ---------------------------------------------------------------- the calls a web run makes
@@ -321,6 +322,8 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
 
   const text = (t, isError = true) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
   const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
+  /** Nobody answered the question in time (the next call asks again). */
+  const noAnswer = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. Don't call it again right away: tell them in one line that their Chrome is waiting for a click to allow ${site}; when they say go ahead, call again and the question comes back. Continue with what you have meanwhile.`);
 
   /** One call from a web run. `run.key` names the run, so its tabs are its own. */
   async function webCall(body, port, api) {
@@ -355,7 +358,8 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
     for (const site of wanted) {
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site, port, api.chromeInFront);
-      if (!ok) return notAllowed(site);
+      if (ok === 'no_answer') return noAnswer(site);
+      if (ok !== true) return notAllowed(site);
     }
     const timeoutMs = Math.min(Math.max(Number(body?.timeoutMs) || 180000, 5000), 11 * 60000);
     const signal = AbortSignal.timeout(timeoutMs);
@@ -402,9 +406,9 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
     const host = hostOf(url);
     if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
     const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
-    if (!isAllowed(site) && !(await askToAllow(site, port, api.chromeInFront))) {
-      return { accepted: false, error: `the person at this computer didn't allow ${site}` };
-    }
+    const ok = isAllowed(site) || await askToAllow(site, port, api.chromeInFront);
+    if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
+    if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
     const tasks = (readJson(TASKS_FILE)?.tasks || []).filter(t => t.taskId !== taskId);
     let tab = '';
     try {
@@ -467,7 +471,11 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
         const entry = checkedEntry(body);
         if (!entry) end({ added: false, error: 'That is not a site this computer can reach for runs.' });
         else if (network.sites()[entry.site]) end({ added: true, already: true, netKey: network.publicKey() });
-        else end((await askToAllow(entry.allowedSite, port, api.chromeInFront, entry)) ? { added: true, netKey: network.publicKey() } : { added: false, error: 'The person at that computer did not allow it.' });
+        else {
+          // Nobody answering in time is not a yes.
+          const ok = await askToAllow(entry.allowedSite, port, api.chromeInFront, entry);
+          end(ok === true ? { added: true, netKey: network.publicKey() } : { added: false, error: ok === 'no_answer' ? 'Nobody at that computer answered in time.' : 'The person at that computer did not allow it.' });
+        }
       } else if (route === 'POST /network/remove') {
         end({ ok: true, removed: network.remove(String(body?.site || '')) });
       } else if (route === 'GET /network') {
