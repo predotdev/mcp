@@ -12,8 +12,8 @@
 //     handoff made (no scripts there at all; the web tools have no script tool);
 //   - Chrome shows its own "started debugging this browser" bar while a tab is attached, and Cancel on
 //     it pauses pre.dev here at once;
-//   - Pause, Stop this run (for the rest of that turn) and Unpair in the popup take effect at once;
-//   - "Finish on my computer": a Browser Agents task handed to this Chrome goes on here, carried on by pre.dev's
+//   - Pause, Stop (a chat run: for the rest of that turn) and Unpair in the popup take effect at once;
+//   - "Finish in my Chrome": a Browser Agents task handed to this Chrome goes on here, carried on by pre.dev's
 //     cloud run with the same rules, in the tab opened for it (web_rules.mjs createTaskCalls);
 //   - it never reads cookies, storage or passwords, and asks for no permission that could.
 
@@ -596,7 +596,7 @@ async function stopRun(runKey) {
   ui();
 }
 
-// ---------------------------------------------------------------- Finish on my computer
+// ---------------------------------------------------------------- Finish in my Chrome
 
 /** The tasks handed to this Chrome: only id, site, tab, the page its tab is on (origin and path) and who drives,
  *  never the task's instruction or progress. They outlast the browser session (every window closed, or Chrome

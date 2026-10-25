@@ -2055,7 +2055,7 @@ const TOOLS = [
   },
   {
     name: 'chrome_handed_off',
-    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish on my computer" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. pre.dev\'s cloud may already be carrying it on in that tab by itself; the list says so. Pass task to take that tab and carry on with the other chrome_* tools from where it is (this stops pre.dev\'s cloud run of it: one of you drives at a time); pass task and done: true once it is finished.',
+    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish in my Chrome" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. pre.dev\'s cloud may already be carrying it on in that tab by itself; the list says so. Pass task to take that tab and carry on with the other chrome_* tools from where it is (this stops pre.dev\'s cloud run of it: one of you drives at a time); pass task and done: true once it is finished.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2070,7 +2070,7 @@ const TOOLS = [
       let tasks = read();
       const save = list => { const tmp = `${file}.${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ tasks: list }, null, 2), { mode: 0o600 }); fs.renameSync(tmp, file); };
       const tabOf = t => (t?.tab ? [...chrome.targets.values()].find(x => isTab(x) && x.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) : null);
-      // A cloud run carrying a task on in this Chrome (channel.mjs, "Finish on my computer"): its calls in flight.
+      // A cloud run carrying a task on in this Chrome (channel.mjs, "Finish in my Chrome"): its calls in flight.
       const RUNS = chrome.__predevHandedRuns || (chrome.__predevHandedRuns = { inflight: new Map() });
       if (!args.task) {
         if (!tasks.length) return 'No tasks were handed to this computer.';

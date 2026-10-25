@@ -15,8 +15,7 @@
 <section id="blocked" class="banner warn" hidden></section>
 
 <section id="unpaired" hidden>
-  <p>Let pre.dev web runs you start do steps in this Chrome, signed in as you. The first time a run uses a site, this Chrome asks you.</p>
-  <p class="dim">It never types passwords, codes or card numbers, and it asks you before it sends, posts, buys or deletes anything.</p>
+  <p>Let runs you start on pre.dev work in this Chrome, signed in as you. It asks before each new site.</p>
   <button id="pair" class="primary">Pair with pre.dev</button>
 </section>
 
@@ -29,7 +28,7 @@
 
 <section id="paired" hidden>
   <p id="account" class="account"></p>
-  <div class="row">
+  <div id="pauseRow" class="row">
     <button id="pause">Pause</button>
     <span id="pauseNote" class="dim small"></span>
   </div>
@@ -39,11 +38,12 @@
   <ul id="sites" class="sites"></ul>
   <p id="noSites" class="dim small">No sites yet. The first time a web run uses a site, this Chrome asks you.</p>
 
-  <h2>What pre.dev did here</h2>
-  <ol id="log" class="log"></ol>
-  <p id="noLog" class="dim small">Nothing yet.</p>
+  <details id="activity" class="activity">
+    <summary id="activityTitle">Activity (0)</summary>
+    <ol id="log" class="log"></ol>
+    <p id="noLog" class="dim small">Nothing yet.</p>
+  </details>
 
-  <p class="dim small">Chrome shows "pre.dev started debugging this browser" while pre.dev works in a tab. Cancel on that bar pauses it here.</p>
   <button id="unpair" class="danger">Unpair this Chrome</button>
 </section>
 

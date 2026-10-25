@@ -12,7 +12,7 @@
 //     registrable domain (accounts.google.com and mail.google.com ask once), by the same rule as
 //     every pre.dev `site`: pre.dev computes it from the host alone, never a URL. The allowed list
 //     is listed and revoked here (`predev-mcp sites`) and on pre.dev, at once;
-//   - "Finish on my computer": a paused cloud Browser Agents task can hand its rest here (the
+//   - "Finish in my Chrome": a paused cloud Browser Agents task can hand its rest here (the
 //     instruction, the page it stopped on and what it did). pre.dev's cloud then carries it on by
 //     itself in the tab opened for it: its planner stays in the cloud and sends one chrome_* call at a
 //     time (POST /tasks/call), under the same rules plus a screenshot of that tab only. An agent on
@@ -53,7 +53,7 @@ export function computerIdIn(stateDir) {
 }
 
 /** The files pairing keeps in a state folder: the pairing itself, the sites web runs may use, and the
- *  cloud tasks handed here to finish ("Finish on my computer"). */
+ *  cloud tasks handed here to finish ("Finish in my Chrome"). */
 export const pairingFiles = stateDir => ({
   pairing: path.join(stateDir, 'pairing.json'),
   sites: path.join(stateDir, 'web-sites.json'),
@@ -295,7 +295,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
 
   // ---------------------------------------------------------------- a handed task, carried on by pre.dev's cloud
 
-  /** "Finish on my computer" (web_rules.mjs), with this computer's Chrome, its person and its task list. */
+  /** "Finish in my Chrome" (web_rules.mjs), with this computer's Chrome, its person and its task list. */
   const taskCalls = (port, api) => createTaskCalls({
     callTool,
     ctx: () => ({ apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl }),

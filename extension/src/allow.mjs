@@ -26,9 +26,8 @@ async function load() {
   const q = await chrome.runtime.sendMessage({ type: 'question', nonce }).catch(() => null);
   if (!q || q.gone) { main.replaceChildren(line('p', ['This question was already answered, or it timed out.'])); return; }
   document.title = `Allow pre.dev to use ${q.site}?`;
+  // The title and two lines, nothing else.
   const nodes = [line('h1', q.question.title), ...q.question.lines.map(l => line('p', l))];
-  if (q.question.warn) nodes.push(line('p', [q.question.warn], 'warn'));
-  nodes.push(line('p', ['Only allow sites you expect. You can untick a site, pause, or unpair any time from the pre.dev button in your toolbar.']));
   const row = document.createElement('div');
   row.className = 'row';
   for (const [decision, label, cls] of [['allow', 'Allow', 'yes'], ['deny', "Don't allow", 'no']]) {

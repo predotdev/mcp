@@ -8,7 +8,7 @@
 export const WEB_TOOLS = new Set(['chrome_profiles', 'chrome_tabs', 'chrome_open', 'chrome_navigate', 'chrome_snapshot', 'chrome_click',
   'chrome_type', 'chrome_act', 'chrome_press', 'chrome_scroll', 'chrome_read', 'chrome_wait', 'chrome_show', 'chrome_close']);
 export const HANDOFF_TOOL = 'chrome_handoff';
-/** What pre.dev's cloud run of a handed task may call here ("Finish on my computer"): a web run's tools
+/** What pre.dev's cloud run of a handed task may call here ("Finish in my Chrome"): a web run's tools
  *  minus the tab list and profile list, plus a screenshot of its own tab (its planner looks at the page).
  *  Still no scripts and no uploads. */
 export const TASK_TOOLS = new Set(['chrome_open', 'chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_press',
@@ -76,8 +76,8 @@ export function allowQuestion(site) {
   return {
     title: ['Allow pre.dev to use ', { b: site }, ' in this Chrome?'],
     lines: [
-      ['A pre.dev run you started on the web wants to work on ', { b: site }, ' here, signed in as you. It reads and clicks only in tabs it opens.'],
-      ['It never types passwords, codes or card numbers, and it asks you before it sends, posts, buys or deletes anything.'],
+      ['A run you started on pre.dev wants to work on ', { b: site }, ', signed in as you.'],
+      ['It never types passwords and asks before it sends, posts, buys or deletes.'],
     ],
     warn: isLocalHost(site) ? 'This address is on this computer or your own network. Only allow it if you expect the run to use it.' : '',
   };
@@ -165,7 +165,7 @@ export const cleanTaskId = v => String(v || '').replace(/[^a-f0-9]/gi, '').slice
 export const taskAgent = taskId => `handed:${taskId}`;
 
 /**
- * "Finish on my computer" for every client of the computer channel: a cloud Browser Agents task handed
+ * "Finish in my Chrome" for every client of the computer channel: a cloud Browser Agents task handed
  * to this computer, which pre.dev's cloud run carries on in this Chrome with this computer's rules.
  * On top of createWebCalls' parts, each client passes in:
  *   webCalls                 its createWebCalls(...) (sitesAllowed, movedTo)
