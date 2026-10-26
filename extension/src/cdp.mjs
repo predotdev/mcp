@@ -33,6 +33,8 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
     conn.__predevHandoff?.watched?.delete(targetId);
     conn.__predevDialogs?.pageOn?.delete(targetId);
     conn.__predevDialogs?.open?.delete(targetId);
+    conn.__predevDialogs?.noAnswer?.delete(targetId);
+    conn.__predevDialogs?.input?.delete(targetId);
   };
 
   function targetOfTab(tabId) {

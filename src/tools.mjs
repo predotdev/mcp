@@ -1114,6 +1114,10 @@ const DLG = chrome.__predevDialogs || (chrome.__predevDialogs = {
   handle: null,
 });
 DLG.usedAt ||= new Map();
+// session -> the input the current call means to send there, counted in pieces (a click, a key or chord, a piece of
+// text, a scroll step): { at, planned, sent, what }. When the page stops answering during the call, it tells whether
+// all of it went out.
+DLG.input ||= new Map();
 // The latest copy of these tools handles the events (the daemon re-imports this file when it changes).
 DLG.handle = onDialogEvent;
 if (!DLG.hooked && typeof chrome.onEvent === 'function') {
@@ -1192,9 +1196,14 @@ async function uncut(targetId) {
   await Promise.race([left, sleep(3000)]);
   DLG.cut.delete(session);
 }
-const sendInput = (method, params, session, timeout) => (DLG.cut.has(session)
-  ? Promise.reject(new Error('A dialog the page opened cut this call short; the rest of its input was not sent.'))
-  : chrome.send(method, params, session, timeout));
+/** A call is about to send `planned` pieces of input to this session (what: the field or the tab they go to). */
+const planInput = (session, planned, what = 'tab') => { DLG.input.set(session, { at: Date.now(), planned, sent: 0, what }); };
+/** One input event. `piece`: it starts one of the planned pieces (a mouse press, a key down, the text, a scroll). */
+const sendInput = (method, params, session, timeout, piece = false) => {
+  if (DLG.cut.has(session)) return Promise.reject(new Error('A dialog the page opened cut this call short; the rest of its input was not sent.'));
+  if (piece) { const plan = DLG.input.get(session); if (plan) plan.sent++; }
+  return chrome.send(method, params, session, timeout);
+};
 
 /** What a run does about a dialog it can't close. */
 const dialogNext = args => (fromWeb(args)
@@ -1227,6 +1236,26 @@ function landedResult(args, info, d) {
   };
 }
 
+/** The call sent all of its input, and then the page stopped answering (busy with what it set off, or a dialog of
+ *  Chrome's own over it): it landed, and must not be done again. Every call on the tab is refused until the page
+ *  answers again. */
+function busyLandedResult(info) {
+  const site = hostOf(info?.url || '') || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  return { content: [{ type: 'text', text: `${tab}It landed: the page on ${site} then stopped answering (busy with what this call set off, or a dialog of Chrome's own is over it). Don't do it again. Read the tab again in a few seconds; if it still doesn't answer, ask the user to look at that tab in their Chrome.` }] };
+}
+
+/** The page stopped answering before all of the call's input went out (some keys of a sequence, the text but not
+ *  its Enter): how much of it reached the page is unknown, so it never says it landed. */
+function busyPartResult(info, plan) {
+  const site = hostOf(info?.url || '') || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  return {
+    content: [{ type: 'text', text: `${tab}Part of it may have gone through: the page on ${site} stopped answering while this call's input was going out. Read the ${plan.what} before sending it again; if the page still doesn't answer, ask the user to look at that tab in their Chrome.` }],
+    partial: { sent: plan.sent, planned: plan.planned },
+  };
+}
+
 /** A result, with the alerts pre.dev pressed OK on during (or just before) its call. */
 function withClosedAlerts(result, closed) {
   if (!closed.length) return result;
@@ -1255,6 +1284,7 @@ async function dialogCall(args, info, run) {
     }
   }
   const call = { tab: info?.targetId || null, dialog: null, closed: [...(info && DLG.closed.get(info.targetId) || [])], wake: null };
+  const startedAt = Date.now();
   if (info) DLG.closed.delete(info.targetId);
   call.setTab = targetId => { call.tab = targetId; setManual(targetId); };
   const landed = new Promise(resolve => { call.wake = resolve; });
@@ -1294,8 +1324,15 @@ async function dialogCall(args, info, run) {
       }
       const tabInfo = call.tab ? chrome.targets.get(call.tab) || info : info;
       if (first.landed) return withClosedAlerts(landedResult(args, tabInfo, call.dialog), call.closed);
-      DLG.noAnswer.set(call.tab, Date.now());
+      // Since when the page doesn't answer: a later call that finds it still so keeps the first time.
+      if (!DLG.noAnswer.has(call.tab)) DLG.noAnswer.set(call.tab, Date.now());
       try { core.onBusy?.(call.tab); } catch {}
+      // This call's own input went out before the page stopped answering. All of it: it landed (never done again).
+      // Only part of it (the page stopped during a later piece): it may have gone through in part, so it says that.
+      const plan = session && DLG.input.get(session);
+      if (plan && plan.at >= startedAt && plan.sent > 0 && !liveDialog(call.tab)) {
+        return withClosedAlerts(plan.sent >= plan.planned ? busyLandedResult(tabInfo) : busyPartResult(tabInfo, plan), call.closed);
+      }
       throw dialogRefused(args, tabInfo, liveDialog(call.tab), { tabLine: !info });
     }
     if (first.error) throw first.error;
@@ -1386,7 +1423,7 @@ async function pressKeysInner(session, combos) {
     const base = { key, code, windowsVirtualKeyCode: keyCode, modifiers };
     await sendInput('Input.dispatchKeyEvent', {
       ...base, type: text ? 'keyDown' : 'rawKeyDown', ...(text ? { text } : {}), ...(command ? { commands: [command] } : {}),
-    }, session);
+    }, session, undefined, true);
     await sendInput('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, session);
   }
 }
@@ -1399,7 +1436,7 @@ async function click(session, x, y, count = 1) {
 async function clickInner(session, x, y, count) {
   await sendInput('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, session);
   for (let i = 1; i <= count; i++) {
-    await sendInput('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session);
+    await sendInput('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session, undefined, true);
     await sendInput('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: i }, session);
   }
 }
@@ -1818,6 +1855,7 @@ const TOOLS = [
       }
       const pkAt = Date.now();
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
+      planInput(session, args.double ? 2 : 1);
       await click(session, x, y, args.double ? 2 : 1);
       if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       await settle(session, before);
@@ -1866,9 +1904,11 @@ const TOOLS = [
       }
       if (field.isPassword && !isLocalDev(before[0])) throw refused('Refusing to type into a password field outside local dev sites; the user should enter it.', { kind: 'secret', field: 'password' });
       const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
+      // The text (or the clearing key) is one piece, its Enter another.
+      planInput(session, (args.text || args.clear !== false ? 1 : 0) + (args.submit ? 1 : 0), 'field');
       if (args.text) {
         await markActing(session, true);
-        try { await sendInput('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
+        try { await sendInput('Input.insertText', { text: args.text }, session, undefined, true); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       let pkAt = 0;
@@ -1936,6 +1976,7 @@ const TOOLS = [
       }
       const pkAt = Date.now();
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
+      planInput(session, String(keys).trim().split(/\s+/).filter(Boolean).length, 'focused field or the tab');
       await pressKeys(session, keys);
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(rest), { kind: CHROME_DIALOG });
       await settle(session, before);
@@ -1966,8 +2007,9 @@ const TOOLS = [
       const step = Number(amount) || 1;
       const deltaY = direction === 'down' ? height * 0.85 * step : direction === 'up' ? -height * 0.85 * step : 0;
       const deltaX = direction === 'right' ? width * 0.85 * step : direction === 'left' ? -width * 0.85 * step : 0;
+      planInput(session, 1);
       await markActing(session, true);
-      try { await sendInput('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session); } finally { await markActing(session, false); }
+      try { await sendInput('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session, undefined, true); } finally { await markActing(session, false); }
       await sleep(350);
       const [top, max] = await evaluate(session, '(r => [Math.round(r.scrollTop), Math.max(0, r.scrollHeight - innerHeight)])(document.scrollingElement || document.documentElement)');
       return `Scrolled ${direction}. Page scroll: ${top}/${max}px`;
@@ -2145,6 +2187,7 @@ const TOOLS = [
         } else if (args.ref || args.selector || args.text) {
           const hit = await inPage(session, `point(${target(args)})`);
           if (hit.error) throw new Error(hit.error);
+          planInput(session, 1);
           await click(session, hit.x, hit.y);
           await sleep(600);
         }

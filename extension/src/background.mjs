@@ -158,6 +158,7 @@ const REFUSED_AS = {
 const DIALOG_AS = { alert: 'A message (alert)', confirm: 'A confirm dialog', prompt: 'A prompt dialog', beforeunload: 'A "Leave site?" dialog' };
 function outcomeOf(result) {
   if (result?.landed && DIALOG_AS[result.dialog?.type]) return { ok: true, text: `Done; ${DIALOG_AS[result.dialog.type].toLowerCase()} opened on the page, waiting for you` };
+  if (result?.partial) return { ok: true, text: 'Part of it may have gone through; then the page stopped answering' };
   if (!result?.isError) return { ok: true, text: 'done' };
   const kind = result.refusal?.kind;
   if (kind === 'page_busy' && DIALOG_AS[result.refusal.dialog?.type]) return { ok: false, kind, text: `${DIALOG_AS[result.refusal.dialog.type]} is open on the page, waiting for you` };
@@ -528,6 +529,7 @@ async function webCall(body) {
   await sites();
   await loadPairing();
   if (runKey) await touchRun(runKey, name, args, turn);
+  heardFrom(runKey && webAgent(runKey), runKey);
   const controller = new AbortController();
   const call = { runKey, controller, why: '' };
   inflight.add(call);
@@ -542,6 +544,7 @@ async function webCall(body) {
     ]);
   } finally {
     inflight.delete(call);
+    heardFrom(runKey && webAgent(runKey), runKey);
     ui();
   }
   if (WEB_TOOLS.has(name) || name === HANDOFF_TOOL) {
@@ -772,6 +775,7 @@ async function taskCallHere(body) {
   // A ping too: while paused, blocked or stopped here the run must find this Chrome away (it waits, then stops with
   // its progress saved), so a ping that answered would send it straight back into the next refused call.
   let why = '';
+  if (taskId) heardFrom(taskAgent(taskId), runKey);
   const hold = name === 'ping' && taskId ? holdOf(args) : null;
   if (hold) {
     // A held ping waits while this task's state here is the one its run last saw (holdPing). Its head went at once
@@ -809,6 +813,7 @@ async function taskCallHere(body) {
     ]);
   } finally {
     inflight.delete(call);
+    if (taskId) heardFrom(taskAgent(taskId), runKey);
     ui();
   }
   // Chrome refused to attach during this call and developer tools turned out to be off here (a company setting):
@@ -1193,11 +1198,75 @@ chrome.alarms.onAlarm.addListener(async alarm => {
   if (alarm.name !== 'keepalive') return;
   if (!running && (await loadPairing())) void loop();
 });
+// ---------------------------------------------------------------- letting tabs go
+
+/** A tab whose page has a dialog of its own open, or doesn't answer, has a card on pre.dev that waits on what this
+ *  session knows of it: letting the tab go would forget the dialog, and the card would close while the dialog is
+ *  still up. So such a tab stays while its card can still be open: the mark is younger than the card's longest hold
+ *  (10 minutes, and a minute for the card to open) and a run that owns the tab goes on. A run goes on while a call
+ *  of it is in flight here, a held ping of it waits, or it was heard from in the last RUN_QUIET_MS (a run waiting on
+ *  a card pings back to back, each ping held at most HOLD_MAX_MS); one stopped or ended here does not. Once no run
+ *  of the tab goes on, the tab goes at the next sweep; once the hold is past, as soon as it is idle. */
+const DIALOG_CARD_MS = 11 * 60000;
+const RUN_QUIET_MS = 2 * HOLD_MAX_MS;
+const SWEEP_MS = 30000;
+/** agent (handed:<task> or web:<run>) -> when its run last called or pinged here, and its run key. */
+const heard = new Map();
+function heardFrom(agent, runKey) { if (agent) heard.set(agent, { at: Date.now(), runKey }); }
+async function runGoesOn(agent, now, state) {
+  const h = heard.get(agent);
+  const runKey = agent.startsWith('handed:') ? `task:${agent.slice(7)}` : h?.runKey;
+  if (!runKey || state.stopped[runKey] || state.runs[runKey]?.ended) return false;
+  if (runKey.startsWith('task:')) {
+    const taskId = runKey.slice(5);
+    const t = state.tasks.find(x => x.taskId === taskId);
+    if (!t || t.stopped) return false;
+    if (holds.has(taskId)) return true;
+  }
+  return [...inflight].some(c => c.runKey === runKey) || (!!h && now - h.at < RUN_QUIET_MS);
+}
+/** targetId -> the last thing logged for its mark ('kept' or 'let go'), so each shows once. */
+const markLog = new Map();
+let sweeping = false;
+async function sweep() {
+  if (inflight.size || sweeping) return;
+  sweeping = true;
+  try {
+    const dlg = conn.__predevDialogs;
+    const owned = conn.__predevHandoff?.owned;
+    const idle = new Set(conn.idle(IDLE_DETACH_MS));
+    let state = null;
+    const now = Date.now();
+    for (const targetId of conn.idle(0)) {
+      const since = dlg?.open?.get(targetId)?.at ?? dlg?.noAnswer?.get(targetId);
+      if (since === undefined) {
+        markLog.delete(targetId);
+        if (idle.has(targetId)) void conn.detach(targetId);
+        continue;
+      }
+      const what = dlg?.open?.has(targetId) ? `a ${dlg.open.get(targetId).type || 'dialog'}` : 'no answer';
+      const owners = [...(owned || [])].filter(([, tabs]) => tabs.has(targetId)).map(([agent]) => agent);
+      state ||= { runs: await session.get('runs', {}), stopped: await session.get('stopped', {}), tasks: await handedTasks.list() };
+      let on = '';
+      if (now - since < DIALOG_CARD_MS) for (const agent of owners) if (await runGoesOn(agent, now, state)) { on = agent; break; }
+      if (on) {
+        if (markLog.get(targetId) !== 'kept') {
+          markLog.set(targetId, 'kept');
+          log('dialog hold', 'kept', targetId.slice(-6), `${what} for ${Math.round((now - since) / 1000)}s, ${on} goes on`);
+        }
+        continue;
+      }
+      // No run of it goes on: it goes now. The hold is past (or nobody owns it): it goes once idle, like any tab.
+      if ((owners.length && now - since < DIALOG_CARD_MS) || idle.has(targetId)) {
+        markLog.delete(targetId);
+        log('dialog hold', 'let go', targetId.slice(-6), `${what} for ${Math.round((now - since) / 1000)}s, ${owners.length ? (now - since >= DIALOG_CARD_MS ? 'the card hold is past' : 'its run is over') : 'no run has it'}`);
+        void conn.detach(targetId);
+      }
+    }
+  } finally { sweeping = false; }
+}
 // Let go of tabs nobody is using, so Chrome's bar shows only while pre.dev works.
-setInterval(() => {
-  if (inflight.size) return;
-  for (const targetId of conn.idle(IDLE_DETACH_MS)) void conn.detach(targetId);
-}, 30000);
+setInterval(() => { void sweep().catch(error => log('sweep failed', error?.message || error)); }, SWEEP_MS);
 chrome.runtime.onStartup.addListener(() => { void boot(); });
 chrome.runtime.onInstalled.addListener(() => { void boot(); });
 void boot();

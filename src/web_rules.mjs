@@ -216,7 +216,8 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
         ? { kind: args.done.kind, ...(typeof args.done.value === 'string' ? { value: args.done.value.slice(0, 300) } : {}) } : { kind: 'url_changes' };
       if (!args.tab) return text('A call for this task must name its tab.');
       if (args.reason === 'user_control' && args.resume === true) handoffArgs = { ...base, reason: 'user_control', resume: true };
-      else if (args.check === true) handoffArgs = { ...base, check: true };
+      // A check for Chrome's own dialog keeps its reason: that check is whether a key reaches the page again.
+      else if (args.check === true) handoffArgs = { ...base, check: true, ...(args.reason === 'chrome_dialog' ? { reason: 'chrome_dialog' } : {}) };
       else if ((args.reason === 'login_required' || args.reason === 'step_up') && args.wait === false) handoffArgs = { ...base, reason: args.reason, wait: false, done };
       else return text('Only the hand-back of the tab, a sign-in step handed to the user in it, and its check are available to this run.');
     } else if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
