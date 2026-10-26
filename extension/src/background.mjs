@@ -640,11 +640,18 @@ const taskCalls = createTaskCalls({
   cloudOnly: true,
 });
 
+/** Paused or blocked here: no task run can use this Chrome, and no task is taken here. */
+function chromeUnavailable() {
+  if (paused) return PAUSED_TEXT;
+  if (devtoolsBlocked) return BLOCKED_TEXT;
+  return '';
+}
+
 /** Paused, blocked or stopped here: pre.dev's cloud run of a handed task finds this Chrome unavailable (it waits a
  *  moment, then stops with its progress saved, unbilled). */
 async function taskUnavailable(taskId) {
-  if (paused) return PAUSED_TEXT;
-  if (devtoolsBlocked) return BLOCKED_TEXT;
+  const why = chromeUnavailable();
+  if (why) return why;
   const stopped = await session.get('stopped', {});
   if (stopped[`task:${taskId}`]) return STOPPED_TEXT;
   // Stopped here before every window closed: it stays stopped (the task keeps the mark).
@@ -705,16 +712,29 @@ async function holdPing(body, hold) {
 /** A task handed here: the person sees it in the popup's runs and log. */
 async function takeTaskHere(body) {
   const taskId = cleanTaskId(body?.taskId);
-  const why = await taskUnavailable(taskId);
-  // The refusal says why in a code too (POLICY_BLOCKED, PAUSED_BY_USER, STOPPED_BY_USER): pre.dev records a policy
-  // refusal from it and not from the wording.
-  if (why) return { accepted: false, error: why === PAUSED_TEXT ? 'the person paused pre.dev in this Chrome' : why === BLOCKED_TEXT ? "this Chrome's settings turn off developer tools" : 'the person stopped this task in this Chrome', ...(TASK_CODES.has(why) ? { code: TASK_CODES.get(why) } : {}) };
+  // Paused or blocked here: refused. A Stop this task from an earlier turn of this task is not a refusal: that stop
+  // ended the run it cut, and pre.dev hands a task here only when the person chooses Finish in my Chrome again, so
+  // this is a new turn (Stop this task, Resume on pre.dev's card, then Finish in my Chrome on its next card). The
+  // stop's mark is cleared once this turn is taken; until then the old turn's calls stay refused (taskUnavailable).
+  const arrived = Date.now();
+  const why = chromeUnavailable();
+  if (why) {
+    const error = why === PAUSED_TEXT ? 'the person paused pre.dev in this Chrome' : "this Chrome's settings turn off developer tools";
+    await note({ kind: 'control', run: `task:${taskId}`, text: `A handed task was not taken: ${error}` });
+    ui();
+    // The refusal says why in a code too (POLICY_BLOCKED, PAUSED_BY_USER): pre.dev records a policy refusal from it
+    // and not from the wording.
+    return { accepted: false, error, ...(TASK_CODES.has(why) ? { code: TASK_CODES.get(why) } : {}) };
+  }
   await sites();
   await loadPairing();
   const out = await taskCalls.takeTask(body);
   if (out.accepted) {
+    // The earlier turn's stop is cleared. One pressed while this turn was being taken (the allow question can wait
+    // minutes) stays: this turn's run then finds this Chrome stopped and stops with its progress saved.
     const stopped = await session.get('stopped', {});
-    if (stopped[`task:${taskId}`]) { delete stopped[`task:${taskId}`]; await accountSession.set('stopped', stopped); wakeHolds(taskId); }
+    const mark = stopped[`task:${taskId}`];
+    if (mark && !(Number(mark.at) >= arrived)) { delete stopped[`task:${taskId}`]; await accountSession.set('stopped', stopped); wakeHolds(taskId); }
     await touchRun(`task:${taskId}`, 'chrome_open', { url: body?.checkpoint?.url });
     // Handed here again after it ended: it is live again.
     const runs = await session.get('runs', {});
