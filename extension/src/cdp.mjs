@@ -9,6 +9,8 @@
 //             browser-level Target.* commands tools.mjs uses, done with chrome.tabs
 //   session(targetId)                        attach to that tab (Chrome shows its "debugging this
 //             browser" bar while any tab is attached; it is never hidden)
+//   onEvent(listener)                        every event of an attached tab, as (targetId, method,
+//             params): tools.mjs follows the page's own dialogs with it
 //
 // Only web pages: chrome.debugger itself refuses chrome:// pages, other extensions and the Web Store,
 // and this adapter refuses anything but http(s) and blank pages.
@@ -25,6 +27,13 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
   const lastUsed = new Map();
   /** Tabs this adapter opened that no session has used yet: closed again if Chrome won't attach to them. */
   const fresh = new Set();
+  const listeners = new Set();
+  /** A tab's session ended: what tools.mjs knew about it from that session starts over with the next one. */
+  const forget = targetId => {
+    conn.__predevHandoff?.watched?.delete(targetId);
+    conn.__predevDialogs?.pageOn?.delete(targetId);
+    conn.__predevDialogs?.open?.delete(targetId);
+  };
 
   function targetOfTab(tabId) {
     for (const [targetId, t] of tabOfTarget) if (t === tabId) return targetId;
@@ -64,6 +73,7 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
     targets.delete(targetId);
     tabOfTarget.delete(targetId);
     sessions.delete(targetId);
+    forget(targetId);
   });
   chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
     const targetId = targetOfTab(tabId);
@@ -76,10 +86,16 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
     const targetId = source.targetId || (source.tabId != null ? targetOfTab(source.tabId) : null);
     if (!targetId) return;
     sessions.delete(targetId);
-    // Scripts added for each new document belong to the session that ended: add them again next time.
-    conn.__predevHandoff?.watched?.delete(targetId);
+    // Scripts added for each new document, and the Page domain, belong to the session that ended: again next time.
+    forget(targetId);
     log('debugger', 'detached', reason);
     onDetach(targetId, reason);
+  });
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (!listeners.size) return;
+    const targetId = source.targetId || (source.tabId != null ? targetOfTab(source.tabId) : null);
+    if (!targetId || !sessions.has(targetId)) return;
+    for (const listener of listeners) { try { listener(targetId, method, params); } catch {} }
   });
 
   function timed(promise, timeout, method) {
@@ -177,7 +193,7 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
     async detach(targetId) {
       if (!sessions.has(targetId)) return;
       sessions.delete(targetId);
-      conn.__predevHandoff?.watched?.delete(targetId);
+      forget(targetId);
       await chrome.debugger.detach({ targetId }).catch(() => {});
     },
     async detachAll() { await Promise.all([...sessions.keys()].map(id => conn.detach(id))); },
@@ -186,6 +202,7 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
       const held = conn.__predevHandoff?.handoff;
       return [...sessions.keys()].filter(id => Date.now() - (lastUsed.get(id) || 0) > ms && !held?.has(id));
     },
+    onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
     tabInfo(tab) {
       const wanted = String(tab || '').trim().toUpperCase();
       if (!wanted) return null;

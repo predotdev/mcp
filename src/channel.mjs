@@ -317,6 +317,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     inflight: RUNS.inflight,
     refresh: () => chrome.connect(),
     log: line => log('channel', line),
+    busyOf: async tab => (api.busyOf ? api.busyOf(tab) : null),
   });
   /** One call from pre.dev's cloud run of a task handed here. */
   const taskCall = (body, port, api) => taskCalls(port, api).taskCall(body);

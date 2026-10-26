@@ -1077,16 +1077,252 @@ const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the ag
 // A click, key or script needs the page to answer the guard's checks first. While a dialog the page
 // opened (an alert, a confirm or a prompt) is up, or the page is busy, it doesn't: the checks would
 // go without their facts, and the input would wait in Chrome and land once the page answers, past
-// every check. So the guard refuses at once, from the tab's last known address.
+// every check. So the guard refuses at once (dialogRefused, below), from the tab's last known address.
 const pageAnswers = session => evaluate(session, '1', 3000).then(() => true, () => false);
-async function pageMustAnswer(args, session, info, what) {
+async function pageMustAnswer(args, session, info) {
   if (!handoffOn(args)) return;
+  const open = liveDialog(info.targetId);
+  if (open) throw dialogRefused(args, info, open);
   if (await pageAnswers(session)) return;
-  const site = keepsSignIn(args, info.url) ? hostOf(info.url) : '';
-  if (site) throw refused(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
-  throw refused(pageBusy(hostOf(info.url), what), { kind: 'page_busy' });
+  throw dialogRefused(args, info, liveDialog(info.targetId));
 }
-const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
+
+// ---------------------------------------------------------------- the page's own dialogs
+// alert, confirm, prompt and "Leave site?" (beforeunload), per tab, from Page.javascriptDialogOpening and
+// Page.javascriptDialogClosed on the tabs calls use (their Page domain is turned on for it). While one is open,
+// Chrome holds the page: its scripts, and every read or input sent to it, wait until the dialog closes. So:
+//   - an alert in a tab a call is using: pre.dev presses OK on it at once, and the call says so (`dialogs`, and a
+//     line in its text). `PREDEV_ALERT_AUTO_OK=off`, or `__predev_alert_auto_ok: false` on pre.dev's call for that
+//     tab, leaves alerts to the person, like a confirm;
+//   - a confirm, a prompt or "Leave site?" is the person's: never answered here. The call that opened it returns at
+//     once as landed, with the dialog, and input it had left to send is dropped. Every later call on that tab is
+//     refused at once (page_busy, with the dialog) until the person closes it;
+//   - no such dialog, but the page doesn't answer (a busy page, or a dialog of Chrome's own): the call is refused
+//     (page_busy, dialog null) within 12 s, instead of failing after Chrome's 15 to 20 s.
+// A connection without dialog events (a background process an older version started) gets the last rule only.
+const DIALOG_WORDS = { alert: 'message (an alert)', confirm: 'confirm dialog', prompt: 'prompt dialog', beforeunload: '"Leave site?" dialog' };
+const DLG = chrome.__predevDialogs || (chrome.__predevDialogs = {
+  open: new Map(),      // targetId -> { type, message, url, at } while a dialog is up
+  noAnswer: new Map(),  // targetId -> when the page last didn't answer, with no dialog (until a probe answers)
+  closed: new Map(),    // targetId -> alerts pressed OK between calls, for the next call there to report
+  pageOn: new Set(),    // sessions whose Page domain is on (they report dialogs)
+  calls: new Set(),     // calls in flight: { tab, dialog, closed, wake }
+  cut: new Map(),       // session -> a call a dialog cut short, still running: its input is dropped
+  manual: new Set(),    // tabs whose alerts stay for the person (pre.dev's call said so)
+  usedAt: new Map(),    // targetId -> when a call last used it
+  hooked: false,
+  handle: null,
+});
+DLG.usedAt ||= new Map();
+// The latest copy of these tools handles the events (the daemon re-imports this file when it changes).
+DLG.handle = onDialogEvent;
+if (!DLG.hooked && typeof chrome.onEvent === 'function') {
+  DLG.hooked = true;
+  chrome.onEvent((targetId, method, params) => DLG.handle?.(targetId, method, params));
+}
+const ALERT_AUTO_OK = !/^(0|off|false|no)$/i.test(String(process.env.PREDEV_ALERT_AUTO_OK || ''));
+// "A tab a call is using": one in flight there; or an agent's own tab (handoffs on) one used in the last 2 minutes.
+// Never while the user has the tab: the user's own tabs keep their alerts between calls.
+const IN_USE_MS = 120000;
+const agentsTab = targetId => [...H.owned.values()].some(tabs => tabs.has(targetId));
+const inUse = targetId => [...DLG.calls].some(c => c.tab === targetId)
+  || (agentsTab(targetId) && Date.now() - (DLG.usedAt?.get(targetId) || 0) < IN_USE_MS);
+const alertsAutoOk = targetId => ALERT_AUTO_OK && inUse(targetId) && !DLG.manual.has(targetId) && !H.handoff.has(targetId) && !PRIVATE.has(targetId);
+const NO_ANSWER_MS = 12000;
+
+function onDialogEvent(targetId, method, params = {}) {
+  if (!targetId) return;
+  if (method === 'Page.javascriptDialogOpening') {
+    const type = DIALOG_WORDS[params.type] ? params.type : 'alert';
+    const d = { type, message: String(params.message || '').slice(0, 300), url: String(params.url || chrome.targets.get(targetId)?.url || ''), at: Date.now() };
+    DLG.open.set(targetId, d);
+    DLG.noAnswer.delete(targetId);
+    if (type === 'alert' && alertsAutoOk(targetId)) void pressOk(targetId, d);
+    else dialogChanged(targetId);
+  } else if (method === 'Page.javascriptDialogClosed') {
+    if (DLG.open.delete(targetId)) dialogChanged(targetId);
+  }
+}
+
+// OK on an alert, as the person would press it. Left open when Chrome won't (then it is the person's, like a confirm).
+async function pressOk(targetId, d) {
+  const session = chrome.sessions.get(targetId);
+  const ok = !!session && await chrome.send('Page.handleJavaScriptDialog', { accept: true }, session, 3000).then(() => true, () => false);
+  if (!ok) { dialogChanged(targetId); return; }
+  if (DLG.open.get(targetId) === d) DLG.open.delete(targetId);
+  const closed = { type: 'alert', message: d.message, closed: 'ok' };
+  const calls = [...DLG.calls].filter(c => c.tab === targetId);
+  for (const c of calls) c.closed.push(closed);
+  if (!calls.length) DLG.closed.set(targetId, [...(DLG.closed.get(targetId) || []), closed].slice(-5));
+  log('dialog', `pressed OK on an alert on ${hostOf(d.url) || 'a page'}`);
+  try { core.onDialog?.({ targetId, site: hostOf(d.url), ...closed }); } catch {}
+  dialogChanged(targetId);
+}
+
+// A dialog opened or closed: a call on that tab that is still waiting lands now, and held pings look again.
+function dialogChanged(targetId) {
+  const d = DLG.open.get(targetId);
+  if (d) for (const c of DLG.calls) if (c.tab === targetId && !c.dialog) { c.dialog = d; c.wake?.(); }
+  try { core.onBusy?.(targetId); } catch {}
+}
+
+/** The dialog open on this tab now, or null. */
+function liveDialog(targetId) {
+  if (!targetId) return null;
+  if (!chrome.targets.has(targetId)) { DLG.open.delete(targetId); DLG.noAnswer.delete(targetId); DLG.closed.delete(targetId); return null; }
+  return DLG.open.get(targetId) || null;
+}
+
+/** Does the page run a script within ms? Only a timeout is no: an error (a page between documents) is an answer. */
+const answers = (session, ms) => chrome.send('Runtime.evaluate', { expression: '1', returnByValue: true }, session, ms)
+  .then(() => true, error => !/did not answer/.test(String(error?.message)));
+
+/** The Page domain on for this session, so its dialogs are reported. */
+async function pageOn(session) {
+  if (!DLG.hooked || !session || DLG.pageOn.has(session)) return;
+  if (await chrome.send('Page.enable', {}, session, 2000).then(() => true, () => false)) DLG.pageOn.add(session);
+}
+
+/** A call a dialog cut short may still be running: its input is dropped (sendInput), and the next call on that tab
+ *  waits a moment for it to end. */
+async function uncut(targetId) {
+  const session = chrome.sessions.get(targetId);
+  const left = session && DLG.cut.get(session);
+  if (!left) return;
+  await Promise.race([left, sleep(3000)]);
+  DLG.cut.delete(session);
+}
+const sendInput = (method, params, session, timeout) => (DLG.cut.has(session)
+  ? Promise.reject(new Error('A dialog the page opened cut this call short; the rest of its input was not sent.'))
+  : chrome.send(method, params, session, timeout));
+
+/** What a run does about a dialog it can't close. */
+const dialogNext = args => (fromWeb(args)
+  ? 'pre.dev asks the user to close it in their Chrome, and the run carries on once they have: read the tab again then, before acting.'
+  : 'Tell the user in one line what it asks and that it is waiting in their Chrome; once they have answered it, read the tab again before acting.');
+const dialogSays = d => (d.message ? ` It says: "${d.message.slice(0, 200)}".` : '');
+
+/** Refused, because a dialog the page opened is up (d), or the page doesn't answer (no d). A new tab's call
+ *  (chrome_open) names the tab first. */
+function dialogRefused(args, info, d, { tabLine = false } = {}) {
+  const site = hostOf(info?.url || d?.url || '') || 'this page';
+  const kept = keepsSignIn(args, info?.url) ? ` ${KEEP_SIGNIN(site)}` : '';
+  const tab = tabLine && info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  if (d) {
+    return refused(`${tab}Refused: a ${DIALOG_WORDS[d.type]} the page on ${site} opened is waiting for the user, and the page answers nothing until it closes.${dialogSays(d)} pre.dev never answers it for them. Don't retry, and don't press keys to close it: ${dialogNext(args)}${kept}`,
+      { kind: 'page_busy', dialog: { type: d.type, message: d.message } });
+  }
+  return refused(`${tab}Refused: the page on ${site} isn't answering (it is busy, or a dialog of Chrome's own is over it), so the agent can't read it or act in it. Don't retry at once: read the tab again in a few seconds; if it still doesn't answer, ask the user to look at that tab in their Chrome.${kept}`,
+    { kind: 'page_busy', dialog: null });
+}
+
+/** The call that opened a dialog only the person may answer: it landed. */
+function landedResult(args, info, d) {
+  const site = hostOf(info?.url || d.url) || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || d.url).slice(0, 160)}\n` : '';
+  return {
+    content: [{ type: 'text', text: `${tab}It landed: the page on ${site} opened a ${DIALOG_WORDS[d.type]} that waits for the user.${dialogSays(d)} pre.dev never answers it for them, and every call on this tab is refused until they do. ${dialogNext(args)}` }],
+    landed: true,
+    dialog: { type: d.type, message: d.message },
+  };
+}
+
+/** A result, with the alerts pre.dev pressed OK on during (or just before) its call. */
+function withClosedAlerts(result, closed) {
+  if (!closed.length) return result;
+  const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : { ...result };
+  const lines = closed.map(c => `The page showed a message (an alert)${c.message ? `: "${c.message.slice(0, 200)}"` : ''}. pre.dev pressed OK on it.`);
+  out.content = [...(out.content || []), { type: 'text', text: lines.join('\n') }];
+  out.dialogs = closed.map(({ type, message, closed: how }) => ({ type, message, closed: how }));
+  return out;
+}
+
+/** One call, with the page's dialogs in view (above). `info` is its tab (null for chrome_open, which names its new
+ *  tab with call.setTab once it has one); run(call) does the work. */
+async function dialogCall(args, info, run) {
+  const manual = args?.__predev_alert_auto_ok === false;
+  const setManual = targetId => { if (manual) DLG.manual.add(targetId); else if (fromWeb(args)) DLG.manual.delete(targetId); };
+  if (info) {
+    setManual(info.targetId);
+    const open = liveDialog(info.targetId);
+    if (open) throw dialogRefused(args, info, open);
+    const session = chrome.sessions.get(info.targetId);
+    // It didn't answer last time: a light look first, so a page that still doesn't answer is refused at once.
+    if (session && DLG.noAnswer.has(info.targetId)) {
+      if (!(await answers(session, 1000))) throw dialogRefused(args, info, liveDialog(info.targetId));
+      DLG.noAnswer.delete(info.targetId);
+      try { core.onBusy?.(info.targetId); } catch {}
+    }
+  }
+  const call = { tab: info?.targetId || null, dialog: null, closed: [...(info && DLG.closed.get(info.targetId) || [])], wake: null };
+  if (info) DLG.closed.delete(info.targetId);
+  call.setTab = targetId => { call.tab = targetId; setManual(targetId); };
+  const landed = new Promise(resolve => { call.wake = resolve; });
+  let stop = false;
+  // Not answering: from 2 s into the call, a light look every 2 s while the page answers (each waits 2.5 s); two in a
+  // row unanswered is a refusal, 7 s into a call on a page that doesn't answer (or 7 s after it stops answering).
+  const stuck = (async () => {
+    await sleep(2000);
+    let missed = 0;
+    while (!stop) {
+      const session = call.tab && chrome.sessions.get(call.tab);
+      if (!session || liveDialog(call.tab)) { missed = 0; await sleep(500); continue; }
+      const ok = await answers(session, 2500);
+      if (stop) return null;
+      missed = ok ? 0 : missed + 1;
+      if (missed >= 2) return true;
+      if (ok) await sleep(2000);
+    }
+    return null;
+  })();
+  DLG.calls.add(call);
+  // A call a dialog cut short on this tab ends first (uncut); the look above keeps watching meanwhile.
+  const work = (info ? uncut(info.targetId) : Promise.resolve()).then(() => run(call));
+  try {
+    const first = await Promise.race([
+      work.then(value => ({ value }), error => ({ error })),
+      landed.then(() => ({ landed: true })),
+      stuck.then(hit => (hit ? { stuck: true } : new Promise(() => {}))),
+    ]);
+    if (first.landed || first.stuck) {
+      // The call stops here; what it had left to do runs out without input (sendInput) and nobody waits on it.
+      const session = call.tab && chrome.sessions.get(call.tab);
+      const left = work.catch(() => {});
+      if (session) {
+        DLG.cut.set(session, left);
+        void left.then(() => { if (DLG.cut.get(session) === left) DLG.cut.delete(session); });
+      }
+      const tabInfo = call.tab ? chrome.targets.get(call.tab) || info : info;
+      if (first.landed) return withClosedAlerts(landedResult(args, tabInfo, call.dialog), call.closed);
+      DLG.noAnswer.set(call.tab, Date.now());
+      try { core.onBusy?.(call.tab); } catch {}
+      throw dialogRefused(args, tabInfo, liveDialog(call.tab), { tabLine: !info });
+    }
+    if (first.error) throw first.error;
+    return withClosedAlerts(first.value, call.closed);
+  } finally {
+    stop = true;
+    DLG.calls.delete(call);
+    if (call.tab) DLG.usedAt.set(call.tab, Date.now());
+  }
+}
+
+/** pre.dev's ping for a handed task: is its tab busy? { type } of the dialog open there ('no_answer' when the page
+ *  doesn't answer, with no dialog), or null. */
+async function busyOf(tab) {
+  const wanted = String(tab || '').trim().toUpperCase();
+  if (!wanted) return null;
+  const hits = [...chrome.targets.values()].filter(t => t.targetId.toUpperCase().startsWith(wanted));
+  if (hits.length !== 1) return null;
+  const { targetId } = hits[0];
+  const d = liveDialog(targetId);
+  if (d) return { type: d.type };
+  if (!DLG.noAnswer.has(targetId)) return null;
+  const session = chrome.sessions.get(targetId);
+  if (session && !(await answers(session, 1000))) return { type: 'no_answer' };
+  DLG.noAnswer.delete(targetId);
+  return null;
+}
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict: allowed.
 async function accountRefusal(args, session, action, target, url, ctx) {
@@ -1148,10 +1384,10 @@ async function pressKeysInner(session, combos) {
     if (modifiers & 6) text = undefined; // ctrl/cmd chords produce no text
     const command = modifiers & 4 ? MAC_COMMANDS[keyName.toLowerCase()] : undefined;
     const base = { key, code, windowsVirtualKeyCode: keyCode, modifiers };
-    await chrome.send('Input.dispatchKeyEvent', {
+    await sendInput('Input.dispatchKeyEvent', {
       ...base, type: text ? 'keyDown' : 'rawKeyDown', ...(text ? { text } : {}), ...(command ? { commands: [command] } : {}),
     }, session);
-    await chrome.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, session);
+    await sendInput('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, session);
   }
 }
 
@@ -1161,10 +1397,10 @@ async function click(session, x, y, count = 1) {
 }
 
 async function clickInner(session, x, y, count) {
-  await chrome.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, session);
+  await sendInput('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, session);
   for (let i = 1; i <= count; i++) {
-    await chrome.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session);
-    await chrome.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: i }, session);
+    await sendInput('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session);
+    await sendInput('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: i }, session);
   }
 }
 
@@ -1194,8 +1430,8 @@ async function inputReaches(session) {
   if (start[1]) { await done(); return null; }
   let out = false;
   try {
-    await chrome.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
-    await chrome.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
+    await sendInput('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
+    await sendInput('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
     for (let i = 0; i < 6; i++) {
       const now = await seenCount(session);
       if (now === null) { out = null; break; }
@@ -1467,6 +1703,8 @@ const TOOLS = [
       if (context) info = await createTab(context, 'about:blank', { background: !foreground }).catch(() => null);
       if (!info) info = await openTaggedTab(p.dir);
       const session = await chrome.session(info.targetId);
+      ctx.dialogCall?.setTab(info.targetId);
+      await pageOn(session);
       if (handoffOn(rest)) ownedBy(agentOf(rest)).add(info.targetId);
       if (foreground) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
       let loaded;
@@ -1546,7 +1784,7 @@ const TOOLS = [
     async run(args, ctx = {}) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);
-      await pageMustAnswer(args, session, info, 'this click');
+      await pageMustAnswer(args, session, info);
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
@@ -1603,7 +1841,7 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       const q = target(args.ref || args.selector ? args : { ...args, text: undefined });
       if (q === '{}') throw new Error('Pass ref (from chrome_snapshot) or selector for the field.');
-      await pageMustAnswer(args, session, info, 'typing here');
+      await pageMustAnswer(args, session, info);
       const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
@@ -1630,7 +1868,7 @@ const TOOLS = [
       const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
       if (args.text) {
         await markActing(session, true);
-        try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
+        try { await sendInput('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       let pkAt = 0;
@@ -1679,7 +1917,7 @@ const TOOLS = [
     async run({ tab, keys, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
+      await pageMustAnswer(rest, session, info);
       const before = await docState(session, info.url);
       if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
         // Enter (or Space) on a focused link or button activates it, like a click.
@@ -1729,7 +1967,7 @@ const TOOLS = [
       const deltaY = direction === 'down' ? height * 0.85 * step : direction === 'up' ? -height * 0.85 * step : 0;
       const deltaX = direction === 'right' ? width * 0.85 * step : direction === 'left' ? -width * 0.85 * step : 0;
       await markActing(session, true);
-      try { await chrome.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session); } finally { await markActing(session, false); }
+      try { await sendInput('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session); } finally { await markActing(session, false); }
       await sleep(350);
       const [top, max] = await evaluate(session, '(r => [Math.round(r.scrollTop), Math.max(0, r.scrollHeight - innerHeight)])(document.scrollingElement || document.documentElement)');
       return `Scrolled ${direction}. Page scroll: ${top}/${max}px`;
@@ -1860,7 +2098,7 @@ const TOOLS = [
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
           throw refused(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`, { kind: 'keep_signin', site });
-        if (!answers) throw refused(pageBusy(hostOf(info.url), 'this script'), { kind: 'page_busy' });
+        if (!answers) throw dialogRefused(rest, info, liveDialog(info.targetId));
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js);
@@ -2190,13 +2428,24 @@ for (const tool of TOOLS) {
   const run = tool.run;
   tool.run = async (args = {}, ctx = {}) => {
     if (args.tab && PRIVATE.size && PRIVATE.has(findTab(args.tab).targetId)) throw refused(PRIVATE_REFUSAL, { kind: 'scope' });
-    if (handoffOn(args) && args.tab) {
-      const info = findTab(args.tab);
-      const session = await chrome.session(info.targetId);
-      await handoffGate(tool.name, args, info, session);
-    }
-    return run.call(tool, args, ctx);
+    const info = args.tab ? findTab(args.tab) : null;
+    // Another agent's tab, or the user's own, says nothing about its dialogs.
+    if (info && handoffOn(args) && !mayUse(agentOf(args), info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
+    return dialogCall(args, info, async () => {
+      if (info) {
+        const session = await chrome.session(info.targetId);
+        await pageOn(session);
+        if (handoffOn(args)) await handoffGate(tool.name, args, info, session);
+      }
+      return run.call(tool, args, ctx);
+    });
   };
+}
+// chrome_open's new tab is its call's from the moment it exists (its page can open a dialog as it loads).
+{
+  const tool = TOOLS.find(t => t.name === 'chrome_open');
+  const run = tool.run;
+  tool.run = (args = {}, ctx = {}) => dialogCall(args, null, call => run.call(tool, args, { ...ctx, dialogCall: call }));
 }
 
 function instructions(ctx = {}) {
@@ -2235,5 +2484,5 @@ function toolList(ctx = {}) {
   }));
 }
 
-return { TOOLS, instructions, toolList, chromeInFront };
+return { TOOLS, instructions, toolList, chromeInFront, busyOf };
 }

@@ -17,8 +17,9 @@ export const TASK_TOOLS = new Set(['chrome_open', 'chrome_navigate', 'chrome_sna
 export const MOVES = new Set(['chrome_open', 'chrome_navigate', 'chrome_click', 'chrome_act', 'chrome_press', 'chrome_type', 'chrome_handoff']);
 /** How long a call waits for the person at this computer to allow a new site. */
 export const ALLOW_WAIT_MS = 120000;
-/** The sign-in keeping lists pre.dev's brain sends with a call (handoff rule 3): the only `__` arguments
- *  a call from pre.dev may carry. */
+/** The sign-in keeping lists pre.dev's brain sends with a call (handoff rule 3), and pre.dev's word that alerts in
+ *  this call's tab stay for the person (`__predev_alert_auto_ok: false`; tools.mjs presses OK on them otherwise):
+ *  the only `__` arguments a call from pre.dev may carry. */
 const KEEP_SIGN_IN_ARGS = ['__predev_signed_in', '__predev_signout_ok'];
 
 /** An http(s) page's host, or '' (other schemes are never a web run's). */
@@ -50,6 +51,7 @@ export function callArgs(body) {
   for (const k of KEEP_SIGN_IN_ARGS) {
     if (Array.isArray(body?.args?.[k])) args[k] = body.args[k].filter(x => typeof x === 'string').slice(0, 50).map(x => x.slice(0, 255));
   }
+  if (body?.args?.__predev_alert_auto_ok === false) args.__predev_alert_auto_ok = false;
   return args;
 }
 
@@ -178,7 +180,7 @@ export const taskAgent = taskId => `handed:${taskId}`;
  *   cloudOnly                true when nothing on this computer can take a task over (the extension): it keeps
  *                            only the task's id, site and tab, never its instruction or progress
  */
-export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, cloudOnly = false }) {
+export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, cloudOnly = false, busyOf = async () => null }) {
   const handedTask = async taskId => (await tasks.list()).find(t => t.taskId === taskId) || null;
 
   /** One call from pre.dev's cloud run of a task handed here. It drives only the tabs it opened for that task
@@ -194,7 +196,9 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       ? refusedText("This Chrome doesn't have this task any more: its windows were closed or Chrome restarted, so the run's tab is gone.", { kind: 'tab_closed' })
       : refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
     if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
-    if (name === 'ping') return text('ok', false);
+    // A ping says whether the task's tab is busy: { type } of a dialog open there that only the person may close
+    // ('no_answer' when the page doesn't answer, with no dialog), or null. The run's card waits on it.
+    if (name === 'ping') return { ...text('ok', false), busy: await busyOf(t.tab).catch(() => null) };
     const agent = taskAgent(taskId);
     const args = callArgs(body);
     args.__agent = agent;

@@ -152,11 +152,15 @@ const REFUSED_AS = {
   user_control: 'You were using the tab',
   tab_closed: 'Its tab was closed',
   taken_over: 'Not handed here any more',
-  page_busy: "The page wasn't answering (a dialog on it?)",
+  page_busy: "The page wasn't answering",
 };
+/** A dialog the page opened, in the person's words. */
+const DIALOG_AS = { alert: 'A message (alert)', confirm: 'A confirm dialog', prompt: 'A prompt dialog', beforeunload: 'A "Leave site?" dialog' };
 function outcomeOf(result) {
+  if (result?.landed && DIALOG_AS[result.dialog?.type]) return { ok: true, text: `Done; ${DIALOG_AS[result.dialog.type].toLowerCase()} opened on the page, waiting for you` };
   if (!result?.isError) return { ok: true, text: 'done' };
   const kind = result.refusal?.kind;
+  if (kind === 'page_busy' && DIALOG_AS[result.refusal.dialog?.type]) return { ok: false, kind, text: `${DIALOG_AS[result.refusal.dialog.type]} is open on the page, waiting for you` };
   const all = String((result.content || []).find(c => c.type === 'text')?.text || '');
   // This Chrome's own reasons, in the person's words rather than the run's.
   if (all.includes(BLOCKED_TEXT)) return { ok: false, kind: 'blocked', text: 'Refused: developer tools are off' };
@@ -230,6 +234,15 @@ const core = {
   async chromeInFront() {
     try { const w = await chrome.windows.getLastFocused(); return !!w?.focused; } catch { return true; }
   },
+  // tools.mjs pressed OK on an alert in a run's tab: the person sees it in Activity.
+  onDialog({ targetId, site }) {
+    let run;
+    for (const [agent, tabs] of conn.__predevHandoff?.owned || []) if (tabs.has(targetId) && agent.startsWith('handed:')) run = `task:${cleanTaskId(agent.slice(7))}`;
+    void note({ kind: 'control', ...(run ? { run } : {}), text: `Closed a message on ${site || 'a page'}` });
+    ui();
+  },
+  // A dialog opened or closed in a tab (or its page answers again): held pings look again.
+  onBusy() { wakeHolds(); },
 };
 const api = createTools(core);
 
@@ -638,6 +651,7 @@ const taskCalls = createTaskCalls({
   refresh: () => conn.refresh(),
   log: line => log(line),
   cloudOnly: true,
+  busyOf: tab => api.busyOf(tab),
 });
 
 /** Paused or blocked here: no task run can use this Chrome, and no task is taken here. */
@@ -664,7 +678,9 @@ async function taskUnavailable(taskId) {
  *  on), or the task leaves this Chrome, in a plain ping's shapes; no change in ms answers the same state. One per
  *  task: a newer one answers the older now. A ping without hold answers at once, as before. */
 const HOLD_MAX_MS = 30000;
-const HOLD_KINDS = new Set(['ok', 'paused', 'stopped', 'policy']);
+const HOLD_KINDS = new Set(['ok', 'paused', 'stopped', 'policy', 'busy']);
+/** A held ping that last saw the tab busy looks again this often (a page that didn't answer says nothing when it does). */
+const BUSY_LOOK_MS = 2000;
 const holds = new Map();
 const kindOf = why => (why === PAUSED_TEXT ? 'paused' : why === STOPPED_TEXT ? 'stopped' : why === BLOCKED_TEXT ? 'policy' : 'ok');
 function holdOf(args) {
@@ -682,7 +698,9 @@ function wakeHolds(taskId = '', how = 'state') {
 async function pingState(body) {
   const why = await taskUnavailable(cleanTaskId(body?.taskId));
   if (why) return { kind: kindOf(why), why };
-  return (await taskCalls.taskCall({ ...body, name: 'ping' }))?.isError ? { kind: 'gone', why } : { kind: 'ok', why };
+  const r = await taskCalls.taskCall({ ...body, name: 'ping' });
+  // 'busy': a dialog only the person may close is open in the task's tab, or its page doesn't answer (ping's busy).
+  return r?.isError ? { kind: 'gone', why } : { kind: r?.busy ? 'busy' : 'ok', why };
 }
 async function holdPing(body, hold) {
   const taskId = cleanTaskId(body?.taskId);
@@ -699,7 +717,7 @@ async function holdPing(body, hold) {
     state = await pingState(body);
     const left = until - Date.now();
     if (state.kind !== hold.seen || left <= 0) break;
-    const timer = setTimeout(mine, left, 'time');
+    const timer = setTimeout(mine, hold.seen === 'busy' ? Math.min(left, BUSY_LOOK_MS) : left, 'time');
     how = await woke;
     clearTimeout(timer);
     if (how === 'newer' || how === 'gone') break;
@@ -1185,4 +1203,4 @@ chrome.runtime.onInstalled.addListener(() => { void boot(); });
 void boot();
 
 // For the tests in this repo's harness only (a dev build): nothing here is reachable from a web page.
-if (CONFIG.dev) globalThis.__predev = { status: () => ({ status, paused, devtoolsBlocked, running, inflight: inflight.size, holds: holds.size }), conn, sites, callTool, webCall, checkDebugger };
+if (CONFIG.dev) globalThis.__predev = { status: () => ({ status, paused, devtoolsBlocked, running, inflight: inflight.size, holds: holds.size }), conn, sites, callTool, webCall, taskCall: taskCallHere, checkDebugger };

@@ -86,7 +86,11 @@ class Chrome {
     this.targets = new Map();   // targetId -> TargetInfo
     this.sessions = new Map();  // targetId -> sessionId
     this.connecting = null;
+    this.listeners = new Set();
   }
+
+  /** Every event of an attached tab, as (targetId, method, params): tools.mjs follows the page's own dialogs with it. */
+  onEvent(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
 
   get connected() { return this.ws?.readyState === 1; }
 
@@ -155,6 +159,11 @@ class Chrome {
       this.sessions.delete(params.targetId);
     } else if (method === 'Target.detachedFromTarget') {
       for (const [targetId, sessionId] of this.sessions) if (sessionId === params.sessionId) this.sessions.delete(targetId);
+    }
+    if (message.sessionId && this.listeners.size) {
+      let targetId = null;
+      for (const [t, s] of this.sessions) if (s === message.sessionId) { targetId = t; break; }
+      if (targetId) for (const listener of this.listeners) { try { listener(targetId, method, params); } catch {} }
     }
   }
 
@@ -398,6 +407,9 @@ function handoffFor(apiKey) {
  *  asked for. Only then may a call lift the kept sign-in (__predev_signout_ok); from any other
  *  agent it is dropped, so a model can't lift it by passing the argument itself. */
 const FROM_PREDEV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_MCP_FROM_PREDEV || '');
+/** PREDEV_ALERT_AUTO_OK=off: alerts in this agent's tabs stay for the user, like a confirm (tools.mjs). It goes with
+ *  each call, so it holds at once for this agent, also with a daemon another agent started. */
+const ALERT_AUTO_OK_OFF = /^(0|off|false|no)$/i.test(process.env.PREDEV_ALERT_AUTO_OK || '');
 /** Which agent a call comes from, so agents sharing the daemon keep to their own tabs. */
 const AGENT_ID = crypto.randomBytes(6).toString('hex');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
@@ -585,6 +597,7 @@ function withCallFlags(args, ctx = shimCtx()) {
   const out = { ...(args || {}), __agent: AGENT_ID };
   if (ctx.handoff) out.__predev_handoff = true;
   if (!FROM_PREDEV) delete out.__predev_signout_ok;
+  if (ALERT_AUTO_OK_OFF) out.__predev_alert_auto_ok = false;
   return out;
 }
 
