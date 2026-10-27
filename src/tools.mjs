@@ -1997,7 +1997,7 @@ const TOOLS = [
           while (Date.now() < until && !ctx.signal?.aborted && await pauseHeld(info, s0)) await sleep(500);
           if (H.paused.has(info.targetId)) return handoffLines('waiting', info, info.url, 'They haven\'t clicked "Let the agent continue" yet. Keep waiting for them (call this again), or ask them in a message; don\'t act in this tab meanwhile.');
         }
-        if (await pauseHeld(info, s0)) throw refused(`The tab stays the user's until they let the agent continue: their own click on "Let the agent continue" at the top of the tab, not the agent's say-so. ${keepGoing(args)}`, { kind: 'user_control' });
+        if (await pauseHeld(info, s0)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
         end(info.targetId, 'resumed');
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }
