@@ -1036,22 +1036,30 @@ async function pressKeys(session, combos) {
   try { await pressKeysInner(session, combos); } finally { await markActing(session, false); }
 }
 
+const keyCombos = combos => String(combos).trim().split(/\s+/).filter(Boolean);
+// One combo ("Enter", "shift+Tab", "cmd+a"): its key event fields, and whether it activates the
+// focused element (Enter or Space, as a click would) or submits its form (Enter).
+function comboKey(combo) {
+  const parts = combo.split('+');
+  const keyName = parts.pop();
+  let modifiers = 0;
+  for (const part of parts) modifiers |= MODIFIERS[part.toLowerCase()] || 0;
+  let key, code, keyCode, text;
+  const known = KEYS[keyName.toLowerCase()];
+  if (known) [key, code, keyCode, text] = known;
+  else if (keyName.length === 1) {
+    key = modifiers & 8 ? keyName.toUpperCase() : keyName;
+    code = /[a-z]/i.test(keyName) ? `Key${keyName.toUpperCase()}` : /\d/.test(keyName) ? `Digit${keyName}` : '';
+    keyCode = keyName.toUpperCase().charCodeAt(0);
+    text = key;
+  } else throw new Error(`Unknown key "${keyName}".`);
+  if (modifiers & 6) text = undefined; // ctrl/cmd chords produce no text
+  return { keyName, key, code, keyCode, text, modifiers, activates: code === 'Enter' || code === 'Space', submits: code === 'Enter' };
+}
+
 async function pressKeysInner(session, combos) {
-  for (const combo of String(combos).trim().split(/\s+/)) {
-    const parts = combo.split('+');
-    const keyName = parts.pop();
-    let modifiers = 0;
-    for (const part of parts) modifiers |= MODIFIERS[part.toLowerCase()] || 0;
-    let key, code, keyCode, text;
-    const known = KEYS[keyName.toLowerCase()];
-    if (known) [key, code, keyCode, text] = known;
-    else if (keyName.length === 1) {
-      key = modifiers & 8 ? keyName.toUpperCase() : keyName;
-      code = /[a-z]/i.test(keyName) ? `Key${keyName.toUpperCase()}` : /\d/.test(keyName) ? `Digit${keyName}` : '';
-      keyCode = keyName.toUpperCase().charCodeAt(0);
-      text = key;
-    } else throw new Error(`Unknown key "${keyName}".`);
-    if (modifiers & 6) text = undefined; // ctrl/cmd chords produce no text
+  for (const combo of keyCombos(combos)) {
+    const { keyName, key, code, keyCode, text, modifiers } = comboKey(combo);
     const command = modifiers & 4 ? MAC_COMMANDS[keyName.toLowerCase()] : undefined;
     const base = { key, code, windowsVirtualKeyCode: keyCode, modifiers };
     await chrome.send('Input.dispatchKeyEvent', {
@@ -1572,23 +1580,34 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
       const before = await docState(session, info.url);
-      if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && (keepsSignIn(rest, before[0]) || signOutAsked(rest, before[0]))) {
-        // Enter (or Space) on a focused link or button activates it, like a click.
-        const facts = await inPage(session, 'activeFacts()').catch(() => null);
-        if (facts && !facts.error) {
-          const keep = await accountRefusal(rest, session, 'Pressing Enter on', `${facts.desc}${linkTarget(facts)}`, before[0], ctx);
-          if (keep) throw new Error(keep);
-        }
-      }
-      if (handoffOn(rest) && /(^|\s|\+)(enter|return)(\s|$)/i.test(String(keys))) {
-        const facts = await inPage(session, 'activeFacts()').catch(() => null);
-        if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
-          const ask = await approvalRefusal(rest, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
-          if (ask) throw new Error(ask);
-        }
-      }
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
-      await pressKeys(session, keys);
+      // One key at a time: Tab, shift+Tab or an arrow key can move the focus, so each Enter or Space
+      // is checked on the element focused when it fires (it activates that element, like a click).
+      const withTab = { ...rest, tab }; // so a refusal that hands the step over names this tab
+      for (const combo of keyCombos(keys)) {
+        const k = comboKey(combo);
+        if (handoffOn(rest) && k.activates) {
+          const { submits } = k;
+          // An earlier key may have opened a dialog: then this one would wait in Chrome, past the checks.
+          await pageMustAnswer(rest, session, info, `pressing ${combo}`);
+          const url = (await docState(session, before[0]))[0] || before[0];
+          if (keepsSignIn(rest, url) || signOutAsked(rest, url)) {
+            const facts = await inPage(session, 'activeFacts()').catch(() => null);
+            if (facts && !facts.error) {
+              const keep = await accountRefusal(withTab, session, `Pressing ${k.code} on`, `${facts.desc}${linkTarget(facts)}`, url, ctx);
+              if (keep) throw new Error(keep);
+            }
+          }
+          if (submits) {
+            const facts = await inPage(session, 'activeFacts()').catch(() => null);
+            if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
+              const ask = await approvalRefusal(withTab, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, url, ctx);
+              if (ask) throw new Error(ask);
+            }
+          }
+        }
+        await pressKeys(session, combo);
+      }
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(DIALOG_REFUSAL);
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
