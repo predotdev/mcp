@@ -823,6 +823,16 @@ const agentOf = args => String(args?.__agent || 'agent');
 // with handoffs on or off, ever reads or acts in them.
 const PRIVATE = chrome.__predevPrivate || (chrome.__predevPrivate = new Set());
 const PRIVATE_REFUSAL = "That tab is pre.dev's own question to the user; no agent can use it.";
+// A guard refusal says what it was for (`refusal`), so a caller that is a program can act on it: a
+// cloud run finishing a handed task in this Chrome (channel.mjs) turns it into a card. The message is
+// the same for every caller.
+class Refused extends Error {
+  constructor(message, refusal) { super(message); this.refusal = refusal; }
+}
+const refused = (message, refusal) => new Refused(message, refusal);
+// One control the person who typed a cloud run approved on pre.dev's card, per run: set by channel.mjs
+// from pre.dev's own word (never from a call's arguments), taken by the first matching ask-first check.
+const APPROVED = chrome.__predevApproved || (chrome.__predevApproved = new Map());
 // A call from a pre.dev web run (the computer channel, channel.mjs): the user hands a step back
 // through the run's own handoff tool, hand_off_to_user, not chrome_handoff.
 const fromWeb = args => args?.__via === 'web';
@@ -886,6 +896,76 @@ async function userTouchedAt(info, session) {
   const since = Math.max(H.ackAt.get(info.targetId) || 0, 0);
   return at > since ? at : 0;
 }
+
+// A takeover: the user clicked or typed in an agent's tab while the agent wasn't acting. The agent stays paused there
+// until the user lets it continue, through a channel the model can't use: the "Let the agent continue" button pre.dev
+// shows at the top of the tab (a trusted click, in a script world the page can't reach), or, from pre.dev's own CLI,
+// the user's answer on its card (__predev_user_said_go: the bridge passes it only for that CLI, which never takes it
+// from its model). Nothing else lifts it: not a resume the agent asks for, not a release, cancel or another handoff.
+H.paused ||= new Map(); // targetId -> { at }: when the user took the tab
+H.pauseWorlds ||= new Map(); // targetId -> the bar's script world in the tab's current page
+const PAUSE_WORLD = 'predev-pause';
+// One line and one button, in a closed shadow root: the page's scripts can't see, click or fake it.
+const PAUSE_BAR = `(() => {
+  if (window.__predevPauseBar && document.documentElement.contains(window.__predevPauseBar)) return true;
+  const host = document.createElement('div');
+  host.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;z-index:2147483647';
+  const root = host.attachShadow({ mode: 'closed' });
+  root.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#14161a;color:rgba(255,255,255,.85);font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;border-bottom:1px solid rgba(255,255,255,.12)"><span>pre.dev\\'s agent is paused while you use this tab.</span><button type="button" style="margin-left:auto;cursor:pointer;border-radius:6px;border:1px solid rgba(251,191,36,.6);background:rgba(245,158,11,.15);color:#fef3c7;padding:4px 10px;font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">Let the agent continue</button></div>';
+  root.querySelector('button').addEventListener('click', e => {
+    if (!e.isTrusted) return;
+    window.__predevContinueAt = Date.now();
+    host.remove();
+  });
+  window.__predevPauseBar = host;
+  (document.body || document.documentElement).appendChild(host);
+  return true;
+})()`;
+// Runs `expression` in the bar's own script world in the tab's page (a new page gets a new one).
+async function inPauseWorld(info, session, expression) {
+  for (let i = 0; i < 2; i++) {
+    let contextId = H.pauseWorlds.get(info.targetId);
+    if (!contextId) {
+      const tree = await chrome.send('Page.getFrameTree', {}, session, 3000);
+      contextId = (await chrome.send('Page.createIsolatedWorld', { frameId: tree.frameTree.frame.id, worldName: PAUSE_WORLD }, session, 3000)).executionContextId;
+      H.pauseWorlds.set(info.targetId, contextId);
+    }
+    const r = await chrome.send('Runtime.evaluate', { expression, contextId, returnByValue: true }, session, 3000).catch(() => null);
+    if (r && !r.exceptionDetails) return r.result?.value;
+    H.pauseWorlds.delete(info.targetId);
+  }
+  return undefined;
+}
+// A touch the agent hasn't seen yet pauses it too (one during a handoff of this tab is the handoff's).
+async function notePause(info, session, h = H.handoff.get(info.targetId)) {
+  const at = await userTouchedAt(info, session);
+  if (at && !H.paused.has(info.targetId) && !(h?.waiting && at >= h.since)) H.paused.set(info.targetId, { at });
+}
+// The user let the agent continue: the tab is the agent's again, once it has read the page.
+async function liftPause(info, session) {
+  H.paused.delete(info.targetId);
+  H.ackAt.set(info.targetId, Date.now());
+  H.reread.add(info.targetId);
+  await inPauseWorld(info, session, 'window.__predevPauseBar ? (window.__predevPauseBar.remove(), true) : true').catch(() => {});
+}
+// Still paused? Their click on the bar lifts it; otherwise the bar is (re)shown.
+async function pauseHeld(info, session) {
+  const p = H.paused.get(info.targetId);
+  if (!p) return false;
+  const clicked = Number(await inPauseWorld(info, session, 'window.__predevContinueAt || 0').catch(() => 0)) || 0;
+  if (clicked > p.at) { await liftPause(info, session); return false; }
+  await inPauseWorld(info, session, PAUSE_BAR).catch(() => {});
+  return true;
+}
+const cliSaidGo = args => fromCli(args) && args?.__predev_user_said_go === true;
+// What the agent does about a takeover, by where the call comes from.
+function keepGoing(args) {
+  if (fromCli(args)) return `Ask them whether to keep going: call hand_off_to_user with tab "${String(args?.tab || '')}" and reason "user_control". They answer on its card, or click "Let the agent continue" at the top of the tab, and the run carries on once they say so. Don't try to take the tab back yourself; read the page again before acting.`;
+  if (fromWeb(args)) return 'Ask them whether to keep going, then wait for them: once they click "Let the agent continue" at the top of the tab in their Chrome, it is the agent\'s again. Don\'t try to take it back before that; read the page again before acting.';
+  return 'Ask them whether to keep going, then wait for them: they click "Let the agent continue" at the top of the tab. chrome_handoff with this tab, reason "user_control", resume: true and wait: true returns once they have. Then read the page again before acting.';
+}
+// How long chrome_handoff resume with wait: true waits for that click (under an MCP client's own request timeout).
+const RESUME_WAIT_MS = 45000;
 const READ_TOOLS = new Set(['chrome_snapshot', 'chrome_read']);
 const ACTION_TOOLS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_eval', 'chrome_scroll']);
 
@@ -893,17 +973,17 @@ const ACTION_TOOLS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 
 async function handoffGate(name, args, info, session) {
   if (!handoffOn(args)) return;
   const agent = agentOf(args);
-  if (!mayUse(agent, info)) throw new Error(SCOPE_REFUSAL);
+  if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
   const h = H.handoff.get(info.targetId);
-  if (h && h.waiting) throw new Error(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until chrome_handoff returns.`);
+  if (h && h.waiting) throw refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' });
   await watchInput(info, session);
-  const at = await userTouchedAt(info, session);
-  if (at) {
-    throw new Error(`The user is using this tab (they clicked or typed in it at ${new Date(at).toLocaleTimeString()}), so the agent is paused here and won't act over them. Ask them whether to keep going. When they say so, call chrome_handoff with this tab${fromWeb(args) ? ' and resume: true' : ', reason "user_control" and resume: true'} to take it back, then re-read the page.`);
+  await notePause(info, session, null);
+  if (await pauseHeld(info, session)) {
+    throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
   }
   if (READ_TOOLS.has(name)) H.reread.delete(info.targetId);
   else if (ACTION_TOOLS.has(name) && H.reread.has(info.targetId)) {
-    throw new Error('The user just had this tab and may have changed the page. Read it first (chrome_snapshot or chrome_read), then act.');
+    throw refused('The user just had this tab and may have changed the page. Read it first (chrome_snapshot or chrome_read), then act.', { kind: 'reread' });
   }
 }
 
@@ -934,20 +1014,29 @@ async function secretRefusal(args, session, q, url, ctx) {
   }
   if (!kind) return '';
   const what = kind === 'password' ? 'a password field' : kind === 'code' ? 'a one-time code field' : 'a payment card field';
-  return `Refusing to type into ${what}: pre.dev never types passwords, one-time codes or card details, even ones you were given. Hand this step to the user: ${handTo(args, kind === 'password' ? 'login_required' : 'step_up')}.`;
+  return refused(`Refusing to type into ${what}: pre.dev never types passwords, one-time codes or card details, even ones you were given. Hand this step to the user: ${handTo(args, kind === 'password' ? 'login_required' : 'step_up')}.`,
+    { kind: 'secret', field: kind === 'password' ? 'password' : kind === 'code' ? 'code' : 'card' });
 }
 
 // Rule 2: ask first before a click or submit that sends, posts, buys or deletes.
 async function approvalRefusal(args, session, desc, facts, url, ctx) {
   if (!handoffOn(args) || isLocalDev(url)) return '';
+  // The person who typed the cloud run approved exactly this control on this page on pre.dev's card: once.
+  const ok = fromWeb(args) ? APPROVED.get(agentOf(args)) : null;
+  if (ok && ok.desc === desc && ok.page === pagePath(url) && Date.now() - ok.at < 120000) {
+    APPROVED.delete(agentOf(args));
+    log('ask first: approved on pre.dev', desc);
+    return '';
+  }
   let p = await judged(ctx, session, `act|${pagePath(url)}|${desc}`,
     `Clicking ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`);
   // No verdict (no pre.dev key, or pre.dev unreachable): a form submit sent with POST asks first.
   if (p === null) p = facts?.isSubmit && /^post$/i.test(facts.formMethod || '') ? 1 : 0;
   if (p < 0.7) return '';
-  return fromWeb(args)
-    ? `Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"send|post|buy|delete|other","summary":"what it does"} and doneCheck {"kind":"element_gone","value":"<a selector for that control>"}; they review it and click it themselves in their Chrome, and the run resumes once it's done.`
-    : `Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"element_gone","value":"<a selector for that control>"} (or url_changes); they review it and click it themselves, and you carry on once it's done.`;
+  const askFirst = { kind: 'approval', desc, page: pagePath(url) };
+  return toHandOff(args)
+    ? refused(`Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"send|post|buy|delete|other","summary":"what it does"} and doneCheck {"kind":"element_gone","value":"<a selector for that control>"}; they review it and click it themselves in their Chrome, and the run resumes once it's done.`, askFirst)
+    : refused(`Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"element_gone","value":"<a selector for that control>"} (or url_changes); they review it and click it themselves, and you carry on once it's done.`, askFirst);
 }
 
 // Rule 3: keep a sign-in a handoff made. Once the user signed in to a site through a handoff, the
@@ -990,8 +1079,8 @@ async function pageMustAnswer(args, session, info, what) {
   if (!handoffOn(args)) return;
   if (await pageAnswers(session)) return;
   const site = keepsSignIn(args, info.url) ? hostOf(info.url) : '';
-  if (site) throw new Error(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`);
-  throw new Error(pageBusy(hostOf(info.url), what));
+  if (site) throw refused(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
+  throw refused(pageBusy(hostOf(info.url), what), { kind: 'page_busy' });
 }
 const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
@@ -1003,7 +1092,7 @@ async function accountRefusal(args, session, action, target, url, ctx) {
     `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
   if (p === null) { log('keep sign-in: no verdict, allowed', target); return ''; }
   if (p < 0.7) return '';
-  return `Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`;
+  return refused(`Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
 }
 const linkTarget = f => (f?.href ? ` (it goes to ${f.href})` : f?.isSubmit && f?.formAction ? ` (it submits to ${f.formAction})` : '');
 
@@ -1358,7 +1447,7 @@ const TOOLS = [
       const p = resolveProfile(profile);
       const address = normalizeUrl(url);
       const keep = await accountRefusal(rest, null, 'Opening', address, address, ctx);
-      if (keep) throw new Error(keep);
+      if (keep) throw keep;
       await mapContexts();
       const context = [...contextDirs].find(([ctx, dir]) => dir === p.dir && [...chrome.targets.values()].some(t => t.browserContextId === ctx))?.[0];
       // The tab starts blank and then loads the URL, so the wait below is for the page itself: a tab
@@ -1393,7 +1482,7 @@ const TOOLS = [
           dest = h?.entries?.[h.currentIndex + (url === 'back' ? -1 : 1)]?.url || '';
         } else dest = normalizeUrl(url);
         const keep = dest ? await accountRefusal(rest, session, 'Opening', dest, dest, ctx) : '';
-        if (keep) throw new Error(keep);
+        if (keep) throw keep;
       }
       let loaded;
       if (url === 'reload') {
@@ -1449,7 +1538,7 @@ const TOOLS = [
         const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
         if (f && !f.error) {
           const keep = await accountRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], ctx);
-          if (keep) throw new Error(keep);
+          if (keep) throw keep;
         }
       }
       if (x === undefined || y === undefined) {
@@ -1458,13 +1547,13 @@ const TOOLS = [
         if (handoffOn(args)) {
           const facts = await inPage(session, `fieldFacts(${target(args)})`).catch(() => null);
           const keep = await accountRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(facts && !facts.error ? facts : null)}`, before[0], ctx);
-          if (keep) throw new Error(keep);
+          if (keep) throw keep;
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
-          if (ask) throw new Error(ask);
+          if (ask) throw ask;
         }
         // Nothing of it is clear on screen: a click would only reach what is on top, so none is sent (a cover that
         // paints nothing keeps the old way: the click goes there, with the note).
-        if (hit.coveredAll && !hit.blank) throw new Error(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`);
+        if (hit.coveredAll && !hit.blank) throw refused(`Not clicked: ${hit.desc} is covered by ${hit.covered} at every point of it on the screen, so a click would go to that instead. Nothing was clicked.`, { kind: 'covered', by: hit.covered, desc: hit.desc });
         ({ x, y } = hit);
         what = hit.desc;
         if (hit.moved) note = `\nNote: ${hit.covered} covers the middle of it, so the click went to a clear part of it.`;
@@ -1474,7 +1563,7 @@ const TOOLS = [
       }
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
       await click(session, x, y, args.double ? 2 : 1);
-      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw new Error(dialogRefusal(args));
+      if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       await settle(session, before);
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1498,17 +1587,21 @@ const TOOLS = [
       const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
-        if (secret) throw new Error(secret);
+        if (secret) throw secret;
         if (args.submit) {
           const facts = await inPage(session, `fieldFacts(${q})`).catch(() => null);
           if (facts && !facts.error && facts.inForm) {
             const ask = await approvalRefusal(args, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form)` : 'submitting this form', facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
-            if (ask) throw new Error(ask);
+            if (ask) throw ask;
           }
         }
         // Never type over the user: they pressed a key in this tab a moment ago.
         const recent = Number(await evaluate(session, 'window.__predevUserAt || 0', 3000).catch(() => 0)) || 0;
-        if (recent && Date.now() - recent < 2000 && recent > (H.ackAt.get(info.targetId) || 0)) throw new Error('The user is typing in this tab right now; the agent never types over them. Ask whether to keep going.');
+        if (recent && Date.now() - recent < 2000 && recent > (H.ackAt.get(info.targetId) || 0)) {
+          if (!H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: recent });
+          await pauseHeld(info, session);
+          throw refused(`The user is typing in this tab right now; the agent never types over them. ${keepGoing(args)}`, { kind: 'user_control' });
+        }
       }
       const field = await inPage(session, `focus(${q}, ${args.clear !== false})`);
       if (field.error) throw new Error(field.error);
@@ -1517,17 +1610,17 @@ const TOOLS = [
         if (picked.error) throw new Error(picked.error);
         return `Selected "${picked.chosen}" in ${picked.desc}`;
       }
-      if (field.isPassword && !isLocalDev(before[0])) throw new Error('Refusing to type into a password field outside local dev sites; the user should enter it.');
+      if (field.isPassword && !isLocalDev(before[0])) throw refused('Refusing to type into a password field outside local dev sites; the user should enter it.', { kind: 'secret', field: 'password' });
       const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
       if (args.text) {
         await markActing(session, true);
         try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args));
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       if (args.submit) {
         const seen1 = handoffOn(args) ? await seenCount(session) : null;
         await pressKeys(session, 'Enter');
-        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(args, "the text went in, but this call's Enter didn't"));
+        if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args, "the text went in, but this call's Enter didn't"), { kind: CHROME_DIALOG });
         await settle(session, before);
       }
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
@@ -1574,19 +1667,19 @@ const TOOLS = [
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
         if (facts && !facts.error) {
           const keep = await accountRefusal(rest, session, 'Pressing Enter on', `${facts.desc}${linkTarget(facts)}`, before[0], ctx);
-          if (keep) throw new Error(keep);
+          if (keep) throw keep;
         }
       }
       if (handoffOn(rest) && /(^|\s|\+)(enter|return)(\s|$)/i.test(String(keys))) {
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
         if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
           const ask = await approvalRefusal(rest, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
-          if (ask) throw new Error(ask);
+          if (ask) throw ask;
         }
       }
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       await pressKeys(session, keys);
-      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(rest));
+      if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(rest), { kind: CHROME_DIALOG });
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
@@ -1744,8 +1837,8 @@ const TOOLS = [
         // on a page the user is signed in to.
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
-          throw new Error(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`);
-        if (!answers) throw new Error(pageBusy(hostOf(info.url), 'this script'));
+          throw refused(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`, { kind: 'keep_signin', site });
+        if (!answers) throw refused(pageBusy(hostOf(info.url), 'this script'), { kind: 'page_busy' });
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
         if (!isLocalDev(href)) expression = guardedEval(js, rest);
@@ -1823,7 +1916,7 @@ const TOOLS = [
   },
   {
     name: 'chrome_handoff',
-    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. With reason "user_control" and resume: true it takes the tab back after the user said to keep going. With reason "chrome_dialog" (a tool said Chrome\'s own dialog, such as its password warning, is over the tab) the user closes that dialog, and it is done once clicks and keys reach the page again.',
+    description: 'Hand the user a step in a tab that only they can do: signing in, a 2FA code, a CAPTCHA, an OAuth consent screen, or reviewing and clicking a send/post/buy/delete themselves. Brings the tab forward (once Chrome is the app in front, so it never grabs the keyboard from another app), then waits with no time limit until the done check passes. Meanwhile the agent gets nothing from that tab. Returns "status: done" (then read the page again before acting), "cancelled", "tab_closed" (ask the user what to do; do not reopen it yourself), "chrome_gone" or "timeout". If Chrome quits, it waits for Chrome to come back and carries on. Handoffs from several agents on this computer take turns. After the user took a tab (a tool said they are using it), reason "user_control" with resume: true gives it back to the agent only once they clicked "Let the agent continue" at the top of the tab; add wait: true to wait for that click. With reason "chrome_dialog" (a tool said Chrome\'s own dialog, such as its password warning, is over the tab) the user closes that dialog, and it is done once clicks and keys reach the page again.',
     inputSchema: {
       type: 'object', required: ['tab'],
       properties: {
@@ -1834,7 +1927,7 @@ const TOOLS = [
           properties: { kind: { type: 'string', enum: ['url_changes', 'url_leaves', 'element_gone', 'element_present', 'input_reaches'] }, value: { type: 'string' } },
         },
         timeout: { type: 'number', description: 'Seconds; omit or 0 for no limit.' },
-        resume: { type: 'boolean', description: 'With reason user_control: take the tab back (the user said to keep going).' },
+        resume: { type: 'boolean', description: 'With reason user_control: the tab is the agent\'s again once the user clicked "Let the agent continue" in it (with wait: true, waits up to 45 s for that click).' },
         wait: { type: 'boolean', description: 'false: hand the tab over and return at once (the caller checks later).' },
         check: { type: 'boolean', description: 'Only run the done check now.' },
         peek: { type: 'boolean', description: 'Only report the tab\'s address.' },
@@ -1858,7 +1951,7 @@ const TOOLS = [
         args = { ...args, tab: tabId(back) };
       }
       let info = findTab(args.tab);
-      if (!mayUse(agent, info)) throw new Error(SCOPE_REFUSAL);
+      if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
       const reason = String(args.reason || 'login_required');
       const end = (id, status) => {
         const h = H.handoff.get(id);
@@ -1886,11 +1979,25 @@ const TOOLS = [
         return handoffLines(v?.ok ? 'done' : 'waiting', info, v?.url || info.url);
       }
       if (args.release || args.cancel) {
+        // Ending a handoff never ends a takeover pause; from pre.dev's CLI, the user's answer on its card does.
+        const s0 = await chrome.session(info.targetId).catch(() => null);
+        if (s0) await notePause(info, s0);
+        if (s0 && args.release && cliSaidGo(args) && H.paused.has(info.targetId)) await liftPause(info, s0);
         H.cancel.add(info.targetId);
         end(info.targetId, args.cancel ? 'cancelled' : 'released');
         return handoffLines(args.cancel ? 'cancelled' : 'released', info, info.url);
       }
       if (reason === 'user_control' && args.resume) {
+        // Only the user ends a takeover pause: their click on the bar, or their answer on pre.dev's CLI card.
+        const s0 = await chrome.session(info.targetId);
+        await notePause(info, s0);
+        if (cliSaidGo(args) && H.paused.has(info.targetId)) await liftPause(info, s0);
+        if (args.wait === true) {
+          const until = Date.now() + RESUME_WAIT_MS;
+          while (Date.now() < until && !ctx.signal?.aborted && await pauseHeld(info, s0)) await sleep(500);
+          if (H.paused.has(info.targetId)) return handoffLines('waiting', info, info.url, 'They haven\'t clicked "Let the agent continue" yet. Keep waiting for them (call this again), or ask them in a message; don\'t act in this tab meanwhile.');
+        }
+        if (await pauseHeld(info, s0)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
         end(info.targetId, 'resumed');
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }
@@ -1898,6 +2005,11 @@ const TOOLS = [
       const [startHref] = await docState(session);
       const startUrl = String(args.start_url || startHref || info.url);
       H.cancel.delete(info.targetId);
+      // A takeover before this handoff stays a pause after it; asking the user whether to keep going (user_control)
+      // pauses the tab until they say so.
+      await notePause(info, session);
+      if (reason === 'user_control' && !H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: Date.now() });
+      if (reason === 'user_control') await pauseHeld(info, session);
       H.handoff.set(info.targetId, { agent, reason, waiting: true, since: Date.now(), startUrl, done: args.done });
       if (args.wait === false) {
         if (await chromeInFront()) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
@@ -1941,6 +2053,14 @@ const TOOLS = [
             await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
             shown = true;
           }
+          if (reason === 'user_control') {
+            // Asked whether to keep going: done once they click "Let the agent continue" (or the card ends it).
+            session = await chrome.session(info.targetId).catch(() => session);
+            if (!(await pauseHeld(info, session))) {
+              end(info.targetId, 'done');
+              return `${handoffLines('done', info, lastUrl)}The user let the agent continue. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
+            }
+          }
           if (waitsForInput(reason, args.done)) {
             // Chrome's dialog: done once a probe key reaches the page (one probe a second).
             session = await chrome.session(info.targetId).catch(() => session);
@@ -1978,7 +2098,7 @@ const TOOLS = [
   },
   {
     name: 'chrome_handed_off',
-    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish on my computer" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. Pass task to take that tab and carry on with the other chrome_* tools from where the cloud run stopped; pass task and done: true once it is finished.',
+    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish on my computer" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. pre.dev\'s cloud may already be carrying it on in that tab by itself; the list says so. Pass task to take that tab and carry on with the other chrome_* tools from where it is (this stops pre.dev\'s cloud run of it: one of you drives at a time); pass task and done: true once it is finished.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1986,25 +2106,66 @@ const TOOLS = [
         done: { type: 'boolean', description: 'true: it is finished; take it off the list.' },
       },
     },
-    async run(args = {}) {
+    async run(args = {}, ctx = {}) {
       if (!handoffOn(args)) throw new Error('chrome_handed_off needs handoffs turned on (PREDEV_HANDOFF=1 for this MCP server).');
       const file = path.join(core.stateDir || '', 'handed-tasks.json');
-      let tasks = [];
-      try { tasks = JSON.parse(fs.readFileSync(file, 'utf8'))?.tasks || []; } catch {}
+      const read = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8'))?.tasks || []; } catch { return []; } };
+      let tasks = read();
       const save = list => { const tmp = `${file}.${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ tasks: list }, null, 2), { mode: 0o600 }); fs.renameSync(tmp, file); };
+      const tabOf = t => (t?.tab ? [...chrome.targets.values()].find(x => isTab(x) && x.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) : null);
+      // A cloud run carrying a task on in this Chrome (channel.mjs, "Finish on my computer"): its calls in flight.
+      const RUNS = chrome.__predevHandedRuns || (chrome.__predevHandedRuns = { inflight: new Map() });
       if (!args.task) {
         if (!tasks.length) return 'No tasks were handed to this computer.';
-        return tasks.map(t => `${t.taskId}  ${t.site}  handed ${t.at}  stopped at step ${t.checkpoint?.step ?? '?'} on ${t.checkpoint?.url || '?'}\n  ${String(t.instruction || '').slice(0, 300)}`).join('\n\n');
+        return tasks.map(t => {
+          const tabNow = tabOf(t);
+          const who = t.driver === 'cloud'
+            ? `pre.dev's cloud is carrying it on${tabNow ? ` in tab ${tabId(tabNow)}` : ''}; pass task to take it over`
+            : 'waiting for an agent here';
+          return `${t.taskId}  ${t.site}  handed ${t.at}  stopped at step ${t.checkpoint?.step ?? '?'} on ${t.checkpoint?.url || '?'}  (${who})\n  ${String(t.instruction || '').slice(0, 300)}`;
+        }).join('\n\n');
       }
       const t = tasks.find(x => x.taskId === String(args.task));
       if (!t) throw new Error(`No handed-off task "${args.task}". Call chrome_handed_off with no arguments for the list.`);
       if (args.done) { save(tasks.filter(x => x.taskId !== t.taskId)); return `Task ${t.taskId} is finished and off the list.`; }
+      let note = '';
+      if (t.driver === 'cloud') {
+        // Take it over: pre.dev's cloud run stops driving this tab (its next call is refused), once any call it
+        // has in flight here has finished, so the two never drive at once.
+        t.driver = 'local';
+        t.takenAt = new Date().toISOString();
+        save(tasks.map(x => (x.taskId === t.taskId ? t : x)));
+        for (let i = 0; i < 60 && (RUNS.inflight.get(t.taskId) || 0) > 0; i++) await sleep(500);
+        const stillBusy = (RUNS.inflight.get(t.taskId) || 0) > 0;
+        const cloudAgent = `handed:${t.taskId}`;
+        const tabNow = tabOf(t);
+        if (tabNow) H.owned.get(cloudAgent)?.delete(tabNow.targetId);
+        // Tell pre.dev, so the cloud run ends now (also while it waits on a card) and the cloud never resumes it.
+        try {
+          let pairing = null;
+          try { pairing = JSON.parse(fs.readFileSync(path.join(core.stateDir || '', 'pairing.json'), 'utf8')); } catch {}
+          let computerId = '';
+          try { computerId = JSON.parse(fs.readFileSync(path.join(core.stateDir || '', 'computer.json'), 'utf8'))?.id || ''; } catch {}
+          const apiUrl = String(pairing?.apiUrl || ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
+          if (ctx.apiKey && computerId) {
+            const res = await fetch(`${apiUrl}/computer-channel/tasks/taken`, {
+              method: 'POST', headers: { Authorization: `Bearer ${ctx.apiKey}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+              body: JSON.stringify({ computerId, taskId: t.taskId }), signal: AbortSignal.timeout(15000),
+            });
+            if (!res.ok) log('handed task: pre.dev did not take the note', res.status);
+          }
+        } catch (error) { log('handed task: could not tell pre.dev', error.message); }
+        note = stillBusy
+          ? "pre.dev's cloud run had a call in flight here; it is refused from now on. Read the page first."
+          : "pre.dev's cloud run of it stopped; you have it now.";
+      }
       // The tab it opened becomes this agent's (it works only in tabs it owns).
-      const info = t.tab ? [...chrome.targets.values()].find(x => isTab(x) && x.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) : null;
+      const info = tabOf(t);
       if (info) ownedBy(agentOf(args)).add(info.targetId);
       const steps = (t.checkpoint?.history || []).map(h => `  ${h.step}. ${h.summary}${h.outcome ? ` (${h.outcome})` : ''}`).join('\n');
       return [
         `Task ${t.taskId}, handed from pre.dev's cloud to finish here (${t.site}).`,
+        note,
         `Instruction: ${t.instruction}`,
         `It stopped at step ${t.checkpoint?.step ?? '?'} on ${t.checkpoint?.url || '?'} (${t.checkpoint?.reason || 'paused'}).`,
         steps ? `Done so far:\n${steps}` : '',
@@ -2033,7 +2194,7 @@ for (const tool of TOOLS) {
   if (!GATED.has(tool.name)) continue;
   const run = tool.run;
   tool.run = async (args = {}, ctx = {}) => {
-    if (args.tab && PRIVATE.size && PRIVATE.has(findTab(args.tab).targetId)) throw new Error(PRIVATE_REFUSAL);
+    if (args.tab && PRIVATE.size && PRIVATE.has(findTab(args.tab).targetId)) throw refused(PRIVATE_REFUSAL, { kind: 'scope' });
     if (handoffOn(args) && args.tab) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);

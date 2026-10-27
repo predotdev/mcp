@@ -553,11 +553,14 @@ const waitsForUser = (name, a) => name === 'chrome_handoff' && a.wait !== false 
 
 /** Where a call comes from, for the hints in tools.mjs. From pre.dev's own CLI (FROM_PREDEV) the user gets a step
  *  through the CLI's own handoff tool, hand_off_to_user, so every refusal and handoff hint names it. Only a pre.dev
- *  web run's channel (channel.mjs) says 'web'; any other caller's __via is dropped. */
+ *  web run's channel (channel.mjs) says 'web'; any other caller's __via is dropped. So is __predev_user_said_go (the
+ *  user's answer on pre.dev's CLI card, which ends a takeover pause) from any agent but that CLI: elsewhere only the
+ *  user's own click in the tab ends it. */
 function withVia(args) {
   const out = { ...args };
   delete out.__via;
   if (FROM_PREDEV) out.__via = 'cli';
+  else delete out.__predev_user_said_go;
   return out;
 }
 
@@ -787,7 +790,7 @@ async function runCall(name, raw) {
       result = ctx.apiKey ? await remote.callTool(ctx, name, args)
         : { content: [{ type: 'text', text: 'pre.dev tools need a free pre.dev account. Sign in with: npx -y @predotdev/mcp login' }], isError: true };
     } else {
-      const callArgs = withCallFlags(args);
+      const callArgs = withVia(withCallFlags(args));
       result = await request(await ensureDaemon(), 'POST', '/call', { name, args: callArgs }, waitsForUser(name, callArgs) ? 0 : 180000);
     }
   } catch (error) {
