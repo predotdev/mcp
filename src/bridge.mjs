@@ -551,6 +551,16 @@ function withCallFlags(args) {
 /** A chrome_handoff that waits for the user (no time limit on it). */
 const waitsForUser = (name, a) => name === 'chrome_handoff' && a.wait !== false && !a.peek && !a.check && !a.release && !a.cancel && !a.resume;
 
+/** Where a call comes from, for the hints in tools.mjs. From pre.dev's own CLI (FROM_PREDEV) the user gets a step
+ *  through the CLI's own handoff tool, hand_off_to_user, so every refusal and handoff hint names it. Only a pre.dev
+ *  web run's channel (channel.mjs) says 'web'; any other caller's __via is dropped. */
+function withVia(args) {
+  const out = { ...args };
+  delete out.__via;
+  if (FROM_PREDEV) out.__via = 'cli';
+  return out;
+}
+
 function runMcp() {
   let lastTab = null;
   let listed = '';
@@ -574,7 +584,7 @@ function runMcp() {
             protocolVersion: message.params?.protocolVersion || '2025-06-18',
             capabilities: { tools: { listChanged: true } },
             serverInfo: { name: 'predev', version: PKG.version || '0.0.0' },
-            instructions: (await loadTools()).instructions(shimCtx()),
+            instructions: (await loadTools()).instructions(FROM_PREDEV ? { ...shimCtx(), via: 'cli' } : shimCtx()),
           });
         case 'tools/list': {
           const ctx = shimCtx();
@@ -593,7 +603,7 @@ function runMcp() {
           const state = await ensureDaemon();
           // A call without a tab means the tab this agent last worked in (an error would cost it a turn).
           // Remembered per agent session, so agents sharing the daemon never borrow each other's tabs.
-          let callArgs = withCallFlags(args);
+          let callArgs = withVia(withCallFlags(args));
           if (!callArgs.tab && lastTab && TAB_TOOLS.has(name) && !callArgs.resume_url) callArgs = { ...callArgs, tab: lastTab };
           const waits = waitsForUser(name, callArgs);
           const result = await request(state, 'POST', '/call', { name, args: callArgs }, waits ? 0 : 180000,
