@@ -1180,15 +1180,20 @@ async function boot() {
   await cutTaskRuns();
   // A new browser session (every window of this Chrome was closed, or it restarted): the tabs of tasks handed here
   // are gone, so a run's next call on one opens it again on the page it was on (web_rules.mjs reopenTab).
+  let reopen = false;
   if (!(await session.get('session', false))) {
     await session.set('session', true);
     const list = await handedTasks.list();
-    if (list.some(t => t.tab)) await handedTasks.save(list.map(t => (t.tab ? { ...t, reopen: true } : t)));
+    reopen = list.some(t => t.tab);
+    if (reopen) await handedTasks.save(list.map(t => (t.tab ? { ...t, reopen: true } : t)));
     await restoreTaskRuns(list);
   }
   paused = !!(await local.get('paused', false));
   devtoolsBlocked = String(await session.get('devtoolsBlocked', ''));
   await sites();
+  // Those tabs open again now (in the background, never focused), not only on the run's next call: a run that comes
+  // back to this Chrome and hands the person a step in "the tab pre.dev opened" finds the tab there.
+  if (reopen) await taskCalls.reopenHanded().catch(error => log(`handed tasks reopen failed: ${error.message}`));
   if (await loadPairing()) { status = 'connecting'; void loop(); }
   ui();
 }

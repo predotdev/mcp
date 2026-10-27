@@ -397,5 +397,21 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     return { accepted: true, ...(tab ? { tab } : {}) };
   }
 
-  return { takeTask, taskCall, taskDriver, handedTask };
+  /** A new browser session (Chrome restarted, or every window of it closed): the tabs of the tasks handed here are
+   *  gone. Each task still marked to reopen opens again now, in the background and never focused, on the page it was
+   *  on, so a card that sends the person to "the tab pre.dev opened in your Chrome" finds that tab there. A tab that
+   *  can't open again (its site no longer allowed here) stays marked, and the run's next call on it is told the tab
+   *  is closed. */
+  async function reopenHanded() {
+    const out = [];
+    for (const t of await tasks.list()) {
+      if (!t.reopen || !t.tab || t.driver !== 'cloud' || tabInfo(t.tab)) continue;
+      const tab = await reopenTab(t, taskAgent(cleanTaskId(t.taskId))).catch(() => '');
+      if (!tab) log(`task ${t.taskId}: its tab could not be opened again`);
+      out.push({ taskId: t.taskId, tab });
+    }
+    return out;
+  }
+
+  return { takeTask, taskCall, taskDriver, handedTask, reopenHanded };
 }
