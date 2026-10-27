@@ -16,6 +16,8 @@
 //     instruction, the page it stopped on and what it did), for Browser Agents Local in this Chrome;
 //   - only the tools a web run needs: no scripts (chrome_eval could read a site's cookies or
 //     storage), no file uploads (files on this computer), no screenshots;
+//   - "Reach through my computer" (network.mjs): a cloud run's connections to the sites this
+//     computer's person chose go out through this computer's network, bytes only;
 //   - nothing else leaves this computer: no cookies, no storage, no files.
 //
 // Unpair (`predev-mcp unpair`) stops all of it at once, here and at pre.dev.
@@ -23,6 +25,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { checkedEntry, createNetwork, networkFiles } from './network.mjs';
 
 /** What a web run may call here (pre.dev's backend has the same list). chrome_handoff is the
  *  handoff itself (bring the tab forward, check, wait, release, take back after the user). */
@@ -129,6 +132,12 @@ export function createChannel(ctx) {
   // ---------------------------------------------------------------- sites a web run may use
 
   const allowedSites = () => readJson(SITES_FILE)?.sites || {};
+  // Cloud runs' connections to the sites this computer's person chose (network.mjs).
+  const network = createNetwork({
+    stateDir, log, allowedSites,
+    send: data => { if (ws?.readyState !== 1) throw new Error('tunnel closed'); ws.send(data); },
+    report: async events => { const p = pairing(); if (p?.apiUrl) await post(p.apiUrl, '/computer-channel/network/use', { computerId: computerId(), events }); },
+  });
   const isAllowed = site => !!site && !!allowedSites()[site];
   function allow(site) {
     const sites = allowedSites();
@@ -144,7 +153,7 @@ export function createChannel(ctx) {
     const keep = new Set(sitesAtPredev.map(String));
     const sites = allowedSites();
     let dropped = 0;
-    for (const site of Object.keys(sites)) if (!keep.has(site)) { delete sites[site]; dropped++; }
+    for (const site of Object.keys(sites)) if (!keep.has(site)) { delete sites[site]; dropped++; network.dropForAllowedSite(site); }
     if (dropped) { writePrivate(SITES_FILE, { sites }); log('channel', `dropped ${dropped} site(s) revoked at pre.dev`); }
   }
 
@@ -173,6 +182,7 @@ export function createChannel(ctx) {
 
   /** The page that asks the person at this computer. Its address carries the one-time secret. */
   function askPage(entry, port) {
+    if (entry.network) return reachPage(entry);
     const site = escapeHtml(entry.site);
     const local = isLocalHost(entry.site);
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -186,6 +196,29 @@ main{max-width:480px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
 <p>It never types passwords, codes or card numbers, and it asks you before it sends, posts, buys or deletes anything.</p>
 ${local ? '<p class="warn">This address is on this computer or your own network. Only allow it if you expect the run to use it.</p>' : ''}
 <p>Only allow sites you expect. You can stop all of it with: npx -y @predotdev/mcp unpair</p>
+<form method="post" action="/allow/${entry.nonce}" class="row">
+<button class="yes" name="decision" value="allow" type="submit">Allow</button>
+<button class="no" name="decision" value="deny" type="submit">Don't allow</button>
+</form></main></body></html>`;
+  }
+
+  /** "Reach through my computer", asked from pre.dev's settings: only the person here says yes. */
+  function reachPage(entry) {
+    const what = escapeHtml(entry.network.site);
+    const scope = entry.network.kind === 'domain' ? `<b>${what}</b> and its subdomains` : `<b>${what}</b>`;
+    const site = escapeHtml(entry.site);
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Let pre.dev cloud runs reach ${what} through this computer?</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0d0d0d;color:#cfd3da;font:15px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif}
+main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p{margin:0 0 12px;color:#9aa3b2}b{color:#fff}
+.row{display:flex;gap:10px;margin-top:20px}button{font:inherit;font-weight:600;border-radius:8px;padding:9px 16px;cursor:pointer;border:1px solid #333}
+.yes{background:#fff;color:#000;border-color:#fff}.no{background:transparent;color:#cfd3da}.warn{color:#f5c26b}</style></head>
+<body><main><h1>Let pre.dev cloud runs reach ${scope} through this computer?</h1>
+<p>Browser Agents runs you start in pre.dev's cloud will open ${scope} through this computer's network, the way your own browser would here: through your VPN or your office network.</p>
+<p>Only the connections go through. For https sites the page stays encrypted between the cloud browser and the site, so neither this computer nor pre.dev can read it. This computer logs each connection (host, bytes, run), never the content.</p>
+<p>Only runs you start yourself use it, never a teammate's, scheduled or loop runs. While this computer is off, those sites don't load in the cloud.</p>
+<p class="warn">Allowing it also lets pre.dev web runs use <b>${site}</b> in this Chrome. Only allow it if you expect the runs to use it.</p>
+<p>Stop any time: npx -y @predotdev/mcp network remove ${what}</p>
 <form method="post" action="/allow/${entry.nonce}" class="row">
 <button class="yes" name="decision" value="allow" type="submit">Allow</button>
 <button class="no" name="decision" value="deny" type="submit">Don't allow</button>
@@ -220,10 +253,11 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
   function decide(entry, allowed) {
     if (entry.decided) return;
     entry.decided = allowed ? 'allow' : 'deny';
-    if (allowed) allow(entry.site);
-    log('channel', `site ${entry.site} ${entry.decided}`);
+    if (allowed && !(entry.network && isAllowed(entry.site))) allow(entry.site);
+    if (allowed && entry.network) network.add(entry.network);
+    log('channel', `${entry.network ? `network site ${entry.network.site}` : `site ${entry.site}`} ${entry.decided}`);
     for (const w of entry.waiters.splice(0)) w(allowed);
-    asking.delete(entry.site);
+    asking.delete(entry.key || entry.site);
     setTimeout(() => {
       byNonce.delete(entry.nonce);
       if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
@@ -233,12 +267,13 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
 
   /** Ask the person at this computer to allow a site for web runs: true once allowed, false when they
    *  said no, 'no_answer' when nobody answered in time (the question closes; the next call asks again). */
-  async function askToAllow(site, port, inFront) {
-    if (isAllowed(site)) return true;
-    let entry = asking.get(site);
+  async function askToAllow(site, port, inFront, reach = null) {
+    if (!reach && isAllowed(site)) return true;
+    const key = reach ? `net:${reach.site}` : site;
+    let entry = asking.get(key);
     if (!entry) {
-      entry = { site, nonce: crypto.randomBytes(24).toString('base64url'), decided: null, waiters: [], targetId: null };
-      asking.set(site, entry);
+      entry = { site, key, ...(reach ? { network: reach } : {}), nonce: crypto.randomBytes(24).toString('base64url'), decided: null, waiters: [], targetId: null };
+      asking.set(key, entry);
       byNonce.set(entry.nonce, entry);
       try {
         await chrome.connect();
@@ -256,7 +291,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
           }
         })();
       } catch (error) {
-        asking.delete(site);
+        asking.delete(key);
         byNonce.delete(entry.nonce);
         throw new Error(`Could not ask on this computer: ${error.message}`);
       }
@@ -268,7 +303,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     // Nobody answered: the question goes away, the next call asks again.
     if (answer === null && !entry.decided) {
       entry.decided = 'timeout';
-      asking.delete(site);
+      asking.delete(key);
       byNonce.delete(entry.nonce);
       if (entry.targetId) chrome.send('Target.closeTarget', { targetId: entry.targetId }).catch(() => {});
       privateTabs.delete(entry.targetId);
@@ -429,7 +464,22 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         const sites = allowedSites();
         const had = !!sites[site];
         if (had) { delete sites[site]; writePrivate(SITES_FILE, { sites }); log('channel', `site ${site} revoked at pre.dev`); }
+        network.dropForAllowedSite(site);
         end({ ok: true, revoked: had });
+      } else if (route === 'POST /network/add') {
+        // "Reach through my computer" from pre.dev's settings: the person here decides.
+        const entry = checkedEntry(body);
+        if (!entry) end({ added: false, error: 'That is not a site this computer can reach for runs.' });
+        else if (network.sites()[entry.site]) end({ added: true, already: true, netKey: network.publicKey() });
+        else {
+          // Nobody answering in time is not a yes.
+          const ok = await askToAllow(entry.allowedSite, port, api.chromeInFront, entry);
+          end(ok === true ? { added: true, netKey: network.publicKey() } : { added: false, error: ok === 'no_answer' ? 'Nobody at that computer answered in time.' : 'The person at that computer did not allow it.' });
+        }
+      } else if (route === 'POST /network/remove') {
+        end({ ok: true, removed: network.remove(String(body?.site || '')) });
+      } else if (route === 'GET /network') {
+        end({ ok: true, sites: network.sites(), recent: network.recent(20) });
       } else if (route === 'POST /tasks/continue') {
         end(await takeTask(body, port, api));
       } else if (route === 'POST /call') {
@@ -453,7 +503,9 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     let grant;
     try {
       // This computer's own allowed list goes along: pre.dev keeps only what is still allowed here.
-      const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId(), sites: Object.keys(allowedSites()) });
+      // So does its list of sites cloud runs reach through it, once it has one (network.mjs).
+      const reach = fs.existsSync(networkFiles(stateDir).sites) ? { network: network.list(), netKey: network.publicKey() } : {};
+      const r = await post(p.apiUrl, '/computer-channel/tunnel', { computerId: computerId(), sites: Object.keys(allowedSites()), ...reach });
       if (r.status === 409) {
         // Unpaired at pre.dev (by `unpair` or from pre.dev's settings): stop, and say so in the log.
         log('channel', 'pre.dev says this computer is no longer paired; stopping');
@@ -466,6 +518,9 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       if (!r.json?.grant?.url) { status = 'offline'; return 'retry'; }
       grant = r.json.grant;
       keepOnly(r.json.sites);
+      // Only a pre.dev with "Reach through my computer" on answers these.
+      if (Array.isArray(r.json.network)) network.keepOnly(r.json.network);
+      network.setLimits(r.json.networkLimits);
     } catch (error) {
       log('channel', 'grant failed', error.message);
       status = 'offline';
@@ -490,6 +545,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         clearTimeout(connectTimer);
         if (ws === socket) ws = null;
         if (status === 'online') status = 'offline';
+        network.closeAll();
         log('channel', 'closed', why);
         try { socket.close(1000, 'reconnect'); } catch {}
         resolve(next);
@@ -510,10 +566,13 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
       };
       socket.onmessage = event => {
         heardAt = Date.now();
-        if (typeof event.data !== 'string') return;
+        // A run connection's bytes (network.mjs); nothing else comes down as binary.
+        if (typeof event.data !== 'string') { network.frame(event.data); return; }
         let m;
         try { m = JSON.parse(event.data); } catch { return; }
         if (m.t === 'req' && Number.isInteger(m.id)) void onRequest(socket, m, port);
+        else if (m.t === 'net-open') void network.open(m).catch(error => log('network', 'open failed', error.message));
+        else if (m.t === 'net-close') network.close(m.id);
         // Unpaired at pre.dev: the edge says so before it closes; ask pre.dev now.
         else if (m.t === 'bye') finish('check-now', `bye ${String(m.why || '').slice(0, 40)}`);
       };
@@ -561,7 +620,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     },
     /** Pairing changed on disk (pair, unpair): follow it. */
     reload(port) {
-      if (!pairing()) { this.stop(); try { fs.rmSync(SITES_FILE, { force: true }); } catch {} return; }
+      if (!pairing()) { this.stop(); try { fs.rmSync(SITES_FILE, { force: true }); fs.rmSync(networkFiles(stateDir).sites, { force: true }); } catch {} return; }
       if (!running) this.start(port);
       else { try { ws?.close(1000, 'reload'); } catch {} wake?.(); }
     },

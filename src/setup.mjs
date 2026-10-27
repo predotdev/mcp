@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computerIdIn, forgetAllowedSite, pairingFiles, readAllowedSites } from './channel.mjs';
+import { checkedEntry, hostFromInput, networkFiles, networkIdentity, readNetworkLog, readNetworkSites, unreachableAddress, writeNetworkSites } from './network.mjs';
 
 const CLIENT_ID = 'predev-chrome-mcp';
 // pre.dev's own servers: the hosted one, this package under either name, or its installed copy.
@@ -617,6 +618,8 @@ export function createSetup(ctx) {
     fs.rmSync(files.pairing, { force: true });
     fs.rmSync(files.sites, { force: true });
     fs.rmSync(files.tasks, { force: true });
+    fs.rmSync(networkFiles(stateDir).sites, { force: true });
+    fs.rmSync(networkFiles(stateDir).key, { force: true });
     // Nothing to stay connected for.
     loginItem('off');
     // The daemon drops the channel now, whatever pre.dev answers.
@@ -753,6 +756,11 @@ ${envXml}  <key>RunAtLoad</key><true/>
     const name = String(site || '').trim().toLowerCase();
     if (!name) { bad('Name the site to revoke, e.g. npx -y @predotdev/mcp sites revoke google.com'); process.exit(1); }
     const had = forgetAllowedSite(stateDir, name);
+    // The sites cloud runs reach through this computer inside it go with it.
+    const reach = readNetworkSites(stateDir);
+    let reachDropped = 0;
+    for (const [s, e] of Object.entries(reach)) if (e?.allowedSite === name) { delete reach[s]; reachDropped++; }
+    if (reachDropped) writeNetworkSites(stateDir, reach);
     const pairing = readPairing();
     const key = String(process.env.PREDEV_API_KEY || readCredentials().apiKey || cliLogin() || '');
     if (pairing?.apiUrl && key) {
@@ -767,5 +775,87 @@ ${envXml}  <key>RunAtLoad</key><true/>
     process.exit(0);
   }
 
-  return { setup, login, logout, uninstall, installApp, pair, unpair, startAtLogin, sites, loginItem };
+  // ------------------------------------------------------------------ reach through this computer
+  // (BROWSER_PROFILES=1 BROWSER_AGENTS_LOCAL_NETWORK=1): cloud Browser Agents runs you start can open
+  // the sites you list here through this computer's network (network.mjs). Running the command here is
+  // the click that allows one.
+
+  const keyNow = () => String(process.env.PREDEV_API_KEY || readCredentials().apiKey || cliLogin() || '');
+  async function callPredev(pairing, route, body) {
+    const res = await fetch(`${pairing.apiUrl.replace(/\/+$/, '')}${route}`, {
+      method: body ? 'POST' : 'GET', signal: AbortSignal.timeout(20000),
+      headers: { Authorization: `Bearer ${keyNow()}`, 'Content-Type': 'application/json', 'x-predev-client': 'predev-mcp' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    }).catch(error => ({ ok: false, status: 0, json: async () => ({ error: error.message }) }));
+    return { status: res.status, ok: res.ok, json: await res.json().catch(() => ({})) };
+  }
+  const fmtBytes = n => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} kB` : `${n} B`);
+
+  async function network(mode = 'list', value = '', ...rest) {
+    const pairing = readPairing();
+    if (mode === 'list' || mode === 'log') {
+      const list = Object.entries(readNetworkSites(stateDir));
+      if (!pairing) console.log('This computer is not paired with pre.dev.');
+      if (mode === 'list') {
+        console.log(list.length
+          ? `pre.dev cloud runs you start reach these through this computer's network:\n${list.map(([s, e]) => `  ${s}${e?.kind === 'domain' ? ' (and its subdomains)' : ''}  (added ${String(e?.addedAt || '').slice(0, 10)})`).join('\n')}\nAdd one: npx -y @predotdev/mcp network add <site>   Remove: npx -y @predotdev/mcp network remove <site>`
+          : 'No sites yet. Add an internal site with: npx -y @predotdev/mcp network add wiki.corp.example.com');
+      }
+      const recent = readNetworkLog(stateDir, mode === 'log' ? 50 : 5);
+      if (recent.length) {
+        console.log(`${mode === 'log' ? 'Connections' : 'Recent connections'} (host, bytes, run; never content):`);
+        for (const e of recent) console.log(`  ${new Date(e.at).toISOString().replace('T', ' ').slice(0, 19)}  ${e.host}:${e.port}  up ${fmtBytes(e.up || 0)} down ${fmtBytes(e.down || 0)}  run ${e.run}  ${e.result}`);
+      }
+      process.exit(0);
+    }
+    if (!pairing) { bad('This computer is not paired. Pair it first: npx -y @predotdev/mcp pair'); process.exit(1); }
+    const host = hostFromInput(value);
+    if (mode === 'remove') {
+      const list = readNetworkSites(stateDir);
+      const name = host || String(value || '').trim().toLowerCase();
+      if (!name) { bad('Name the site to remove, e.g. npx -y @predotdev/mcp network remove wiki.corp.example.com'); process.exit(1); }
+      const had = !!list[name];
+      if (had) { delete list[name]; writeNetworkSites(stateDir, list); }
+      await callPredev(pairing, '/computer-channel/network/remove', { computerId: computerIdIn(stateDir), site: name });
+      if (had) ok(`Removed: pre.dev cloud runs no longer reach ${name} through this computer.`);
+      else skip(`${name} was not on the list.`);
+      process.exit(0);
+    }
+    if (mode !== 'add') { bad(`Unknown: network ${mode}. Use network, network add <site>, network remove <site> or network log.`); process.exit(1); }
+    if (!host) { bad('Name a site or an internal host, e.g. npx -y @predotdev/mcp network add wiki.corp.example.com'); process.exit(1); }
+    if (unreachableAddress(host)) { bad(`${host} is this computer itself (or link-local): runs never reach it this way.`); process.exit(1); }
+    // The site and its allowed site, by pre.dev's one rule (tldts, private suffixes included).
+    const site = await callPredev(pairing, `/computer-channel/site?host=${encodeURIComponent(host)}`);
+    const allowedSite = site.ok && typeof site.json.site === 'string' && host.endsWith(site.json.site) ? site.json.site : host;
+    const kind = allowedSite === host && !/^[0-9.]+$|:/.test(host) ? 'domain' : 'host';
+    const what = kind === 'domain' ? `${host} and its subdomains` : host;
+    console.log(`Let pre.dev cloud runs you start reach ${what} through this computer's network?`);
+    console.log("  Only the connections go through: for https sites the page stays encrypted between pre.dev's cloud browser and the site.");
+    console.log('  This computer logs each connection (host, bytes, run), never the content. Teammates\' runs, scheduled and loop runs never use it.');
+    if (allowedSite !== host || kind === 'host') console.log(`  It also lets pre.dev web runs use ${allowedSite} in this Chrome.`);
+    const yes = rest.includes('--yes') || rest.includes('-y') || await askYesNo('Allow it? [y/N] ', false);
+    if (!yes) { skip('Not added.'); process.exit(0); }
+    // This computer's network key goes along: runs encrypt every connection to it, and only it can answer.
+    const r = await callPredev(pairing, '/computer-channel/network', { computerId: computerIdIn(stateDir), site: host, netKey: networkIdentity(stateDir).pub });
+    if (r.status === 404) { bad('Reaching sites through your computer is not available on your pre.dev account yet.'); process.exit(1); }
+    if (!r.ok) { bad(`pre.dev did not add it: ${r.json.error || `HTTP ${r.status}`}`); process.exit(1); }
+    const entry = checkedEntry({ site: r.json.site || host, kind: r.json.kind || kind, allowedSite: r.json.allowedSite || allowedSite });
+    if (!entry) { bad('pre.dev answered with a site this computer does not accept.'); process.exit(1); }
+    // Typing the command here is the click: allowed here (for its site) and reached through here.
+    const sitesFile = pairingFiles(stateDir).sites;
+    const allowed = readAllowedSites(stateDir);
+    if (!allowed[entry.allowedSite]) {
+      allowed[entry.allowedSite] = { allowedAt: new Date().toISOString() };
+      const tmp = `${sitesFile}.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ sites: allowed }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, sitesFile);
+    }
+    const list = readNetworkSites(stateDir);
+    list[entry.site] = { kind: entry.kind, allowedSite: entry.allowedSite, addedAt: new Date().toISOString() };
+    writeNetworkSites(stateDir, list);
+    ok(`Added: cloud runs you start reach ${entry.kind === 'domain' ? `${entry.site} and its subdomains` : entry.site} through this computer while it is connected to pre.dev.`);
+    process.exit(0);
+  }
+
+  return { setup, login, logout, uninstall, installApp, pair, unpair, startAtLogin, sites, network, loginItem };
 }
