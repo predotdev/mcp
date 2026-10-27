@@ -979,6 +979,19 @@ function keepsSignIn(args, href) {
   const ok = Array.isArray(args.__predev_signout_ok) ? args.__predev_signout_ok.map(siteKey) : [];
   return ok.includes(k) ? '' : k;
 }
+// The site this call may sign the user out of because they asked for it (a kept sign-in that
+// __predev_signout_ok names), or ''.
+function signOutAsked(args, href) {
+  if (!handoffOn(args) || !href || isLocalDev(href)) return '';
+  const k = siteKey(href);
+  if (!k) return '';
+  const named = Array.isArray(args.__predev_signed_in) ? args.__predev_signed_in.map(siteKey) : [];
+  if (!H.signedIn.has(k) && !named.includes(k)) return '';
+  const ok = Array.isArray(args.__predev_signout_ok) ? args.__predev_signout_ok.map(siteKey) : [];
+  return ok.includes(k) ? k : '';
+}
+// Where a call that signed the user out (as they asked) notes the site, so its result can say so.
+const SIGNED_OUT = Symbol('signedOut');
 const hostOf = href => { try { return new URL(String(href)).hostname; } catch { return String(href || ''); } };
 const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the agent keeps that sign-in for the rest of the run: don't log out, switch accounts or re-trigger the sign-in, carry on signed in. If the task needs it, ask the user; they can do it in the tab themselves.`;
 // A click, key or script needs the page to answer the guard's checks first. While a dialog the page
@@ -995,13 +1008,23 @@ async function pageMustAnswer(args, session, info, what) {
 }
 const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
-// user out or open account security? No verdict: allowed.
+// user out or open account security? No verdict (no pre.dev key, or the check failed or timed out):
+// the step never goes through. With handoffs on it goes to the user to decide; otherwise a refusal.
 async function accountRefusal(args, session, action, target, url, ctx) {
-  if (!keepsSignIn(args, url)) return '';
+  const asked = signOutAsked(args, url);
+  if (!asked && !keepsSignIn(args, url)) return '';
   const site = hostOf(url);
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
     `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
-  if (p === null) { log('keep sign-in: no verdict, allowed', target); return ''; }
+  if (asked) { if (p !== null && p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
+  if (p === null) {
+    log('keep sign-in: no verdict, not done', target);
+    const unchecked = `Refused: ${action.toLowerCase()} ${target} on ${site} couldn't be checked (pre.dev's check gave no answer), so the agent doesn't do it: it could sign the user out or open the account's security settings.`;
+    if (!handoffOn(args)) return unchecked;
+    return fromWeb(args)
+      ? `${unchecked} Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"other","summary":"what it does"} and doneCheck {"kind":"url_changes"}; they decide and do it themselves in their Chrome, and the run resumes once it's done.`
+      : `${unchecked} Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"url_changes"}; they decide and do it in the tab themselves, and you carry on after.`;
+  }
   if (p < 0.7) return '';
   return `Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`;
 }
@@ -1032,22 +1055,30 @@ async function pressKeys(session, combos) {
   try { await pressKeysInner(session, combos); } finally { await markActing(session, false); }
 }
 
+const keyCombos = combos => String(combos).trim().split(/\s+/).filter(Boolean);
+// One combo ("Enter", "shift+Tab", "cmd+a"): its key event fields, and whether it activates the
+// focused element (Enter or Space, as a click would) or submits its form (Enter).
+function comboKey(combo) {
+  const parts = combo.split('+');
+  const keyName = parts.pop();
+  let modifiers = 0;
+  for (const part of parts) modifiers |= MODIFIERS[part.toLowerCase()] || 0;
+  let key, code, keyCode, text;
+  const known = KEYS[keyName.toLowerCase()];
+  if (known) [key, code, keyCode, text] = known;
+  else if (keyName.length === 1) {
+    key = modifiers & 8 ? keyName.toUpperCase() : keyName;
+    code = /[a-z]/i.test(keyName) ? `Key${keyName.toUpperCase()}` : /\d/.test(keyName) ? `Digit${keyName}` : '';
+    keyCode = keyName.toUpperCase().charCodeAt(0);
+    text = key;
+  } else throw new Error(`Unknown key "${keyName}".`);
+  if (modifiers & 6) text = undefined; // ctrl/cmd chords produce no text
+  return { keyName, key, code, keyCode, text, modifiers, activates: code === 'Enter' || code === 'Space', submits: code === 'Enter' };
+}
+
 async function pressKeysInner(session, combos) {
-  for (const combo of String(combos).trim().split(/\s+/)) {
-    const parts = combo.split('+');
-    const keyName = parts.pop();
-    let modifiers = 0;
-    for (const part of parts) modifiers |= MODIFIERS[part.toLowerCase()] || 0;
-    let key, code, keyCode, text;
-    const known = KEYS[keyName.toLowerCase()];
-    if (known) [key, code, keyCode, text] = known;
-    else if (keyName.length === 1) {
-      key = modifiers & 8 ? keyName.toUpperCase() : keyName;
-      code = /[a-z]/i.test(keyName) ? `Key${keyName.toUpperCase()}` : /\d/.test(keyName) ? `Digit${keyName}` : '';
-      keyCode = keyName.toUpperCase().charCodeAt(0);
-      text = key;
-    } else throw new Error(`Unknown key "${keyName}".`);
-    if (modifiers & 6) text = undefined; // ctrl/cmd chords produce no text
+  for (const combo of keyCombos(combos)) {
+    const { keyName, key, code, keyCode, text, modifiers } = comboKey(combo);
     const command = modifiers & 4 ? MAC_COMMANDS[keyName.toLowerCase()] : undefined;
     const base = { key, code, windowsVirtualKeyCode: keyCode, modifiers };
     await chrome.send('Input.dispatchKeyEvent', {
@@ -1444,7 +1475,7 @@ const TOOLS = [
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
-      if (handoffOn(args) && x !== undefined && y !== undefined && keepsSignIn(args, before[0])) {
+      if (handoffOn(args) && x !== undefined && y !== undefined && (keepsSignIn(args, before[0]) || signOutAsked(args, before[0]))) {
         // A click by position: the control under that point.
         const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
         if (f && !f.error) {
@@ -1569,23 +1600,34 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
       const before = await docState(session, info.url);
-      if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
-        // Enter (or Space) on a focused link or button activates it, like a click.
-        const facts = await inPage(session, 'activeFacts()').catch(() => null);
-        if (facts && !facts.error) {
-          const keep = await accountRefusal(rest, session, 'Pressing Enter on', `${facts.desc}${linkTarget(facts)}`, before[0], ctx);
-          if (keep) throw new Error(keep);
-        }
-      }
-      if (handoffOn(rest) && /(^|\s|\+)(enter|return)(\s|$)/i.test(String(keys))) {
-        const facts = await inPage(session, 'activeFacts()').catch(() => null);
-        if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
-          const ask = await approvalRefusal(rest, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
-          if (ask) throw new Error(ask);
-        }
-      }
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
-      await pressKeys(session, keys);
+      // One key at a time: Tab, shift+Tab or an arrow key can move the focus, so each Enter or Space
+      // is checked on the element focused when it fires (it activates that element, like a click).
+      const withTab = { ...rest, tab }; // so a refusal that hands the step over names this tab
+      for (const combo of keyCombos(keys)) {
+        const k = comboKey(combo);
+        if (handoffOn(rest) && k.activates) {
+          const { submits } = k;
+          // An earlier key may have opened a dialog: then this one would wait in Chrome, past the checks.
+          await pageMustAnswer(rest, session, info, `pressing ${combo}`);
+          const url = (await docState(session, before[0]))[0] || before[0];
+          if (keepsSignIn(rest, url) || signOutAsked(rest, url)) {
+            const facts = await inPage(session, 'activeFacts()').catch(() => null);
+            if (facts && !facts.error) {
+              const keep = await accountRefusal(withTab, session, `Pressing ${k.code} on`, `${facts.desc}${linkTarget(facts)}`, url, ctx);
+              if (keep) throw new Error(keep);
+            }
+          }
+          if (submits) {
+            const facts = await inPage(session, 'activeFacts()').catch(() => null);
+            if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
+              const ask = await approvalRefusal(withTab, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, url, ctx);
+              if (ask) throw new Error(ask);
+            }
+          }
+        }
+        await pressKeys(session, combo);
+      }
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw new Error(dialogRefusal(rest));
       await settle(session, before);
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
@@ -2040,6 +2082,22 @@ for (const tool of TOOLS) {
       await handoffGate(tool.name, args, info, session);
     }
     return run.call(tool, args, ctx);
+  };
+}
+
+// A sign-out the user asked for (rule 3 let it through) that went through: the agent no longer
+// keeps that sign-in, and the result says so in signedOut, so the caller can note it too.
+for (const tool of TOOLS) {
+  if (!['chrome_open', 'chrome_navigate', 'chrome_click', 'chrome_press', 'chrome_act'].includes(tool.name)) continue;
+  const run = tool.run;
+  tool.run = async (args = {}, ctx = {}) => {
+    if (ctx[SIGNED_OUT]) return run.call(tool, args, ctx);
+    const note = {};
+    const result = await run.call(tool, args, { ...ctx, [SIGNED_OUT]: note });
+    if (!note.host) return result;
+    H.signedIn.delete(siteKey(note.host));
+    const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : result;
+    return out?.isError ? out : { ...out, signedOut: { site: note.host } };
   };
 }
 
