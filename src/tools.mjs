@@ -1010,16 +1010,20 @@ const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the pa
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict (no pre.dev key, or the check failed or timed out):
 // the step never goes through. With handoffs on it goes to the user to decide; otherwise a refusal.
+// With no pre.dev key the check returns at once (nothing to ask), and the refusal says how to set a key.
 async function accountRefusal(args, session, action, target, url, ctx) {
   const asked = signOutAsked(args, url);
   if (!asked && !keepsSignIn(args, url)) return '';
   const site = hostOf(url);
+  const keyless = !ctx?.apiKey;
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
     `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
   if (asked) { if (p !== null && p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
   if (p === null) {
-    log('keep sign-in: no verdict, not done', target);
-    const unchecked = `Refused: ${action.toLowerCase()} ${target} on ${site} couldn't be checked (pre.dev's check gave no answer), so the agent doesn't do it: it could sign the user out or open the account's security settings.`;
+    log(keyless ? 'keep sign-in: no pre.dev key, not done' : 'keep sign-in: no verdict, not done', target);
+    const unchecked = keyless
+      ? `Refused: pre.dev can't check ${action.toLowerCase()} ${target} on ${site} because no pre.dev key is set, so the agent doesn't do it: it could sign the user out or open the account's security settings. To set a key, sign in by running \`npx -y @predotdev/mcp login\` in a terminal: it opens pre.dev in the browser and saves the key for every agent, no restart needed.`
+      : `Refused: ${action.toLowerCase()} ${target} on ${site} couldn't be checked (pre.dev's check gave no answer), so the agent doesn't do it: it could sign the user out or open the account's security settings.`;
     if (!handoffOn(args)) return unchecked;
     return fromWeb(args)
       ? `${unchecked} Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"other","summary":"what it does"} and doneCheck {"kind":"url_changes"}; they decide and do it themselves in their Chrome, and the run resumes once it's done.`
