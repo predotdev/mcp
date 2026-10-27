@@ -836,8 +836,12 @@ const APPROVED = chrome.__predevApproved || (chrome.__predevApproved = new Map()
 // A call from a pre.dev web run (the computer channel, channel.mjs): the user hands a step back
 // through the run's own handoff tool, hand_off_to_user, not chrome_handoff.
 const fromWeb = args => args?.__via === 'web';
+// A call from pre.dev's own CLI (bridge.mjs, PREDEV_MCP_FROM_PREDEV=1): the same, through the CLI's
+// hand_off_to_user, which shows the user one card and one notification.
+const fromCli = args => args?.__via === 'cli';
+const toHandOff = args => fromWeb(args) || fromCli(args);
 function handTo(args, reason, extra = '') {
-  return fromWeb(args)
+  return toHandOff(args)
     ? `call hand_off_to_user with tab "${String(args?.tab || '')}" and reason "${reason}"${extra}; the run resumes once they finish`
     : `call chrome_handoff with this tab and reason "${reason}"${extra}; it waits until they finish`;
 }
@@ -1242,12 +1246,12 @@ async function pageState(session) {
 
 // A chrome_eval script, run so that while it runs it can't write a password, one-time code or
 // card field (structure: input type or autocomplete token), click, or submit a form.
-function guardedEval(js) {
+function guardedEval(js, args = {}) {
   return `(async () => {
   const SECRET = new Set(['current-password','new-password','one-time-code','cc-name','cc-number','cc-csc','cc-exp','cc-exp-month','cc-exp-year','cc-type','cc-given-name','cc-family-name','cc-additional-name']);
   const isSecret = el => !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (String(el.type || '').toLowerCase() === 'password' || String(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/).some(t => SECRET.has(t)));
   const refuse = what => { throw new Error('Refused by pre.dev: ' + what); };
-  const secretWhy = 'scripts never write passwords, one-time codes or card details; hand the step to the user with chrome_handoff.';
+  const secretWhy = 'scripts never write passwords, one-time codes or card details; hand the step to the user with ${toHandOff(args) ? 'hand_off_to_user and this tab' : 'chrome_handoff'}.';
   const clickWhy = "in the user's Chrome, clicks and submits go through chrome_click (it asks the user first where it must), not scripts.";
   const restore = [];
   const patch = (obj, key, make) => { const d = Object.getOwnPropertyDescriptor(obj, key); if (!d) return; Object.defineProperty(obj, key, make(d)); restore.push(() => Object.defineProperty(obj, key, d)); };
@@ -1763,7 +1767,7 @@ const TOOLS = [
         if (!answers) throw refused(pageBusy(hostOf(info.url), 'this script'), { kind: 'page_busy' });
         // Never a script write to a password, one-time code or card field; and in the user's own
         // Chrome a click or submit goes through chrome_click, which asks first when it must.
-        if (!isLocalDev(href)) expression = guardedEval(js);
+        if (!isLocalDev(href)) expression = guardedEval(js, rest);
       }
       const value = await evaluate(session, expression, 30000);
       const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
@@ -2111,6 +2115,8 @@ function instructions(ctx = {}) {
     ctx.apiKey ? '' : `chrome_act, plain-words waits${ctx.cloud === false ? '' : " and pre.dev's cloud tools (cloud browser agents, specs, plans)"} need a free pre.dev account, which is not signed in yet; if the user wants them, run \`npx -y @predotdev/mcp login\` in a terminal (it opens pre.dev in their browser; no restart needed).`,
     ctx.via === 'web'
       ? "These tools reach the user's own Chrome on their computer, signed in as them, from this web run: use them for sites that need the user's own logins. The first time this run uses a site there, the user is asked on that computer to allow it, and the call waits for them. Always pick the profile deliberately. Never enter passwords, one-time codes, payment or government ID details, and never click send, post, buy or delete yourself when a tool says to ask first: hand that step to the user with hand_off_to_user and the tab. Work only in tabs you open with chrome_open."
+      : ctx.handoff && ctx.via === 'cli'
+      ? 'Always pick the profile deliberately. Never enter passwords, one-time codes, payment or government ID details, and never click send, post, buy or delete yourself when a tool says to ask first: hand that step to the user with hand_off_to_user and the tab, which shows them a card and a notification, and the run resumes once they are done. Work only in tabs you open with chrome_open.'
       : ctx.handoff
       ? 'Always pick the profile deliberately. Never enter passwords, one-time codes, payment or government ID details, and never click send, post, buy or delete yourself when a tool says to ask first: hand that step to the user with chrome_handoff, which waits until they are done. Work only in tabs you open with chrome_open.'
       : 'Always pick the profile deliberately. Never enter passwords, payment or government ID details; ask the user to.',
