@@ -990,15 +990,22 @@ async function pageMustAnswer(args, session, info, what) {
 }
 const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
-// user out or open account security? No verdict: allowed.
+// user out or open account security? No verdict (no pre.dev key, or the check failed or timed out):
+// the step never goes through. With handoffs on it goes to the user to decide; otherwise a refusal.
 async function accountRefusal(args, session, action, target, url, ctx) {
   const asked = signOutAsked(args, url);
   if (!asked && !keepsSignIn(args, url)) return '';
   const site = hostOf(url);
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
     `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
-  if (p === null) { log('keep sign-in: no verdict, allowed', target); return ''; }
-  if (asked) { if (p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
+  if (asked) { if (p !== null && p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
+  if (p === null) {
+    log('keep sign-in: no verdict, not done', target);
+    const unchecked = `Refused: ${action.toLowerCase()} ${target} on ${site} couldn't be checked (pre.dev's check gave no answer), so the agent doesn't do it: it could sign the user out or open the account's security settings.`;
+    return handoffOn(args)
+      ? `${unchecked} Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"url_changes"}; they decide and do it in the tab themselves, and you carry on after.`
+      : unchecked;
+  }
   if (p < 0.7) return '';
   return `Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`;
 }
