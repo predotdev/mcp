@@ -824,24 +824,26 @@ ${envXml}  <key>RunAtLoad</key><true/>
     if (mode !== 'add') { bad(`Unknown: network ${mode}. Use network, network add <site>, network remove <site> or network log.`); process.exit(1); }
     if (!host) { bad('Name a site or an internal host, e.g. npx -y @predotdev/mcp network add wiki.corp.example.com'); process.exit(1); }
     if (unreachableAddress(host)) { bad(`${host} is this computer itself (or link-local): runs never reach it this way.`); process.exit(1); }
-    // The site and its allowed site, by pre.dev's one rule (tldts, private suffixes included).
+    // A registrable site (by pre.dev's one rule: tldts, private suffixes included) goes with its
+    // subdomains; any other host or an IP is that host alone. Either way this computer allows exactly
+    // what was typed for web runs too, never a wider site it belongs to.
     const site = await callPredev(pairing, `/computer-channel/site?host=${encodeURIComponent(host)}`);
-    const allowedSite = site.ok && typeof site.json.site === 'string' && host.endsWith(site.json.site) ? site.json.site : host;
-    const kind = allowedSite === host && !/^[0-9.]+$|:/.test(host) ? 'domain' : 'host';
+    const registrable = site.ok && typeof site.json.site === 'string' && host.endsWith(site.json.site) ? site.json.site : host;
+    const kind = registrable === host && !/^[0-9.]+$|:/.test(host) ? 'domain' : 'host';
     const what = kind === 'domain' ? `${host} and its subdomains` : host;
     console.log(`Let pre.dev cloud runs you start reach ${what} through this computer's network?`);
     console.log("  Only the connections go through: for https sites the page stays encrypted between pre.dev's cloud browser and the site.");
     console.log('  This computer logs each connection (host, bytes, run), never the content. Teammates\' runs, scheduled and loop runs never use it.');
-    if (allowedSite !== host || kind === 'host') console.log(`  It also lets pre.dev web runs use ${allowedSite} in this Chrome.`);
+    console.log(`  It also lets pre.dev web runs use ${what} in this Chrome.`);
     const yes = rest.includes('--yes') || rest.includes('-y') || await askYesNo('Allow it? [y/N] ', false);
     if (!yes) { skip('Not added.'); process.exit(0); }
     // This computer's network key goes along: runs encrypt every connection to it, and only it can answer.
     const r = await callPredev(pairing, '/computer-channel/network', { computerId: computerIdIn(stateDir), site: host, netKey: networkIdentity(stateDir).pub });
     if (r.status === 404) { bad('Reaching sites through your computer is not available on your pre.dev account yet.'); process.exit(1); }
     if (!r.ok) { bad(`pre.dev did not add it: ${r.json.error || `HTTP ${r.status}`}`); process.exit(1); }
-    const entry = checkedEntry({ site: r.json.site || host, kind: r.json.kind || kind, allowedSite: r.json.allowedSite || allowedSite });
+    const entry = checkedEntry({ site: r.json.site || host, kind: r.json.kind || kind, allowedSite: r.json.site || host });
     if (!entry) { bad('pre.dev answered with a site this computer does not accept.'); process.exit(1); }
-    // Typing the command here is the click: allowed here (for its site) and reached through here.
+    // Typing the command here is the click: allowed here (exactly that site or host) and reached through here.
     const sitesFile = pairingFiles(stateDir).sites;
     const allowed = readAllowedSites(stateDir);
     if (!allowed[entry.allowedSite]) {

@@ -138,7 +138,12 @@ export function createChannel(ctx) {
     send: data => { if (ws?.readyState !== 1) throw new Error('tunnel closed'); ws.send(data); },
     report: async events => { const p = pairing(); if (p?.apiUrl) await post(p.apiUrl, '/computer-channel/network/use', { computerId: computerId(), events }); },
   });
-  const isAllowed = site => !!site && !!allowedSites()[site];
+  // A site (and its subdomains), or one exact host that `network add` allowed (wiki.corp.example.com):
+  // that host alone, never the site it belongs to.
+  const isAllowed = (site, host = '') => {
+    const sites = allowedSites();
+    return !!site && (!!sites[site] || (!!host && !!sites[host]));
+  };
   function allow(site) {
     const sites = allowedSites();
     sites[site] = { allowedAt: new Date().toISOString() };
@@ -351,12 +356,16 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
       if (!host) return text('Web runs can open only http and https pages in the user\'s Chrome.');
       // pre.dev computed the target's site with the call (the same rule); only what matches this host counts.
       const given = typeof body?.site === 'string' && body.site && host.endsWith(body.site) ? body.site : '';
-      wanted.push(given || await siteFor(host));
+      wanted.push([given || await siteFor(host), host]);
     }
     const info = args.tab ? tabInfo(args.tab) : null;
-    if (info) { const here = await siteFor(hostOf(info.url)); if (here && !wanted.includes(here)) wanted.push(here); }
-    for (const site of wanted) {
-      if (isAllowed(site)) continue;
+    if (info) {
+      const host = hostOf(info.url);
+      const here = await siteFor(host);
+      if (here && !wanted.some(([s, h]) => s === here && h === host)) wanted.push([here, host]);
+    }
+    for (const [site, host] of wanted) {
+      if (isAllowed(site, host)) continue;
       const ok = await askToAllow(site, port, api.chromeInFront);
       if (ok === 'no_answer') return noAnswer(site);
       if (ok !== true) return notAllowed(site);
@@ -369,8 +378,9 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
       const shown = (result?.content || []).find(c => c.type === 'text')?.text || '';
       const tab = /^Tab ([0-9A-F]{6,}) ·/m.exec(shown)?.[1] || args.tab;
       const now = tab ? tabInfo(tab) : null;
-      const site = now ? await siteFor(hostOf(now.url)) : '';
-      if (site && !isAllowed(site)) {
+      const host = now ? hostOf(now.url) : '';
+      const site = host ? await siteFor(host) : '';
+      if (site && !isAllowed(site, host)) {
         return text(`Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. The next call on this tab asks the user to allow ${site} on their computer.`, false);
       }
     }
@@ -406,7 +416,7 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
     const host = hostOf(url);
     if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
     const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
-    const ok = isAllowed(site) || await askToAllow(site, port, api.chromeInFront);
+    const ok = isAllowed(site, host) || await askToAllow(site, port, api.chromeInFront);
     if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
     if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
     const tasks = (readJson(TASKS_FILE)?.tasks || []).filter(t => t.taskId !== taskId);
@@ -467,8 +477,9 @@ main{max-width:500px;padding:28px}h1{font-size:18px;color:#fff;margin:0 0 10px}p
         network.dropForAllowedSite(site);
         end({ ok: true, revoked: had });
       } else if (route === 'POST /network/add') {
-        // "Reach through my computer" from pre.dev's settings: the person here decides.
-        const entry = checkedEntry(body);
+        // "Reach through my computer" from pre.dev's settings: the person here decides. Allowing it
+        // allows exactly that site or host here, whatever wider site pre.dev names.
+        const entry = checkedEntry({ ...body, allowedSite: body?.site });
         if (!entry) end({ added: false, error: 'That is not a site this computer can reach for runs.' });
         else if (network.sites()[entry.site]) end({ added: true, already: true, netKey: network.publicKey() });
         else {
