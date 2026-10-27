@@ -961,6 +961,19 @@ function keepsSignIn(args, href) {
   const ok = Array.isArray(args.__predev_signout_ok) ? args.__predev_signout_ok.map(siteKey) : [];
   return ok.includes(k) ? '' : k;
 }
+// The site this call may sign the user out of because they asked for it (a kept sign-in that
+// __predev_signout_ok names), or ''.
+function signOutAsked(args, href) {
+  if (!handoffOn(args) || !href || isLocalDev(href)) return '';
+  const k = siteKey(href);
+  if (!k) return '';
+  const named = Array.isArray(args.__predev_signed_in) ? args.__predev_signed_in.map(siteKey) : [];
+  if (!H.signedIn.has(k) && !named.includes(k)) return '';
+  const ok = Array.isArray(args.__predev_signout_ok) ? args.__predev_signout_ok.map(siteKey) : [];
+  return ok.includes(k) ? k : '';
+}
+// Where a call that signed the user out (as they asked) notes the site, so its result can say so.
+const SIGNED_OUT = Symbol('signedOut');
 const hostOf = href => { try { return new URL(String(href)).hostname; } catch { return String(href || ''); } };
 const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the agent keeps that sign-in for the rest of the run: don't log out, switch accounts or re-trigger the sign-in, carry on signed in. If the task needs it, ask the user; they can do it in the tab themselves.`;
 // A click, key or script needs the page to answer the guard's checks first. While a dialog the page
@@ -979,11 +992,13 @@ const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the pa
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict: allowed.
 async function accountRefusal(args, session, action, target, url, ctx) {
-  if (!keepsSignIn(args, url)) return '';
+  const asked = signOutAsked(args, url);
+  if (!asked && !keepsSignIn(args, url)) return '';
   const site = hostOf(url);
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
     `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
   if (p === null) { log('keep sign-in: no verdict, allowed', target); return ''; }
+  if (asked) { if (p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
   if (p < 0.7) return '';
   return `Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`;
 }
@@ -1425,7 +1440,7 @@ const TOOLS = [
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
-      if (handoffOn(args) && x !== undefined && y !== undefined && keepsSignIn(args, before[0])) {
+      if (handoffOn(args) && x !== undefined && y !== undefined && (keepsSignIn(args, before[0]) || signOutAsked(args, before[0]))) {
         // A click by position: the control under that point.
         const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
         if (f && !f.error) {
@@ -1550,7 +1565,7 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
       const before = await docState(session, info.url);
-      if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && keepsSignIn(rest, before[0])) {
+      if (handoffOn(rest) && /(^|\s|\+)(enter|return|space)(\s|$)/i.test(String(keys)) && (keepsSignIn(rest, before[0]) || signOutAsked(rest, before[0]))) {
         // Enter (or Space) on a focused link or button activates it, like a click.
         const facts = await inPage(session, 'activeFacts()').catch(() => null);
         if (facts && !facts.error) {
@@ -1983,6 +1998,22 @@ for (const tool of TOOLS) {
       await handoffGate(tool.name, args, info, session);
     }
     return run.call(tool, args, ctx);
+  };
+}
+
+// A sign-out the user asked for (rule 3 let it through) that went through: the agent no longer
+// keeps that sign-in, and the result says so in signedOut, so the caller can note it too.
+for (const tool of TOOLS) {
+  if (!['chrome_open', 'chrome_navigate', 'chrome_click', 'chrome_press', 'chrome_act'].includes(tool.name)) continue;
+  const run = tool.run;
+  tool.run = async (args = {}, ctx = {}) => {
+    if (ctx[SIGNED_OUT]) return run.call(tool, args, ctx);
+    const note = {};
+    const result = await run.call(tool, args, { ...ctx, [SIGNED_OUT]: note });
+    if (!note.host) return result;
+    H.signedIn.delete(siteKey(note.host));
+    const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : result;
+    return out?.isError ? out : { ...out, signedOut: { site: note.host } };
   };
 }
 
