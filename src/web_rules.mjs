@@ -200,7 +200,7 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     // A ping says whether the task's tab is busy: { type } of a dialog open there that only the person may close
     // ('no_answer' when the page doesn't answer, with no dialog), or null. The run's card waits on it.
     if (name === 'ping') {
-      reopenForRun(t);
+      await reopenForRun(t);
       return { ...text('ok', false), busy: await busyOf(t.tab).catch(() => null) };
     }
     const agent = taskAgent(taskId);
@@ -339,16 +339,20 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
    *  browser session opens again now, in the background and never focused, and not only on the run's next call that
    *  names it: a card that sends the person to "the tab pre.dev opened in your Chrome" finds that tab there. A task
    *  whose run ended (finished, stopped, expired, or went offline while this Chrome was away) never pings, so its tab
-   *  never opens again. One try per task from pings; a tab that can't open stays marked, and the run's next call on
-   *  it is told the tab is closed. */
+   *  never opens again. The ping answers once the tab is open (at most PING_REOPEN_MS), so a card the run opens next
+   *  never shows before its tab. One try per task from pings; a tab that can't open stays marked, and the run's next
+   *  call on it is told the tab is closed. */
   const pingTried = new Set();
+  const PING_REOPEN_MS = 5000;
   function reopenForRun(t) {
-    if (!t.reopen || !t.tab || pingTried.has(t.taskId)) return;
+    if (!t.reopen || !t.tab || pingTried.has(t.taskId)) return null;
     pingTried.add(t.taskId);
-    void (async () => {
+    const open = (async () => {
       await refresh().catch(() => {});
       if (!tabInfo(t.tab)) await reopenTab(t, taskAgent(t.taskId));
     })().catch(() => {});
+    let timer;
+    return Promise.race([open, new Promise(resolve => { timer = setTimeout(resolve, PING_REOPEN_MS); })]).finally(() => clearTimeout(timer));
   }
 
   async function openTabAgain(t, agent) {
