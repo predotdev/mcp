@@ -177,10 +177,11 @@ export const taskAgent = taskId => `handed:${taskId}`;
  *   approved, inflight       the guard's one-approved-control map, and calls in flight per task
  *   refresh()                makes the tab list current before a kept tab is looked up
  *   log(text)
+ *   onReopen(taskId, tab)    a task's tab was opened again after a new browser session (tab '' when it could not be)
  *   cloudOnly                true when nothing on this computer can take a task over (the extension): it keeps
  *                            only the task's id, site and tab, never its instruction or progress
  */
-export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, cloudOnly = false, busyOf = async () => null }) {
+export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, onReopen = () => {}, cloudOnly = false, busyOf = async () => null }) {
   const handedTask = async taskId => (await tasks.list()).find(t => t.taskId === taskId) || null;
 
   /** One call from pre.dev's cloud run of a task handed here. It drives only the tabs it opened for that task
@@ -198,7 +199,10 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
     // A ping says whether the task's tab is busy: { type } of a dialog open there that only the person may close
     // ('no_answer' when the page doesn't answer, with no dialog), or null. The run's card waits on it.
-    if (name === 'ping') return { ...text('ok', false), busy: await busyOf(t.tab).catch(() => null) };
+    if (name === 'ping') {
+      reopenForRun(t);
+      return { ...text('ok', false), busy: await busyOf(t.tab).catch(() => null) };
+    }
     const agent = taskAgent(taskId);
     const args = callArgs(body);
     args.__agent = agent;
@@ -310,8 +314,44 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
 
   /** The extension, after every window of this Chrome closed or Chrome restarted (it marks the task `reopen`): the
    *  task's tab is gone, so it opens again on the page it was on, once, if that site is still allowed. The run's old
-   *  name for the tab keeps working. Returns the new tab, or ''. */
-  async function reopenTab(t, agent) {
+   *  name for the tab keeps working. One open per task at a time: a call that comes while its ping's open is under
+   *  way gets the same tab. Returns the new tab, or ''. */
+  const reopening = new Map(); // taskId -> the open under way
+  function reopenTab(t, agent) {
+    let open = reopening.get(t.taskId);
+    if (!open) {
+      open = openTabAgain(t, agent).catch(error => { log(`handed task reopen failed: ${error.message}`); return ''; })
+        .then(tab => { onReopen(t.taskId, tab); return tab; })
+        .finally(() => reopening.delete(t.taskId));
+      reopening.set(t.taskId, open);
+    }
+    return open.then(async tab => {
+      // Opened by another call of this task: this copy of it catches up from the list.
+      if (tab && t.tab !== tab) {
+        const now = (await tasks.list()).find(x => x.taskId === t.taskId);
+        if (now) Object.assign(t, { tab: now.tab, was: now.was, reopen: !!now.reopen, wallCheck: !!now.wallCheck });
+      }
+      return tab;
+    });
+  }
+
+  /** Only a run that goes on calls or pings this Chrome. So the tab of a task whose run reaches it again after a new
+   *  browser session opens again now, in the background and never focused, and not only on the run's next call that
+   *  names it: a card that sends the person to "the tab pre.dev opened in your Chrome" finds that tab there. A task
+   *  whose run ended (finished, stopped, expired, or went offline while this Chrome was away) never pings, so its tab
+   *  never opens again. One try per task from pings; a tab that can't open stays marked, and the run's next call on
+   *  it is told the tab is closed. */
+  const pingTried = new Set();
+  function reopenForRun(t) {
+    if (!t.reopen || !t.tab || pingTried.has(t.taskId)) return;
+    pingTried.add(t.taskId);
+    void (async () => {
+      await refresh().catch(() => {});
+      if (!tabInfo(t.tab)) await reopenTab(t, taskAgent(t.taskId));
+    })().catch(() => {});
+  }
+
+  async function openTabAgain(t, agent) {
     const page = pageOf(t.page || '');
     const site = page ? await siteFor(hostOf(page)) : '';
     if (!site || !isAllowed(site)) return '';
@@ -397,21 +437,5 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     return { accepted: true, ...(tab ? { tab } : {}) };
   }
 
-  /** A new browser session (Chrome restarted, or every window of it closed): the tabs of the tasks handed here are
-   *  gone. Each task still marked to reopen opens again now, in the background and never focused, on the page it was
-   *  on, so a card that sends the person to "the tab pre.dev opened in your Chrome" finds that tab there. A tab that
-   *  can't open again (its site no longer allowed here) stays marked, and the run's next call on it is told the tab
-   *  is closed. */
-  async function reopenHanded() {
-    const out = [];
-    for (const t of await tasks.list()) {
-      if (!t.reopen || !t.tab || t.driver !== 'cloud' || tabInfo(t.tab)) continue;
-      const tab = await reopenTab(t, taskAgent(cleanTaskId(t.taskId))).catch(() => '');
-      if (!tab) log(`task ${t.taskId}: its tab could not be opened again`);
-      out.push({ taskId: t.taskId, tab });
-    }
-    return out;
-  }
-
-  return { takeTask, taskCall, taskDriver, handedTask, reopenHanded };
+  return { takeTask, taskCall, taskDriver, handedTask };
 }

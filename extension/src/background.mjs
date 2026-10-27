@@ -653,6 +653,7 @@ const taskCalls = createTaskCalls({
   inflight: taskInflight,
   refresh: () => conn.refresh(),
   log: line => log(line),
+  onReopen: (taskId, tab) => void note({ kind: 'control', run: `task:${taskId}`, text: tab ? "Opened the task's tab again after Chrome restarted" : "Could not open the task's tab again after Chrome restarted" }),
   cloudOnly: true,
   busyOf: tab => api.busyOf(tab),
 });
@@ -991,7 +992,6 @@ async function connectOnce() {
       clearTimeout(connectTimer);
       log('connected');
       ui();
-      void reopenHandedTabs();
       pingTimer = setInterval(() => {
         if (Date.now() - heardAt > 2.5 * PING_MS) return finish('retry-now', 'no answer from pre.dev');
         try { socket.send('{"t":"ping"}'); } catch {}
@@ -1176,29 +1176,12 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
 
 // ---------------------------------------------------------------- start, and stay up
 
-/** The handed tasks' tabs marked to reopen (a new browser session) and gone open again whenever this Chrome comes
- *  online (in the background, never focused), not only on the run's next call, so a run that comes back here and hands the
- *  person a step in "the tab pre.dev opened" finds that tab there. */
-let reopenPending = false; // a reopen pass is running
-async function reopenHandedTabs() {
-  // Every time this Chrome comes online (the handed-task list is this account's, so it is read only once paired).
-  if (reopenPending) return;
-  reopenPending = true;
-  try {
-    // The allowed sites are this account's: read them again now that the pairing is loaded.
-    await sites().catch(() => {});
-    await conn.refresh().catch(() => {});
-    const done = await taskCalls.reopenHanded();
-    for (const d of done) void note({ kind: 'control', run: `task:${d.taskId}`, text: d.tab ? 'Opened the task\'s tab again after Chrome restarted' : 'Could not open the task\'s tab again after Chrome restarted' });
-  } catch (error) { void note({ kind: 'control', text: `Could not open handed tasks' tabs again: ${String(error.message).slice(0, 120)}` }); }
-  finally { reopenPending = false; }
-}
-
 async function boot() {
   // Away until now (the service worker was not running): a handed task's run here may have stopped meanwhile.
   await cutTaskRuns();
   // A new browser session (every window of this Chrome was closed, or it restarted): the tabs of tasks handed here
-  // are gone, so a run's next call on one opens it again on the page it was on (web_rules.mjs reopenTab).
+  // are gone, so a run's next ping or call on one opens it again on the page it was on (web_rules.mjs reopenTab).
+  // Only a run that goes on pings: the tab of a task whose run ended never opens again.
   if (!(await session.get('session', false))) {
     await session.set('session', true);
     const list = await handedTasks.list();
