@@ -1765,6 +1765,15 @@ async function chromeInFront() {
 }
 
 const handoffLines = (status, info, url, extra = '') => `status: ${status}\n${url ? `url: ${url}\n` : ''}${info ? `tab: ${tabId(info)}\n` : ''}${extra}`;
+// The result itself says what to do, for every client (not only the tool description).
+const TAB_CLOSED_NOTE = 'The user closed the handoff\'s tab. Ask them in a short message what they\'d like to do. Don\'t reopen the page or hand it to them again on your own.';
+// A tab gone from the list is closed only once Chrome is still here a moment later: quitting Chrome can
+// drop its tabs just before the connection itself (that is chrome_gone, never tab_closed).
+async function tabClosed(id) {
+  if (chrome.targets.has(id)) return false;
+  await sleep(1000);
+  return chrome.connected && !chrome.targets.has(id);
+}
 
 // Waits for Chrome to come back after it quit, then finds the handoff's page again (the
 // session restore reopens it in a new tab with a new id).
@@ -2378,7 +2387,16 @@ const TOOLS = [
         if (args.report_back) return handoffLines('chrome_back', back, back.url);
         args = { ...args, tab: tabId(back) };
       }
-      let info = findTab(args.tab);
+      let info;
+      try { info = findTab(args.tab); } catch (error) {
+        // The tab this agent handed to the user is gone: they closed it (a check, a release, a wait on it).
+        const want = String(args.tab || '').trim().toUpperCase();
+        const was = want && chrome.connected && [...H.handoff.keys()].find(id => id.toUpperCase().startsWith(want) && H.handoff.get(id)?.agent === agent);
+        if (!was) throw error;
+        H.handoff.delete(was);
+        if (H.active === was) H.active = null;
+        throw new Error(`No tab "${args.tab}". ${TAB_CLOSED_NOTE}`);
+      }
       if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
       const reason = String(args.reason || 'login_required');
       const end = (id, status) => {
@@ -2440,8 +2458,11 @@ const TOOLS = [
       if (reason === 'user_control') await pauseHeld(info, session);
       H.handoff.set(info.targetId, { agent, reason, waiting: true, since: Date.now(), startUrl, done: args.done });
       if (args.wait === false) {
-        if (await chromeInFront()) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
-        return handoffLines('started', info, startUrl);
+        // Another agent's handoff is the user's now: this tab waits its turn (a wait: true call on it comes
+        // forward when that one ends) and never comes forward over it.
+        const busy = H.active && H.active !== info.targetId && chrome.targets.has(H.active) && H.handoff.get(H.active)?.agent !== agent;
+        if (!busy && await chromeInFront()) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
+        return handoffLines('started', info, startUrl, busy ? 'Another agent\'s handoff is open on this computer: wait with wait: true, and this tab comes forward when that one ends.' : '');
       }
       // One handoff at a time on this bridge: wait for another agent's to end first.
       const id0 = info.targetId;
@@ -2452,6 +2473,8 @@ const TOOLS = [
         while (H.active && H.active !== id0 && chrome.targets.has(H.active)) {
           if (ctx.signal?.aborted || cancelled()) { end(id0, 'cancelled'); return handoffLines('cancelled', info, startUrl); }
           if (Date.now() > limit) { end(id0, 'timeout'); return handoffLines('timeout', info, startUrl); }
+          // Its own tab closed while it waited its turn (Chrome quitting is told after the wait, as chrome_gone).
+          if (chrome.connected && await tabClosed(id0)) { end(id0, 'tab_closed'); return handoffLines('tab_closed', null, startUrl, TAB_CLOSED_NOTE); }
           await sleep(500);
         }
         H.active = id0;
@@ -2476,7 +2499,11 @@ const TOOLS = [
             if (args.report_back) return handoffLines('chrome_back', info, back.url);
             continue;
           }
-          if (!chrome.targets.has(info.targetId)) { end(info.targetId, 'tab_closed'); return handoffLines('tab_closed', null, lastUrl); }
+          if (!chrome.targets.has(info.targetId)) {
+            if (!(await tabClosed(info.targetId))) continue;
+            end(info.targetId, 'tab_closed');
+            return handoffLines('tab_closed', null, lastUrl, TAB_CLOSED_NOTE);
+          }
           if (!shown && await chromeInFront()) {
             await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
             shown = true;
