@@ -363,12 +363,13 @@ async function siteFor(host) {
 
 /** Ask the person at this Chrome to allow a site: the extension's own page, which no run can reach
  *  (no run attaches to an extension page or opens one). true once allowed, false when they said no,
- *  'no_answer' when nobody answered in time (the question closes; the next call asks again), 'off' when
- *  the site is unticked here. */
+ *  'no_answer' when nobody answered in time (the question closes), 'off' when the site is unticked here,
+ *  'paused' when pre.dev is paused in this Chrome (no question). A run keeps false and 'no_answer' for the
+ *  rest of it (web_rules.mjs askOnce); 'off' and 'paused' are looked at again on its next call. */
 async function askToAllow(site) {
   await sites();
   if (isAllowedNow(site)) return true;
-  if (paused) return false;
+  if (paused) return 'paused';
   // Unticked in the popup: the person said no to this site here. Refused without asking; ticking it again allows it.
   if (sitesCache?.[site] && !sitesCache[site].on) return 'off';
   let entry = asking.get(site);

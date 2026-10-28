@@ -36,9 +36,11 @@ export const text = (t, isError = true) => ({ content: [{ type: 'text', text: t 
 /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
 export const refusedText = (t, refusal) => ({ ...text(t), refusal });
 export const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
-/** Nobody answered the question in time (the next call asks again): that says nothing about what the
- *  person wants, so the run asks them. */
+/** Nobody answered the question in time: that says nothing about what the person wants, so the run asks them (their
+ *  go-ahead is a new turn of the run, which asks again). */
 export const noAnswer = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. Don't call it again right away: tell them in one line that their Chrome is waiting for a click to allow ${site}; when they say go ahead, call again and the question comes back. Continue with what you have meanwhile.`);
+/** Nobody answered the question for a handed task's run: its run doesn't ask about that site again (askOnce). */
+export const noAnswerThisRun = site => text(`No answer from the person in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes: pre.dev asked on their computer whether web runs may use ${site} in their Chrome, nobody clicked, and the question closed. This run doesn't ask about ${site} again: continue with what you have, and say in one line that ${site} needs their click to allow it.`);
 /** A site the person turned off here (the extension's list of allowed sites): no question, a plain no. */
 export const turnedOff = site => text(`The user turned ${site} off for web runs in their Chrome, so this run can't use it there. Don't retry or ask them to allow it: tell them in one line what you need from ${site} (they can tick it again from the pre.dev button in their Chrome's toolbar), and continue with what you have.`);
 export const PRIVATE_TAB = "That tab is pre.dev's own question to the user; no run can use it.";
@@ -87,6 +89,18 @@ export function allowQuestion(site) {
 /** A question line as plain text. */
 export const plainLine = parts => parts.map(p => (typeof p === 'string' ? p : p.b)).join('');
 
+/** The run a call belongs to, for the person's answers that hold for the rest of it: a handed task (its id), or one
+ *  turn of a web run (its key and the turn pre.dev names). '' for a web run that names no turn: it holds none. */
+export function answerRunOf(body) {
+  const taskId = cleanTaskId(body?.taskId);
+  if (taskId) return taskAgent(taskId);
+  const key = runKeyOf(body);
+  const turn = runTurnOf(body);
+  return key && turn ? `${webAgent(key)}#${turn}` : '';
+}
+/** How many runs' answers a client keeps (the oldest go first). */
+const HELD_MAX = 500;
+
 /**
  * The web run calls of one client, with that client's Chrome and person:
  *   callTool(name, args, ctx)  runs a chrome_* tool (tools.mjs) in this Chrome
@@ -97,11 +111,36 @@ export const plainLine = parts => parts.map(p => (typeof p === 'string' ? p : p.
  *   isAllowed(site)            the person allowed it here
  *   askToAllow(site)           ask the person here; true once allowed, false when they said no,
  *                              'no_answer' when nobody answered in time, 'off' when the person turned
- *                              that site off here (then there is no question)
+ *                              that site off here (then there is no question); anything else is a no
+ *                              that askOnce does not keep
+ *   held                       where the person's no is kept for each run (askOnce): a Map that outlives
+ *                              one call; this client's own when none is given
  */
-export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow }) {
+export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow: askHere, held = new Map() }) {
+  /** The person's no to a site (Don't allow, or no answer in time) holds for the rest of that run (answerRunOf): its
+   *  later calls on that site get the same refusal at once, with no second question. A new run asks again, and so
+   *  does a site turned off here (no question either way). */
+  async function askOnce(site, body) {
+    const key = answerRunOf(body);
+    const id = key && `${key} ${site}`;
+    if (id && held.has(id)) return held.get(id);
+    const ok = await askHere(site);
+    if (id && (ok === false || ok === 'no_answer')) {
+      held.set(id, ok);
+      while (held.size > HELD_MAX) held.delete(held.keys().next().value);
+    }
+    return ok;
+  }
+  /** A run's answers are let go (a task handed here again is a new run). */
+  function forgetRun(key) {
+    if (!key) return;
+    for (const id of [...held.keys()]) if (id.startsWith(`${key} `)) held.delete(id);
+  }
+
   /** A new site needs a click here first: where the call goes, and where the tab is now. null when allowed. */
   async function sitesAllowed(name, args, body) {
+    // This run's no to a site holds for it (askOnce).
+    const askToAllow = site => askOnce(site, body);
     const wanted = [];
     if ((name === 'chrome_open' || name === 'chrome_navigate') && args.url && !['back', 'forward', 'reload'].includes(args.url)) {
       const raw = String(args.url);
@@ -120,7 +159,7 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
       if (isAllowed(site)) continue;
       const ok = await askToAllow(site);
       if (ok === 'off') return { ...turnedOff(site), refusal: { kind: 'not_allowed', site } };
-      if (ok === 'no_answer') return { ...noAnswer(site), refusal: { kind: 'not_allowed', site, answer: 'none' } };
+      if (ok === 'no_answer') return { ...(cleanTaskId(body?.taskId) ? noAnswerThisRun(site) : noAnswer(site)), refusal: { kind: 'not_allowed', site, answer: 'none' } };
       if (ok !== true) return { ...notAllowed(site), refusal: { kind: 'not_allowed', site } };
     }
     return null;
@@ -158,7 +197,7 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
     return (await movedTo(name, args, result)) || result;
   }
 
-  return { webCall, sitesAllowed, movedTo };
+  return { webCall, sitesAllowed, movedTo, forgetRun };
 }
 
 /** A handed task's id as pre.dev sends it. */
@@ -437,6 +476,8 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       }),
     });
     await tasks.save(rest.slice(-20));
+    // A new hand-off is a new run: the person's answers from the last one are asked again.
+    webCalls.forgetRun?.(taskAgent(taskId));
     log(`task ${taskId} handed to this computer (${site}${body?.runner === 'cloud' ? ', carried on by pre.dev' : ''})`);
     return { accepted: true, ...(tab ? { tab } : {}) };
   }

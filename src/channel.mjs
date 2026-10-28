@@ -90,6 +90,8 @@ export function createChannel(ctx) {
   /** One question per site at a time: site -> { nonce, decided, waiters, targetId }. */
   const asking = new Map();
   const byNonce = new Map();
+  /** The person's no to a site, kept for the rest of each run (web_rules.mjs askOnce): one question per site per run. */
+  const heldAnswers = new Map();
   /** Cloud runs of handed tasks: calls in flight per task (chrome_handed_off waits for them on a take-over). */
   const RUNS = chrome.__predevHandedRuns || (chrome.__predevHandedRuns = { inflight: new Map() });
   const APPROVED = chrome.__predevApproved || (chrome.__predevApproved = new Map());
@@ -285,6 +287,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     siteFor,
     isAllowed,
     askToAllow: site => askToAllow(site, port, api.chromeInFront),
+    held: heldAnswers,
   });
   /** A new site needs a click here first (web_rules.mjs). */
   const sitesAllowed = (name, args, body, port, api) => webCalls(port, api).sitesAllowed(name, args, body);
