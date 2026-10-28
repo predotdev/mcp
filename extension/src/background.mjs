@@ -298,7 +298,8 @@ const allowedSites = () => local.get('sites', {});
 let sitesCache = null;
 async function sites() { if (!sitesCache) sitesCache = await allowedSites(); return sitesCache; }
 chrome.storage.onChanged.addListener((changes, area) => { if (area === 'local' && changes.sites) sitesCache = changes.sites.newValue || {}; });
-const isAllowedNow = site => !!site && !!sitesCache?.[site]?.on;
+// A site (and its subdomains), or one exact host allowed on its own: that host alone, never the site it belongs to.
+const isAllowedNow = (site, host = '') => !!site && (!!sitesCache?.[site]?.on || (!!host && !!sitesCache?.[host]?.on));
 
 async function post(route, body, p) {
   p ||= await pairing();

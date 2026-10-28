@@ -108,7 +108,7 @@ const HELD_MAX = 500;
  *   tabInfo(tab)               the page target a tab id names, or null
  *   isPrivate(targetId)        pre.dev's own question tab
  *   siteFor(host)              the registrable domain pre.dev computes for a host
- *   isAllowed(site)            the person allowed it here
+ *   isAllowed(site, host)      the person allowed it here (the site, or exactly that host)
  *   askToAllow(site)           ask the person here; true once allowed, false when they said no,
  *                              'no_answer' when nobody answered in time, 'off' when the person turned
  *                              that site off here (then there is no question); anything else is a no
@@ -148,15 +148,19 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
       if (!host) return text('Web runs can open only http and https pages in the user\'s Chrome.');
       // pre.dev computed the target's site with the call (the same rule); only what matches this host counts.
       const given = typeof body?.site === 'string' && body.site && host.endsWith(body.site) ? body.site : '';
-      wanted.push(given || await siteFor(host));
+      wanted.push([given || await siteFor(host), host]);
     }
     // The site the tab is on now counts only for a call that works on that page. Leaving it (back, forward, another
     // address, closing the tab) needs no yes for it: the page a call ends on is checked after (movedTo).
     const leaves = name === 'chrome_close' || (name === 'chrome_navigate' && args.url && args.url !== 'reload');
     const info = args.tab && !leaves ? tabInfo(args.tab) : null;
-    if (info) { const here = await siteFor(hostOf(info.url)); if (here && !wanted.includes(here)) wanted.push(here); }
-    for (const site of wanted) {
-      if (isAllowed(site)) continue;
+    if (info) {
+      const host = hostOf(info.url);
+      const here = await siteFor(host);
+      if (here && !wanted.some(([s, h]) => s === here && h === host)) wanted.push([here, host]);
+    }
+    for (const [site, host] of wanted) {
+      if (isAllowed(site, host)) continue;
       const ok = await askToAllow(site);
       if (ok === 'off') return { ...turnedOff(site), refusal: { kind: 'not_allowed', site } };
       if (ok === 'no_answer') return { ...(cleanTaskId(body?.taskId) ? noAnswerThisRun(site) : noAnswer(site)), refusal: { kind: 'not_allowed', site, answer: 'none' } };
@@ -170,8 +174,9 @@ export function createWebCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isA
     if (!MOVES.has(name) || result?.isError) return null;
     const tab = tabInResult(result) || args.tab;
     const now = tab ? tabInfo(tab) : null;
-    const site = now ? await siteFor(hostOf(now.url)) : '';
-    if (site && !isAllowed(site)) {
+    const host = now ? hostOf(now.url) : '';
+    const site = host ? await siteFor(host) : '';
+    if (site && !isAllowed(site, host)) {
       // What the call did is kept (its first lines, such as where a click went); the page it ended on is not shown.
       return text(`${actionLines(result)}Tab ${tab} is now on ${site}, which web runs haven't used in the user's Chrome yet, so its page isn't shown. A call that works on this page asks the user to allow ${site} on their computer first; going back or opening another page needs no answer.`, false);
     }
@@ -396,8 +401,9 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
 
   async function openTabAgain(t, agent) {
     const page = pageOf(t.page || '');
-    const site = page ? await siteFor(hostOf(page)) : '';
-    if (!site || !isAllowed(site)) return '';
+    const host = page ? hostOf(page) : '';
+    const site = host ? await siteFor(host) : '';
+    if (!site || !isAllowed(site, host)) return '';
     let tab = '';
     try {
       const opened = await callTool('chrome_open', { profile: defaultProfile(), url: page, foreground: false, __agent: agent, __predev_handoff: true, __via: 'web' },
@@ -446,7 +452,7 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     if (!taskId || !host) return { accepted: false, error: 'a handed-off task needs its id and the http(s) page it stopped on' };
     if (cloudOnly && body?.runner !== 'cloud') return { accepted: false, error: "this Chrome has no agent of its own to take a task over; only pre.dev's cloud run can carry a task on here" };
     const site = (typeof body?.site === 'string' && body.site && host.endsWith(body.site)) ? body.site : await siteFor(host);
-    const ok = isAllowed(site) || await askToAllow(site);
+    const ok = isAllowed(site, host) || await askToAllow(site);
     if (ok === 'no_answer') return { accepted: false, error: `no answer from the person at this computer in ${Math.round(ALLOW_WAIT_MS / 60000)} minutes to allow ${site}` };
     if (ok === 'off') return { accepted: false, error: `the person at this computer turned ${site} off for pre.dev runs` };
     if (ok !== true) return { accepted: false, error: `the person at this computer didn't allow ${site}` };
