@@ -366,24 +366,24 @@ const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
  *  PREDEV_HANDOFF=1 (how the pre.dev CLI starts this server; also for tests). Off by default; off,
  *  every tool works as before. */
 const HANDOFF_ENV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
-/** The features pre.dev last named for the saved key, kept for the terminal commands and for the
- *  next start (written only once pre.dev names one; removed when it stops). */
+/** pre.dev's last answer for the saved key, { key, features, at }: the features it named (an empty
+ *  list when it named none) and when. Kept for the terminal commands and for the next start, which
+ *  answers initialize from it at once. It only shapes the tool list; pre.dev checks each feature. */
 const FEATURES_FILE = path.join(BASE_STATE_DIR, 'features.json');
 const keyId = apiKey => crypto.createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
-function savedFeatures(apiKey) {
+function savedAnswer(apiKey) {
   try {
     const saved = JSON.parse(fs.readFileSync(FEATURES_FILE, 'utf8'));
-    return saved?.key === keyId(apiKey) && Array.isArray(saved.features) ? saved.features : [];
-  } catch { return []; }
+    return saved?.key === keyId(apiKey) && Array.isArray(saved.features) ? saved : null;
+  } catch { return null; }
 }
+const savedFeatures = apiKey => savedAnswer(apiKey)?.features || [];
 function saveFeatures(apiKey, list) {
   try {
-    if (list.length) {
-      fs.mkdirSync(BASE_STATE_DIR, { recursive: true, mode: 0o700 });
-      const tmp = `${FEATURES_FILE}.${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify({ key: keyId(apiKey), features: list }), { mode: 0o600 });
-      fs.renameSync(tmp, FEATURES_FILE);
-    } else if (fs.existsSync(FEATURES_FILE) && savedFeatures(apiKey).length) fs.unlinkSync(FEATURES_FILE);
+    fs.mkdirSync(BASE_STATE_DIR, { recursive: true, mode: 0o700 });
+    const tmp = `${FEATURES_FILE}.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ key: keyId(apiKey), features: list, at: new Date().toISOString() }), { mode: 0o600 });
+    fs.renameSync(tmp, FEATURES_FILE);
   } catch {}
 }
 /** Handoffs for this key: PREDEV_HANDOFF=1, else what pre.dev's hosted tools last said (this run's
@@ -568,7 +568,7 @@ async function updateInstalledCopy() {
 
 /** Set while serving MCP: tells the agent to re-list when the hosted tools change handoffs. */
 let featuresChanged = null;
-/** How long initialize waits for pre.dev's first answer when nothing is saved for the key. */
+/** How long initialize waits for pre.dev's first answer when nothing is saved for the key (its first start). */
 const FIRST_ANSWER_WAIT_MS = 1500;
 const remote = createRemote({
   version: PKG.version || '0.0.0',
@@ -627,13 +627,14 @@ function runMcp() {
       switch (message.method) {
         case 'initialize': {
           // The instructions say whether handoffs are on, which pre.dev's hosted tools list tells.
-          // Ask for it now (tools/list then uses the same answer). With nothing saved for this key,
-          // wait for it briefly, so the first start after pre.dev turns handoffs on already says so;
-          // with a saved answer, reply at once and let the list refresh it.
+          // Ask for it now (tools/list then uses the same answer). With an answer saved for this key
+          // (an empty one too), reply at once from it and let this answer refresh it: the agent re-lists
+          // only if the tools change. Only the key's first start waits for it, briefly, so it already
+          // says whether handoffs are on.
           const ctx = keyCtx();
           if (CLOUD && ctx.apiKey && !HANDOFF_ENV && remote.featuresFor(ctx.apiKey) === undefined) {
             const listed = remote.listTools(ctx).catch(() => []);
-            if (!savedFeatures(ctx.apiKey).length) {
+            if (!savedAnswer(ctx.apiKey)) {
               let timer;
               await Promise.race([listed, new Promise(resolve => { timer = setTimeout(resolve, FIRST_ANSWER_WAIT_MS); })]);
               clearTimeout(timer);
