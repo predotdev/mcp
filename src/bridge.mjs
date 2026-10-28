@@ -533,7 +533,30 @@ async function updateInstalledCopy() {
   return meta.version;
 }
 
-const remote = createRemote({ version: PKG.version || '0.0.0' });
+/** The user's browser profile listing as pre.dev last gave it for the saved key (profiles.json: { key, value, at };
+ *  profile names, which one is the default, and site domains). A start lists browser_agent with it at once and
+ *  refreshes it behind; it only shapes the tool list. */
+const PROFILES_FILE = path.join(BASE_STATE_DIR, 'profiles.json');
+const profilesKeyId = apiKey => crypto.createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
+const profilesStore = {
+  load(apiKey) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8'));
+      return saved?.key === profilesKeyId(apiKey) ? { value: saved.value ?? null } : null;
+    } catch { return null; }
+  },
+  save(apiKey, value) {
+    try {
+      fs.mkdirSync(BASE_STATE_DIR, { recursive: true, mode: 0o700 });
+      const tmp = `${PROFILES_FILE}.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ key: profilesKeyId(apiKey), value, at: new Date().toISOString() }), { mode: 0o600 });
+      fs.renameSync(tmp, PROFILES_FILE);
+    } catch {}
+  },
+};
+/** Set while serving MCP: tells the agent to re-list when pre.dev's answer changes the hosted tools. */
+let hostedChanged = null;
+const remote = createRemote({ version: PKG.version || '0.0.0', profilesStore, onListChanged: () => hostedChanged?.() });
 
 // Tools that act on one tab. chrome_close is left out on purpose: closing needs the tab named.
 const TAB_TOOLS = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
@@ -567,6 +590,7 @@ function runMcp() {
   // A chrome_handoff can wait for the user for as long as they need; the agent can cancel it.
   const inflight = new Map(); // MCP request id -> { req, tab, state }
   const write = message => process.stdout.write(`${JSON.stringify(message)}\n`);
+  hostedChanged = () => { if (listed) write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }); };
   // After an update, the agent re-lists the tools when they changed (new tools or parameters).
   const update = () => updateInstalledCopy().then(async version => {
     if (!version || !listed) return;

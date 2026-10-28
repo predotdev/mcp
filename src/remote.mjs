@@ -14,9 +14,9 @@ const SIGN_IN = 'Sign in to pre.dev (free) by running `npx -y @predotdev/mcp log
 
 class PlanRequired extends Error {}
 
-export function createRemote({ version }) {
+export function createRemote({ version, profilesStore = null, onListChanged = () => {} }) {
   let cache = { key: null, at: 0, tools: [], locked: null };
-  let profiles = { key: null, at: 0, value: null };
+  let profiles = { key: null, at: 0, value: null, answered: false };
   let nextId = 0;
   const base = ctx => (ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
 
@@ -25,10 +25,13 @@ export function createRemote({ version }) {
   // fills `profile` by itself, except "auto" when the user turned on "Use my logins automatically" (read from the
   // profile listing); pre.dev then picks the profile that covers each task's site, or none.
   const takesProfile = tool => tool?.name === 'browser_agent' && !!tool.inputSchema?.properties?.profile;
+  /** pre.dev's own answer, cached a minute (a call that may ask for "auto" reads this). Each answer is also saved
+   *  (profilesStore) for the next start's tool list. */
   async function profileListing(ctx) {
     const key = ctx.apiKey || '';
     if (profiles.key === key && Date.now() - profiles.at < PROFILES_TTL_MS) return profiles.value;
     let value = null;
+    let answered = false;
     try {
       const response = await fetch(`${base(ctx)}/browser-profiles`, {
         headers: { Authorization: `Bearer ${ctx.apiKey}`, 'User-Agent': `predev-mcp/${version}`, 'x-predev-client': 'mcp' },
@@ -42,10 +45,26 @@ export function createRemote({ version }) {
             profiles: (body.profiles || []).map(p => ({ name: String(p.name || ''), isDefault: !!p.isDefault, sites: (p.sites || []).map(s => s.domain).filter(Boolean) })),
           };
         }
+        answered = true;
       }
     } catch {}
-    profiles = { key, at: Date.now(), value };
+    profiles = { key, at: Date.now(), value, answered };
+    if (answered) profilesStore?.save(key, value);
     return value;
+  }
+  /** The listing browser_agent's description is built from. With one saved for the key, that one at once, while this
+   *  start asks pre.dev behind it; an answer that differs re-lists the tools. Without one (the key's first start),
+   *  pre.dev's answer. Only the description comes from the saved copy: a call reads pre.dev's own answer above, and
+   *  pre.dev checks any profile a call names. */
+  async function listingForList(ctx) {
+    const key = ctx.apiKey || '';
+    if (profiles.key === key && Date.now() - profiles.at < PROFILES_TTL_MS) return profiles.value;
+    const saved = profilesStore?.load(key);
+    if (!saved) return profileListing(ctx);
+    profileListing(ctx).then(value => {
+      if (profiles.answered && JSON.stringify(value) !== JSON.stringify(saved.value)) { cache.at = 0; onListChanged(); }
+    }).catch(() => {});
+    return saved.value;
   }
   /** browser_agent's description, with the user's profiles and whether "auto" is on, so the agent knows what to name. */
   function withProfiles(tool, listing) {
@@ -116,7 +135,7 @@ export function createRemote({ version }) {
         const result = await rpc(ctx, 'tools/list', {}, 15000);
         tools = (result?.tools || []).filter(tool => !HIDDEN.has(tool.name) && !tool.name.startsWith('chrome_'));
         if (tools.some(takesProfile)) {
-          const listing = await profileListing(ctx);
+          const listing = await listingForList(ctx);
           tools = tools.map(tool => (takesProfile(tool) ? withProfiles(tool, listing) : tool));
         }
       }
