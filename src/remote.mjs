@@ -7,16 +7,77 @@
 // /mcp/info) and a call says how to unlock them, so the agent can tell the user.
 
 const LIST_TTL_MS = 10 * 60_000;
+const PROFILES_TTL_MS = 60_000;
 /** Kept callable for old prompts, but not listed: the hosted server marks them deprecated. */
 const HIDDEN = new Set(['browser_task', 'browser_task_list', 'browser_task_get']);
 const SIGN_IN = 'Sign in to pre.dev (free) by running `npx -y @predotdev/mcp login` in a terminal; no restart needed.';
 
 class PlanRequired extends Error {}
 
-export function createRemote({ version }) {
+export function createRemote({ version, profilesStore = null, onListChanged = () => {} }) {
   let cache = { key: null, at: 0, tools: [], locked: null };
+  let profiles = { key: null, at: 0, value: null, answered: false };
   let nextId = 0;
   const base = ctx => (ctx.apiUrl || 'https://api.pre.dev').replace(/\/+$/, '');
+
+  // Browser profiles: the user's own signed-in sessions in pre.dev's cloud browsers. pre.dev offers them only to
+  // accounts it has turned them on for, and then the hosted browser_agent takes a `profile`. This server never
+  // fills `profile` by itself, except "auto" when the user turned on "Use my logins automatically" (read from the
+  // profile listing); pre.dev then picks the profile that covers each task's site, or none.
+  const takesProfile = tool => tool?.name === 'browser_agent' && !!tool.inputSchema?.properties?.profile;
+  /** pre.dev's own answer, cached a minute (a call that may ask for "auto" reads this). Each answer is also saved
+   *  (profilesStore) for the next start's tool list. */
+  async function profileListing(ctx) {
+    const key = ctx.apiKey || '';
+    if (profiles.key === key && Date.now() - profiles.at < PROFILES_TTL_MS) return profiles.value;
+    let value = null;
+    let answered = false;
+    try {
+      const response = await fetch(`${base(ctx)}/browser-profiles`, {
+        headers: { Authorization: `Bearer ${ctx.apiKey}`, 'User-Agent': `predev-mcp/${version}`, 'x-predev-client': 'mcp' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (response.ok) {
+        const body = await response.json();
+        if (body?.enabled) {
+          value = {
+            auto: body.useLoginsAutomatically === true,
+            profiles: (body.profiles || []).map(p => ({ name: String(p.name || ''), isDefault: !!p.isDefault, sites: (p.sites || []).map(s => s.domain).filter(Boolean) })),
+          };
+        }
+        answered = true;
+      }
+    } catch {}
+    profiles = { key, at: Date.now(), value, answered };
+    if (answered) profilesStore?.save(key, value);
+    return value;
+  }
+  /** The listing browser_agent's description is built from. With one saved for the key, that one at once, while this
+   *  start asks pre.dev behind it; an answer that differs re-lists the tools. Without one (the key's first start),
+   *  pre.dev's answer. Only the description comes from the saved copy: a call reads pre.dev's own answer above, and
+   *  pre.dev checks any profile a call names. */
+  async function listingForList(ctx) {
+    const key = ctx.apiKey || '';
+    if (profiles.key === key && Date.now() - profiles.at < PROFILES_TTL_MS) return profiles.value;
+    const saved = profilesStore?.load(key);
+    if (!saved) return profileListing(ctx);
+    profileListing(ctx).then(value => {
+      if (profiles.answered && JSON.stringify(value) !== JSON.stringify(saved.value)) { cache.at = 0; onListChanged(); }
+    }).catch(() => {});
+    return saved.value;
+  }
+  /** browser_agent's description, with the user's profiles and whether "auto" is on, so the agent knows what to name. */
+  function withProfiles(tool, listing) {
+    if (!listing) return tool;
+    const names = listing.profiles.slice(0, 20).map(p => `${p.name}${p.isDefault ? ' (default)' : ''}: ${p.sites.slice(0, 12).join(', ') || 'no sites yet'}`);
+    const note = [
+      names.length ? `The user's browser profiles: ${names.join('; ')}.` : 'The user has no browser profiles yet.',
+      listing.auto
+        ? 'Their "Use my logins automatically" is on: a call that names no profile runs each task with the profile that covers its site, or signed out when none does.'
+        : 'Pass profile (a name, or "default") only for a task that needs the user signed in; without it the task runs signed out.',
+    ].join(' ');
+    return { ...tool, description: `${tool.description || ''} ${note}`.trim() };
+  }
 
   async function rpc(ctx, method, params, timeout) {
     const id = ++nextId;
@@ -73,6 +134,10 @@ export function createRemote({ version }) {
       } else {
         const result = await rpc(ctx, 'tools/list', {}, 15000);
         tools = (result?.tools || []).filter(tool => !HIDDEN.has(tool.name) && !tool.name.startsWith('chrome_'));
+        if (tools.some(takesProfile)) {
+          const listing = await listingForList(ctx);
+          tools = tools.map(tool => (takesProfile(tool) ? withProfiles(tool, listing) : tool));
+        }
       }
     } catch (error) {
       if (error instanceof PlanRequired) {
@@ -98,8 +163,14 @@ export function createRemote({ version }) {
 
   // Specs and cloud browser runs can take minutes; the hosted tools return when they are done.
   async function callTool(ctx, name, args) {
-    await listTools(ctx);
+    const tools = await listTools(ctx);
     if (cache.locked) return offer(cache.locked);
+    // "Use my logins automatically" on: a browser_agent call that names no profile for the batch asks for "auto"
+    // (tasks that name their own profile keep it).
+    if (name === 'browser_agent' && args && args.profile === undefined && tools.some(takesProfile)) {
+      const listing = await profileListing(ctx);
+      if (listing?.auto) args = { ...args, profile: 'auto' };
+    }
     try {
       return await rpc(ctx, 'tools/call', { name, arguments: args || {} }, 15 * 60_000);
     } catch (error) {
