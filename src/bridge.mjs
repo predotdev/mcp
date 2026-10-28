@@ -265,25 +265,76 @@ async function callTool(name, args, ctx, tools = {}) {
 
 function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
 
-function takeLock() {
-  for (let attempt = 0; attempt < 2; attempt++) {
+// A daemon killed hard (a crash, SIGKILL, a stopped container) leaves its lock behind, and its pid
+// can come back as another program, or as the next daemon itself (a fresh container often gives it
+// the same pid). So a live pid alone proves nothing: a lock counts while its daemon answers at the
+// port its state file names, and for the moment between taking the lock and listening.
+const LOCK_STARTING_MS = 5000;
+
+/** The lock's text and when it was written, read from one open file; null when there is none. */
+function readLock(file = LOCK_FILE) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    return { text: fs.readFileSync(fd, 'utf8'), at: fs.fstatSync(fd).mtimeMs };
+  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+
+/** Whether a running daemon holds this lock. One too busy to answer in time still counts. */
+async function lockHeld(lock) {
+  const pid = Number(lock.text) || 0;
+  if (pid === process.pid || (pid && !pidAlive(pid))) return false;
+  // Just taken, or still being written: its daemon is not listening yet.
+  if (Math.abs(Date.now() - lock.at) < LOCK_STARTING_MS) return true;
+  if (!pid) return false;
+  let state = null;
+  try { state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
+  if (state?.pid !== pid || !state.port || !state.token) return false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${state.port}/health`, { headers: { 'x-bridge-token': state.token }, signal: AbortSignal.timeout(3000) });
+    return (await res.json())?.ok === true;
+  } catch (error) { return error?.name === 'TimeoutError'; }
+}
+
+/** Clears a stale lock. One start at a time does it (it holds LOCK_FILE.break meanwhile), and only
+ *  while the lock is still the one found stale, so a lock another start just took always stays.
+ *  False when another start is clearing it. */
+function breakLock(stale) {
+  const guard = `${LOCK_FILE}.break`;
+  try { fs.closeSync(fs.openSync(guard, 'wx', 0o600)); } catch {
+    // A guard left by a start that died while holding it is cleared once it is old.
+    const left = readLock(guard);
+    if (left && Math.abs(Date.now() - left.at) >= LOCK_STARTING_MS) fs.rmSync(guard, { force: true });
+    return false;
+  }
+  try {
+    const now = readLock();
+    if (now?.text === stale.text && now.at === stale.at) fs.rmSync(LOCK_FILE, { force: true });
+  } finally { fs.rmSync(guard, { force: true }); }
+  return true;
+}
+
+async function takeLock() {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const fd = fs.openSync(LOCK_FILE, 'wx', 0o600);
       fs.writeSync(fd, String(process.pid));
       fs.closeSync(fd);
       return true;
-    } catch {
-      const holder = Number(fs.readFileSync(LOCK_FILE, 'utf8')) || 0;
-      if (holder && pidAlive(holder)) return false;
-      fs.rmSync(LOCK_FILE, { force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
     }
+    const lock = readLock();
+    if (!lock) continue; // released just now
+    if (await lockHeld(lock)) return false;
+    if (!breakLock(lock)) await sleep(50);
   }
   return false;
 }
 
-function runDaemon() {
+async function runDaemon() {
   privateStateDir();
-  if (!takeLock()) { log('another daemon holds the lock; exiting'); process.exit(0); }
+  if (!await takeLock()) { log('another daemon holds the lock; exiting'); process.exit(0); }
   const release = () => {
     try { if (fs.readFileSync(LOCK_FILE, 'utf8') === String(process.pid)) fs.rmSync(LOCK_FILE); } catch {}
     // A state file left behind names a port another program could take after this one exits.
