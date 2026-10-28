@@ -979,18 +979,25 @@ async function userTouchedAt(info, session) {
 // until the user lets it continue, through a channel the model can't use: the "Let the agent continue" button pre.dev
 // shows at the top of the tab (a trusted click, in a script world the page can't reach), or, from pre.dev's own CLI,
 // the user's answer on its card (__predev_user_said_go: the bridge passes it only for that CLI, which never takes it
-// from its model). Nothing else lifts it: not a resume the agent asks for, not a release, cancel or another handoff.
-H.paused ||= new Map(); // targetId -> { at }: when the user took the tab
+// from its model). On a tab of a task handed here from pre.dev's cloud run, the run's card on pre.dev is the one way
+// back: the bar has no button there, and the run's hand-back after the person's Done on that card lifts the pause
+// (__predev_card_done: set only by web_rules.mjs taskCall, for that hand-back). Nothing else lifts it: not a resume
+// the agent asks for, not a release, cancel or another handoff.
+H.paused ||= new Map(); // targetId -> { at, card? }: when the user took the tab; card: a handed cloud run's tab
 H.pauseWorlds ||= new Map(); // targetId -> the bar's script world in the tab's current page
 const PAUSE_WORLD = 'predev-pause';
-// One line and one button, in a closed shadow root: the page's scripts can't see, click or fake it.
-const PAUSE_BAR = `(() => {
+// One line and one button, in a closed shadow root: the page's scripts can't see, click or fake it. On a handed cloud
+// run's tab, one line and no button: the person presses Done on the run's card on pre.dev.
+const PAUSE_LINE = "pre.dev\\'s agent is paused while you use this tab.";
+const CARD_LINE = "pre.dev\\'s agent is paused while you use this tab. Press Done on the pre.dev card to continue.";
+const PAUSE_BUTTON = '<button type="button" style="margin-left:auto;cursor:pointer;border-radius:6px;border:1px solid rgba(251,191,36,.6);background:rgba(245,158,11,.15);color:#fef3c7;padding:4px 10px;font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">Let the agent continue</button>';
+const pauseBar = card => `(() => {
   if (window.__predevPauseBar && document.documentElement.contains(window.__predevPauseBar)) return true;
   const host = document.createElement('div');
   host.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;z-index:2147483647';
   const root = host.attachShadow({ mode: 'closed' });
-  root.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#14161a;color:rgba(255,255,255,.85);font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;border-bottom:1px solid rgba(255,255,255,.12)"><span>pre.dev\\'s agent is paused while you use this tab.</span><button type="button" style="margin-left:auto;cursor:pointer;border-radius:6px;border:1px solid rgba(251,191,36,.6);background:rgba(245,158,11,.15);color:#fef3c7;padding:4px 10px;font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">Let the agent continue</button></div>';
-  root.querySelector('button').addEventListener('click', e => {
+  root.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#14161a;color:rgba(255,255,255,.85);font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;border-bottom:1px solid rgba(255,255,255,.12)"><span>${card ? CARD_LINE : PAUSE_LINE}</span>${card ? '' : PAUSE_BUTTON}</div>';
+  root.querySelector('button')?.addEventListener('click', e => {
     if (!e.isTrusted) return;
     window.__predevContinueAt = Date.now();
     host.remove();
@@ -999,6 +1006,8 @@ const PAUSE_BAR = `(() => {
   (document.body || document.documentElement).appendChild(host);
   return true;
 })()`;
+const PAUSE_BAR = pauseBar(false);
+const PAUSE_BAR_CARD = pauseBar(true);
 // Runs `expression` in the bar's own script world in the tab's page (a new page gets a new one).
 async function inPauseWorld(info, session, expression) {
   for (let i = 0; i < 2; i++) {
@@ -1026,18 +1035,25 @@ async function liftPause(info, session) {
   H.reread.add(info.targetId);
   await inPauseWorld(info, session, 'window.__predevPauseBar ? (window.__predevPauseBar.remove(), true) : true').catch(() => {});
 }
-// Still paused? Their click on the bar lifts it; otherwise the bar is (re)shown.
-async function pauseHeld(info, session) {
+// A call from pre.dev's cloud run of a task handed here (web_rules.mjs taskCall, its own guard scope).
+const handedRun = args => fromWeb(args) && agentOf(args).startsWith('handed:');
+// Still paused? Their click on the bar lifts it; otherwise the bar is (re)shown (on a handed cloud run's tab, the
+// bar without a button).
+async function pauseHeld(info, session, args) {
   const p = H.paused.get(info.targetId);
   if (!p) return false;
+  if (handedRun(args)) p.card = true;
   const clicked = Number(await inPauseWorld(info, session, 'window.__predevContinueAt || 0').catch(() => 0)) || 0;
   if (clicked > p.at) { await liftPause(info, session); return false; }
-  await inPauseWorld(info, session, PAUSE_BAR).catch(() => {});
+  await inPauseWorld(info, session, p.card ? PAUSE_BAR_CARD : PAUSE_BAR).catch(() => {});
   return true;
 }
 const cliSaidGo = args => fromCli(args) && args?.__predev_user_said_go === true;
+// The person pressed Done on a handed cloud run's card on pre.dev: that run's hand-back of the tab.
+const cardSaidGo = args => handedRun(args) && args?.__predev_card_done === true;
 // What the agent does about a takeover, by where the call comes from.
 function keepGoing(args) {
+  if (handedRun(args)) return 'The run waits for them on its card on pre.dev: once they press Done there, the tab is the run\'s again. Read the page again before acting.';
   if (fromCli(args)) return `Ask them whether to keep going: call hand_off_to_user with tab "${String(args?.tab || '')}" and reason "user_control". They answer on its card, or click "Let the agent continue" at the top of the tab, and the run carries on once they say so. Don't try to take the tab back yourself; read the page again before acting.`;
   if (fromWeb(args)) return 'Ask them whether to keep going, then wait for them: once they click "Let the agent continue" at the top of the tab in their Chrome, it is the agent\'s again. Don\'t try to take it back before that; read the page again before acting.';
   return 'Ask them whether to keep going, then wait for them: they click "Let the agent continue" at the top of the tab. chrome_handoff with this tab, reason "user_control", resume: true and wait: true returns once they have. Then read the page again before acting.';
@@ -1056,7 +1072,7 @@ async function handoffGate(name, args, info, session) {
   if (h && h.waiting) throw refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' });
   await watchInput(info, session);
   await notePause(info, session, null);
-  if (await pauseHeld(info, session)) {
+  if (await pauseHeld(info, session, args)) {
     throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
   }
   if (READ_TOOLS.has(name)) H.reread.delete(info.targetId);
@@ -2014,7 +2030,7 @@ const TOOLS = [
         const recent = Number(await evaluate(session, 'window.__predevUserAt || 0', 3000).catch(() => 0)) || 0;
         if (recent && Date.now() - recent < 2000 && recent > (H.ackAt.get(info.targetId) || 0)) {
           if (!H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: recent });
-          await pauseHeld(info, session);
+          await pauseHeld(info, session, args);
           throw refused(`The user is typing in this tab right now; the agent never types over them. ${keepGoing(args)}`, { kind: 'user_control' });
         }
       }
@@ -2434,16 +2450,17 @@ const TOOLS = [
         return handoffLines(args.cancel ? 'cancelled' : 'released', info, info.url);
       }
       if (reason === 'user_control' && args.resume) {
-        // Only the user ends a takeover pause: their click on the bar, or their answer on pre.dev's CLI card.
+        // Only the user ends a takeover pause: their click on the bar, their answer on pre.dev's CLI card, or their
+        // Done on a handed cloud run's card (that run's hand-back).
         const s0 = await chrome.session(info.targetId);
         await notePause(info, s0);
-        if (cliSaidGo(args) && H.paused.has(info.targetId)) await liftPause(info, s0);
+        if ((cliSaidGo(args) || cardSaidGo(args)) && H.paused.has(info.targetId)) await liftPause(info, s0);
         if (args.wait === true) {
           const until = Date.now() + RESUME_WAIT_MS;
           while (Date.now() < until && !ctx.signal?.aborted && await pauseHeld(info, s0)) await sleep(500);
           if (H.paused.has(info.targetId)) return handoffLines('waiting', info, info.url, 'They haven\'t clicked "Let the agent continue" yet. Keep waiting for them (call this again), or ask them in a message; don\'t act in this tab meanwhile.');
         }
-        if (await pauseHeld(info, s0)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
+        if (await pauseHeld(info, s0, args)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
         end(info.targetId, 'resumed');
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }

@@ -252,7 +252,8 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     args.__agent = agent;
     args.__predev_handoff = true;
     args.__via = 'web';
-    // Of chrome_handoff, a handed task's run may: take the tab back after the user had it (a card's Done); hand the
+    // Of chrome_handoff, a handed task's run may: take the tab back after the user had it (a card's Done, which also
+    // ends a takeover pause there: __predev_card_done is set here only, and callArgs drops any caller's); hand the
     // user a sign-in step in its own tab without waiting (a passkey: the browser and Touch ID do it, nothing is typed),
     // with a done check from the URL or the page's structure; and run that check. Never a wait, a release of another
     // agent's tab, or any other reason.
@@ -263,7 +264,7 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       const done = args.done && typeof args.done === 'object' && kinds.includes(args.done.kind)
         ? { kind: args.done.kind, ...(typeof args.done.value === 'string' ? { value: args.done.value.slice(0, 300) } : {}) } : { kind: 'url_changes' };
       if (!args.tab) return text('A call for this task must name its tab.');
-      if (args.reason === 'user_control' && args.resume === true) handoffArgs = { ...base, reason: 'user_control', resume: true };
+      if (args.reason === 'user_control' && args.resume === true) handoffArgs = { ...base, reason: 'user_control', resume: true, __predev_card_done: true };
       // A check for Chrome's own dialog keeps its reason: that check is whether a key reaches the page again.
       else if (args.check === true) handoffArgs = { ...base, check: true, ...(args.reason === 'chrome_dialog' ? { reason: 'chrome_dialog' } : {}) };
       else if ((args.reason === 'login_required' || args.reason === 'step_up') && args.wait === false) handoffArgs = { ...base, reason: args.reason, wait: false, done };

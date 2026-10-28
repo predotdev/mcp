@@ -663,6 +663,8 @@ const waitsForUser = (name, a) => name === 'chrome_handoff' && a.wait !== false 
 function withVia(args) {
   const out = { ...args };
   delete out.__via;
+  // A handed cloud run's hand-back after its card (web_rules.mjs taskCall), never a local agent's.
+  delete out.__predev_card_done;
   if (FROM_PREDEV) out.__via = 'cli';
   else delete out.__predev_user_said_go;
   return out;
