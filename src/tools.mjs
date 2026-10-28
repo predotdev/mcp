@@ -980,9 +980,10 @@ async function userTouchedAt(info, session) {
 // shows at the top of the tab (a trusted click, in a script world the page can't reach), or, from pre.dev's own CLI,
 // the user's answer on its card (__predev_user_said_go: the bridge passes it only for that CLI, which never takes it
 // from its model). On a tab of a task handed here from pre.dev's cloud run, the run's card on pre.dev is the one way
-// back: the bar has no button there, and the run's hand-back after the person's Done on that card lifts the pause
-// (__predev_card_done: set only by web_rules.mjs taskCall, for that hand-back). Nothing else lifts it: not a resume
-// the agent asks for, not a release, cancel or another handoff.
+// back: the bar has no button there, and the run's hand-back after the person's Done on its user_control card lifts
+// the pause (__predev_card_done: set only by web_rules.mjs taskCall, for a hand-back that names that card). Nothing
+// else lifts it: not a resume the agent asks for, not a release, cancel or another handoff, and not the hand-back
+// after any other card (a dialog card that closed by itself, a sign-in's Done).
 H.paused ||= new Map(); // targetId -> { at, card? }: when the user took the tab; card: a handed cloud run's tab
 H.pauseWorlds ||= new Map(); // targetId -> the bar's script world in the tab's current page
 const PAUSE_WORLD = 'predev-pause';
@@ -2460,7 +2461,7 @@ const TOOLS = [
           while (Date.now() < until && !ctx.signal?.aborted && await pauseHeld(info, s0)) await sleep(500);
           if (H.paused.has(info.targetId)) return handoffLines('waiting', info, info.url, 'They haven\'t clicked "Let the agent continue" yet. Keep waiting for them (call this again), or ask them in a message; don\'t act in this tab meanwhile.');
         }
-        if (await pauseHeld(info, s0, args)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
+        if (await pauseHeld(info, s0, args)) throw refused(handedRun(args) ? `The tab stays the user's. ${keepGoing(args)}` : `The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
         end(info.targetId, 'resumed');
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }
