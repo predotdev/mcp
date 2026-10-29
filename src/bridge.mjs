@@ -87,6 +87,7 @@ class Chrome {
     this.sessions = new Map();  // targetId -> sessionId
     this.connecting = null;
     this.upgrading = null;      // the debugging connection Chrome has not answered yet
+    this.lostByChrome = false;  // the last connection this process held was closed from Chrome's side
     this.listeners = new Set();
   }
 
@@ -97,6 +98,16 @@ class Chrome {
   /** Chrome's "Allow remote debugging?" prompt is up: DevToolsActivePort was read and Chrome holds the debugging
    *  connection unanswered. A Chrome that quit refuses it, or there is no DevToolsActivePort, and the connect fails. */
   get awaitingAllow() { return this.upgrading?.readyState === 0; }
+  /** The kept connection for GET /state (D.5): true while it is up. false only once a connection this process held
+   *  was closed from Chrome's side (Chrome quit, crashed, or its debugging was turned off), until the next connection.
+   *  undefined when this process has held no connection yet (a fresh start, before its first Chrome call) or its own
+   *  close came last, since then "not connected" says nothing about Chrome. This process never closes the kept
+   *  connection itself while Chrome runs: the only close it makes is a 10-minute unanswered "Allow remote debugging?"
+   *  upgrade, which counts as its own. */
+  get keptConnection() {
+    if (this.connected) return true;
+    return this.lostByChrome ? false : undefined;
+  }
 
   // One pending connection at a time: while Chrome's "Allow remote debugging?" prompt is up,
   // callers get a clear retry message instead of each opening another prompt.
@@ -122,6 +133,7 @@ class Chrome {
     this.upgrading = ws;
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.lostByChrome = false;
         try { ws.close(); } catch {}
         reject(new Error('Chrome\'s "Allow remote debugging?" prompt was not answered in 10 minutes; retry to ask again.'));
       }, 600000);
@@ -131,6 +143,7 @@ class Chrome {
     ws.onmessage = event => this.#onMessage(JSON.parse(event.data));
     ws.onclose = () => {
       log('chrome connection closed');
+      if (this.ws === ws) this.lostByChrome = true;
       this.ws = null;
       this.targets.clear();
       this.sessions.clear();
@@ -138,6 +151,7 @@ class Chrome {
       this.pending.clear();
     };
     this.ws = ws;
+    this.lostByChrome = false;
     if (this.wsUrl !== url) { contextDirs.clear(); this.wsUrl = url; loadProfileMap(); }
     failedProbes.clear();
     triedDirs.clear();
