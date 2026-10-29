@@ -79,6 +79,21 @@ export function forgetAllowedSite(stateDir, site) {
 
 const escapeHtml = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+/** Whether this computer's Chrome is gone (D.3), from the bridge's own connection (bridge.mjs Chrome). Connected: a tab
+ *  gone from the list counts as closed only once Chrome is still connected a moment later (quitting drops the tabs just
+ *  before the connection), so false. Else one bounded try to connect again: a connect that fails (no
+ *  DevToolsActivePort, refused, or closed) is true; one Chrome still holds unanswered is its "Allow remote debugging?"
+ *  prompt, 'allow' (Chrome is open and waits on the person); one that connects is false. */
+export async function chromeGone(chrome, sleep) {
+  if (chrome.connected) {
+    await sleep(1000);
+    if (chrome.connected) return false;
+  }
+  const failed = await Promise.race([chrome.connect().then(() => false, () => true), sleep(3000).then(() => null)]);
+  if (failed === null) return chrome.awaitingAllow ? 'allow' : !chrome.connected;
+  return failed || !chrome.connected;
+}
+
 export function createChannel(ctx) {
   const { stateDir, chromeDir, chrome, log, sleep, callTool, loadTools, privateTabs, readCredentials, cliLogin, defaultApiUrl } = ctx;
   const { pairing: PAIRING_FILE, sites: SITES_FILE, tasks: TASKS_FILE } = pairingFiles(stateDir);
@@ -298,20 +313,6 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
 
   // ---------------------------------------------------------------- a handed task, carried on by pre.dev's cloud
 
-  /** This computer's Chrome quit or is not connected (D.3): a tab gone from the list counts as closed only once Chrome
-   *  is still connected a moment later (quitting drops the tabs just before the connection), else one bounded try to
-   *  connect again says whether it is back. */
-  async function chromeGone() {
-    if (chrome.connected) {
-      await sleep(1000);
-      if (chrome.connected) return false;
-    }
-    try {
-      await Promise.race([chrome.connect(), sleep(3000).then(() => { throw new Error('no answer'); })]);
-    } catch { return true; }
-    return !chrome.connected;
-  }
-
   /** "Finish in my Chrome" (web_rules.mjs), with this computer's Chrome, its person and its task list. */
   const taskCalls = (port, api) => createTaskCalls({
     callTool,
@@ -335,7 +336,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     refresh: () => chrome.connect(),
     log: line => log('channel', line),
     busyOf: async tab => (api.busyOf ? api.busyOf(tab) : null),
-    chromeGone,
+    chromeGone: () => chromeGone(chrome, sleep),
   });
   /** One call from pre.dev's cloud run of a task handed here. */
   const taskCall = (body, port, api) => taskCalls(port, api).taskCall(body);

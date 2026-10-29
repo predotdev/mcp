@@ -35,8 +35,12 @@ export const isLocalHost = host => host === 'localhost' || host.endsWith('.local
 export const text = (t, isError = true) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
 /** A refusal a cloud run acts on (tools.mjs Refused): the same words, plus what it was for. */
 export const refusedText = (t, refusal) => ({ ...text(t), refusal });
-/** A handed task's call while this computer's Chrome is gone (quit, or not connected): its tab can't be reached. */
-export const chromeGoneText = () => refusedText("Chrome on this computer isn't running or isn't connected to pre.dev, so this task's tab can't be reached right now.", { kind: 'chrome_gone' });
+/** A handed task's call while this computer's Chrome is gone (quit, or not connected): its tab can't be reached. With
+ *  allowPrompt, Chrome is open and asking "Allow remote debugging?": the kind stays chrome_gone (the run stops the same
+ *  way), and the person clicks Allow, then resumes the task. */
+export const chromeGoneText = (allowPrompt = false) => allowPrompt
+  ? refusedText('Chrome on this computer is asking "Allow remote debugging?". Click Allow in Chrome, then resume this task.', { kind: 'chrome_gone', allowPrompt: true })
+  : refusedText("Chrome on this computer isn't running or isn't connected to pre.dev, so this task's tab can't be reached right now.", { kind: 'chrome_gone' });
 export const notAllowed = site => text(`The user didn't allow web runs to use ${site} in their Chrome (pre.dev asks on their computer the first time a web run uses a site). Don't retry on your own: tell them in one line what you need from ${site}, and continue with what you have.`);
 /** Nobody answered the question in time: that says nothing about what the person wants, so the run asks them (their
  *  go-ahead is a new turn of the run, which asks again). */
@@ -226,11 +230,17 @@ export const taskAgent = taskId => `handed:${taskId}`;
  *   onReopen(taskId, tab)    a task's tab was opened again after a new browser session (tab '' when it could not be)
  *   cloudOnly                true when nothing on this computer can take a task over (the extension): it keeps
  *                            only the task's id, site and tab, never its instruction or progress
- *   chromeGone()             true when this computer's Chrome quit or is not connected: a call that finds no tab
- *                            then says chrome_gone, never tab_closed (the extension runs in Chrome: never gone)
+ *   chromeGone()             true when this computer's Chrome quit or is not connected, 'allow' when Chrome is open
+ *                            and asking "Allow remote debugging?": a call that finds no tab then says chrome_gone
+ *                            (allowPrompt for 'allow'), never tab_closed (the extension runs in Chrome: never gone)
  */
 export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, isAllowed, askToAllow, webCalls, tasks, defaultProfile, owned, approved, inflight, refresh = async () => {}, log = () => {}, onReopen = () => {}, cloudOnly = false, busyOf = async () => null, chromeGone = async () => false }) {
   const handedTask = async taskId => (await tasks.list()).find(t => t.taskId === taskId) || null;
+  /** A call that finds no tab: Chrome gone (chrome_gone, allowPrompt while it asks "Allow remote debugging?"), else closed(). */
+  const noTab = async closed => {
+    const gone = await chromeGone();
+    return gone ? chromeGoneText(gone === 'allow') : closed();
+  };
 
   /** One call from pre.dev's cloud run of a task handed here. It drives only the tabs it opened for that task
    *  (the one opened at hand-off, and its popups), with this computer's rules, and only while no agent here took
@@ -242,7 +252,7 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
     // In the extension (cloudOnly) no agent on this computer takes a task over, so a task it no longer has lost its tab:
     // every window of this Chrome was closed, or Chrome restarted. The run stops with its progress saved, to resume in the cloud or here.
     if (!t) return cloudOnly
-      ? ((await chromeGone()) ? chromeGoneText() : refusedText("This Chrome doesn't have this task any more: its windows were closed or Chrome restarted, so the run's tab is gone.", { kind: 'tab_closed' }))
+      ? noTab(() => refusedText("This Chrome doesn't have this task any more: its windows were closed or Chrome restarted, so the run's tab is gone.", { kind: 'tab_closed' }))
       : refusedText('This task is not handed to this computer any more.', { kind: 'taken_over' });
     if (t.driver !== 'cloud') return refusedText('An agent on this computer has this task now.', { kind: 'taken_over' });
     // A ping says whether the task's tab is busy: { type } of a dialog open there that only the person may close
@@ -298,7 +308,7 @@ export function createTaskCalls({ callTool, ctx, tabInfo, isPrivate, siteFor, is
       }
       // No tab: closed in a Chrome that is still here (tab_closed), or Chrome itself quit or lost its
       // connection (chrome_gone), which pre.dev tells apart (the computer is offline, the task is not over).
-      if (!info) return (await chromeGone()) ? chromeGoneText() : refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
+      if (!info) return noTab(() => refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' }));
       if (isPrivate(info.targetId)) return refusedText(PRIVATE_TAB, { kind: 'scope' });
       // The tab opened for this task stays this run's, also after this client restarted (the list says so).
       if (t.tab && info.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) owned(agent)?.add(info.targetId);

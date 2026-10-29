@@ -86,6 +86,7 @@ class Chrome {
     this.targets = new Map();   // targetId -> TargetInfo
     this.sessions = new Map();  // targetId -> sessionId
     this.connecting = null;
+    this.upgrading = null;      // the debugging connection Chrome has not answered yet
     this.listeners = new Set();
   }
 
@@ -93,6 +94,9 @@ class Chrome {
   onEvent(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
 
   get connected() { return this.ws?.readyState === 1; }
+  /** Chrome's "Allow remote debugging?" prompt is up: DevToolsActivePort was read and Chrome holds the debugging
+   *  connection unanswered. A Chrome that quit refuses it, or there is no DevToolsActivePort, and the connect fails. */
+  get awaitingAllow() { return this.upgrading?.readyState === 0; }
 
   // One pending connection at a time: while Chrome's "Allow remote debugging?" prompt is up,
   // callers get a clear retry message instead of each opening another prompt.
@@ -115,6 +119,7 @@ class Chrome {
     }
     const url = `ws://127.0.0.1:${port}${wsPath}`;
     const ws = new WebSocket(url);
+    this.upgrading = ws;
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
@@ -122,7 +127,7 @@ class Chrome {
       }, 600000);
       ws.onopen = () => { clearTimeout(timer); resolve(); };
       ws.onerror = () => { clearTimeout(timer); reject(new Error('Chrome refused the debugging connection (prompt cancelled, or Chrome is not running).')); };
-    });
+    }).finally(() => { if (this.upgrading === ws) this.upgrading = null; });
     ws.onmessage = event => this.#onMessage(JSON.parse(event.data));
     ws.onclose = () => {
       log('chrome connection closed');
