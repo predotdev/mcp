@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pre.dev</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <img src="icons/icon-32.png" alt="" width="20" height="20">
+  <h1>pre.dev in this Chrome</h1>
+  <span id="pill" class="pill">...</span>
+</header>
+
+<section id="blocked" class="banner warn" hidden></section>
+
+<section id="unpaired" hidden>
+  <p>Let runs you start on pre.dev work in this Chrome, signed in as you. It asks before each new site.</p>
+  <button id="pair" class="primary">Pair with pre.dev</button>
+</section>
+
+<section id="pairing" hidden>
+  <p>Approve this Chrome on pre.dev, in the tab that just opened.</p>
+  <p>Your code: <b id="code"></b></p>
+  <p><a id="again" href="#">Open pre.dev again</a></p>
+  <button id="cancel">Cancel</button>
+</section>
+
+<section id="paired" hidden>
+  <p id="account" class="account"></p>
+  <div id="pauseRow" class="row">
+    <button id="pause">Pause</button>
+    <span id="pauseNote" class="dim small"></span>
+  </div>
+  <div id="runs"></div>
+
+  <h2>Allowed sites</h2>
+  <ul id="sites" class="sites"></ul>
+  <p id="noSites" class="dim small">No sites yet. The first time a web run uses a site, this Chrome asks you.</p>
+
+  <details id="activity" class="activity">
+    <summary id="activityTitle">Activity (0)</summary>
+    <ol id="log" class="log"></ol>
+    <p id="noLog" class="dim small">Nothing yet.</p>
+  </details>
+
+  <button id="unpair" class="danger">Unpair this Chrome</button>
+</section>
+
+<p id="error" class="error" hidden></p>
+<p id="dev" class="dim small" hidden></p>
+<script type="module" src="popup.mjs"></script>
+</body>
+</html>

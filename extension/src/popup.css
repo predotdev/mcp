@@ -1,0 +1,37 @@
+:root { color-scheme: dark; --bg: #0d0d0d; --fg: #cfd3da; --dim: #8a93a2; --line: #262626; --white: #fff; --warn: #f5c26b; --bad: #f87171; --ok: #4ade80; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; width: 360px; background: var(--bg); color: var(--fg); font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; padding: 14px; }
+header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+h1 { font-size: 14px; color: var(--white); margin: 0; flex: 1; }
+h2 { font-size: 12px; color: var(--white); margin: 16px 0 6px; text-transform: none; }
+p { margin: 0 0 8px; }
+b { color: var(--white); }
+a { color: var(--white); }
+.dim { color: var(--dim); }
+.small { font-size: 12px; }
+.pill { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--dim); }
+.pill.online { color: var(--ok); border-color: #1f3d2a; }
+.pill.paused, .pill.blocked { color: var(--warn); border-color: #4a3a17; }
+button { font: inherit; font-weight: 600; border-radius: 7px; padding: 6px 12px; cursor: pointer; border: 1px solid #333; background: transparent; color: var(--fg); }
+button.primary { background: var(--white); color: #000; border-color: var(--white); }
+button.danger { color: var(--bad); border-color: #4a1f1f; margin-top: 6px; }
+button:disabled { opacity: .5; cursor: default; }
+.row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+.banner { border: 1px solid #4a3a17; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.warn { color: var(--warn); }
+.error { color: var(--bad); margin-top: 10px; }
+.account { color: var(--white); }
+.run { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; display: flex; gap: 8px; align-items: center; }
+.run .what { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.sites { list-style: none; padding: 0; margin: 0; }
+.sites li { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.sites label { display: flex; gap: 8px; align-items: center; cursor: pointer; overflow-wrap: anywhere; }
+.activity { margin-top: 16px; }
+.activity summary { font-size: 12px; font-weight: 600; color: var(--white); cursor: pointer; margin-bottom: 6px; }
+.log { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--line); }
+.log li { padding: 5px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 68px 1fr; gap: 6px; }
+.log time { color: var(--dim); font-variant-numeric: tabular-nums; }
+.log .refused { color: var(--warn); }
+.log .failed { color: var(--bad); }
+.log .control { color: var(--dim); }

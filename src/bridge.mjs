@@ -86,9 +86,28 @@ class Chrome {
     this.targets = new Map();   // targetId -> TargetInfo
     this.sessions = new Map();  // targetId -> sessionId
     this.connecting = null;
+    this.upgrading = null;      // the debugging connection Chrome has not answered yet
+    this.lostByChrome = false;  // the last connection this process held was closed from Chrome's side
+    this.listeners = new Set();
   }
 
+  /** Every event of an attached tab, as (targetId, method, params): tools.mjs follows the page's own dialogs with it. */
+  onEvent(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+
   get connected() { return this.ws?.readyState === 1; }
+  /** Chrome's "Allow remote debugging?" prompt is up: DevToolsActivePort was read and Chrome holds the debugging
+   *  connection unanswered. A Chrome that quit refuses it, or there is no DevToolsActivePort, and the connect fails. */
+  get awaitingAllow() { return this.upgrading?.readyState === 0; }
+  /** The kept connection for GET /state (D.5): true while it is up. false only once a connection this process held
+   *  was closed from Chrome's side (Chrome quit, crashed, or its debugging was turned off), until the next connection.
+   *  undefined when this process has held no connection yet (a fresh start, before its first Chrome call) or its own
+   *  close came last, since then "not connected" says nothing about Chrome. This process never closes the kept
+   *  connection itself while Chrome runs: the only close it makes is a 10-minute unanswered "Allow remote debugging?"
+   *  upgrade, which counts as its own. */
+  get keptConnection() {
+    if (this.connected) return true;
+    return this.lostByChrome ? false : undefined;
+  }
 
   // One pending connection at a time: while Chrome's "Allow remote debugging?" prompt is up,
   // callers get a clear retry message instead of each opening another prompt.
@@ -111,17 +130,20 @@ class Chrome {
     }
     const url = `ws://127.0.0.1:${port}${wsPath}`;
     const ws = new WebSocket(url);
+    this.upgrading = ws;
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.lostByChrome = false;
         try { ws.close(); } catch {}
         reject(new Error('Chrome\'s "Allow remote debugging?" prompt was not answered in 10 minutes; retry to ask again.'));
       }, 600000);
       ws.onopen = () => { clearTimeout(timer); resolve(); };
       ws.onerror = () => { clearTimeout(timer); reject(new Error('Chrome refused the debugging connection (prompt cancelled, or Chrome is not running).')); };
-    });
+    }).finally(() => { if (this.upgrading === ws) this.upgrading = null; });
     ws.onmessage = event => this.#onMessage(JSON.parse(event.data));
     ws.onclose = () => {
       log('chrome connection closed');
+      if (this.ws === ws) this.lostByChrome = true;
       this.ws = null;
       this.targets.clear();
       this.sessions.clear();
@@ -129,6 +151,7 @@ class Chrome {
       this.pending.clear();
     };
     this.ws = ws;
+    this.lostByChrome = false;
     if (this.wsUrl !== url) { contextDirs.clear(); this.wsUrl = url; loadProfileMap(); }
     failedProbes.clear();
     triedDirs.clear();
@@ -155,6 +178,11 @@ class Chrome {
       this.sessions.delete(params.targetId);
     } else if (method === 'Target.detachedFromTarget') {
       for (const [targetId, sessionId] of this.sessions) if (sessionId === params.sessionId) this.sessions.delete(targetId);
+    }
+    if (message.sessionId && this.listeners.size) {
+      let targetId = null;
+      for (const [t, s] of this.sessions) if (s === message.sessionId) { targetId = t; break; }
+      if (targetId) for (const listener of this.listeners) { try { listener(targetId, method, params); } catch {} }
     }
   }
 
@@ -256,25 +284,76 @@ async function callTool(name, args, ctx, tools = {}) {
 
 function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
 
-function takeLock() {
-  for (let attempt = 0; attempt < 2; attempt++) {
+// A daemon killed hard (a crash, SIGKILL, a stopped container) leaves its lock behind, and its pid
+// can come back as another program, or as the next daemon itself (a fresh container often gives it
+// the same pid). So a live pid alone proves nothing: a lock counts while its daemon answers at the
+// port its state file names, and for the moment between taking the lock and listening.
+const LOCK_STARTING_MS = 5000;
+
+/** The lock's text and when it was written, read from one open file; null when there is none. */
+function readLock(file = LOCK_FILE) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    return { text: fs.readFileSync(fd, 'utf8'), at: fs.fstatSync(fd).mtimeMs };
+  } catch { return null; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+
+/** Whether a running daemon holds this lock. One too busy to answer in time still counts. */
+async function lockHeld(lock) {
+  const pid = Number(lock.text) || 0;
+  if (pid === process.pid || (pid && !pidAlive(pid))) return false;
+  // Just taken, or still being written: its daemon is not listening yet.
+  if (Math.abs(Date.now() - lock.at) < LOCK_STARTING_MS) return true;
+  if (!pid) return false;
+  let state = null;
+  try { state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
+  if (state?.pid !== pid || !state.port || !state.token) return false;
+  try {
+    const res = await fetch(`http://127.0.0.1:${state.port}/health`, { headers: { 'x-bridge-token': state.token }, signal: AbortSignal.timeout(3000) });
+    return (await res.json())?.ok === true;
+  } catch (error) { return error?.name === 'TimeoutError'; }
+}
+
+/** Clears a stale lock. One start at a time does it (it holds LOCK_FILE.break meanwhile), and only
+ *  while the lock is still the one found stale, so a lock another start just took always stays.
+ *  False when another start is clearing it. */
+function breakLock(stale) {
+  const guard = `${LOCK_FILE}.break`;
+  try { fs.closeSync(fs.openSync(guard, 'wx', 0o600)); } catch {
+    // A guard left by a start that died while holding it is cleared once it is old.
+    const left = readLock(guard);
+    if (left && Math.abs(Date.now() - left.at) >= LOCK_STARTING_MS) fs.rmSync(guard, { force: true });
+    return false;
+  }
+  try {
+    const now = readLock();
+    if (now?.text === stale.text && now.at === stale.at) fs.rmSync(LOCK_FILE, { force: true });
+  } finally { fs.rmSync(guard, { force: true }); }
+  return true;
+}
+
+async function takeLock() {
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const fd = fs.openSync(LOCK_FILE, 'wx', 0o600);
       fs.writeSync(fd, String(process.pid));
       fs.closeSync(fd);
       return true;
-    } catch {
-      const holder = Number(fs.readFileSync(LOCK_FILE, 'utf8')) || 0;
-      if (holder && pidAlive(holder)) return false;
-      fs.rmSync(LOCK_FILE, { force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
     }
+    const lock = readLock();
+    if (!lock) continue; // released just now
+    if (await lockHeld(lock)) return false;
+    if (!breakLock(lock)) await sleep(50);
   }
   return false;
 }
 
-function runDaemon() {
+async function runDaemon() {
   privateStateDir();
-  if (!takeLock()) { log('another daemon holds the lock; exiting'); process.exit(0); }
+  if (!await takeLock()) { log('another daemon holds the lock; exiting'); process.exit(0); }
   const release = () => {
     try { if (fs.readFileSync(LOCK_FILE, 'utf8') === String(process.pid)) fs.rmSync(LOCK_FILE); } catch {}
     // A state file left behind names a port another program could take after this one exits.
@@ -398,6 +477,9 @@ function handoffFor(apiKey) {
  *  asked for. Only then may a call lift the kept sign-in (__predev_signout_ok); from any other
  *  agent it is dropped, so a model can't lift it by passing the argument itself. */
 const FROM_PREDEV = /^(1|true|on|yes)$/i.test(process.env.PREDEV_MCP_FROM_PREDEV || '');
+/** PREDEV_ALERT_AUTO_OK=off: alerts in this agent's tabs stay for the user, like a confirm (tools.mjs). It goes with
+ *  each call, so it holds at once for this agent, also with a daemon another agent started. */
+const ALERT_AUTO_OK_OFF = /^(0|off|false|no)$/i.test(process.env.PREDEV_ALERT_AUTO_OK || '');
 /** Which agent a call comes from, so agents sharing the daemon keep to their own tabs. */
 const AGENT_ID = crypto.randomBytes(6).toString('hex');
 // Read on every call, so signing in takes effect without restarting the agent. An agent's
@@ -585,6 +667,7 @@ function withCallFlags(args, ctx = shimCtx()) {
   const out = { ...(args || {}), __agent: AGENT_ID };
   if (ctx.handoff) out.__predev_handoff = true;
   if (!FROM_PREDEV) delete out.__predev_signout_ok;
+  if (ALERT_AUTO_OK_OFF) out.__predev_alert_auto_ok = false;
   return out;
 }
 
@@ -599,6 +682,8 @@ const waitsForUser = (name, a) => name === 'chrome_handoff' && a.wait !== false 
 function withVia(args) {
   const out = { ...args };
   delete out.__via;
+  // A handed cloud run's hand-back after its card (web_rules.mjs taskCall), never a local agent's.
+  delete out.__predev_card_done;
   if (FROM_PREDEV) out.__via = 'cli';
   else delete out.__predev_user_said_go;
   return out;
