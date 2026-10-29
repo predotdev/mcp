@@ -298,6 +298,20 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
 
   // ---------------------------------------------------------------- a handed task, carried on by pre.dev's cloud
 
+  /** This computer's Chrome quit or is not connected (D.3): a tab gone from the list counts as closed only once Chrome
+   *  is still connected a moment later (quitting drops the tabs just before the connection), else one bounded try to
+   *  connect again says whether it is back. */
+  async function chromeGone() {
+    if (chrome.connected) {
+      await sleep(1000);
+      if (chrome.connected) return false;
+    }
+    try {
+      await Promise.race([chrome.connect(), sleep(3000).then(() => { throw new Error('no answer'); })]);
+    } catch { return true; }
+    return !chrome.connected;
+  }
+
   /** "Finish in my Chrome" (web_rules.mjs), with this computer's Chrome, its person and its task list. */
   const taskCalls = (port, api) => createTaskCalls({
     callTool,
@@ -321,6 +335,7 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
     refresh: () => chrome.connect(),
     log: line => log('channel', line),
     busyOf: async tab => (api.busyOf ? api.busyOf(tab) : null),
+    chromeGone,
   });
   /** One call from pre.dev's cloud run of a task handed here. */
   const taskCall = (body, port, api) => taskCalls(port, api).taskCall(body);
