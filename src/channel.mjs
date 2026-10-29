@@ -389,7 +389,19 @@ ${q.warn ? `<p class="warn">${escapeHtml(q.warn)}</p>` : ''}
       head(200);
       const api = await loadTools();
       if (route === 'GET /state') {
-        end({ ok: true, chrome: chrome.connected || fs.existsSync(path.join(chromeDir, 'DevToolsActivePort')), version: ctx.version, profiles: profiles() });
+        // chrome: can this computer take a step (Chrome connected, or its debugging port file is there).
+        // connected / allowPrompt: the daemon's one kept Chrome connection as it is right now, for a step that waits
+        // in that Chrome (D.5): not connected = Chrome quit or debugging was turned off; allowPrompt = Chrome is open
+        // and asking "Allow remote debugging?". Read only: /state never starts a connect, since one on every probe
+        // would raise that prompt again after the person said Deny.
+        end({
+          ok: true,
+          chrome: chrome.connected || fs.existsSync(path.join(chromeDir, 'DevToolsActivePort')),
+          connected: chrome.connected,
+          allowPrompt: chrome.awaitingAllow,
+          version: ctx.version,
+          profiles: profiles(),
+        });
       } else if (route === 'GET /tools') {
         end(webTools(api));
       } else if (route === 'POST /sites/revoke') {
