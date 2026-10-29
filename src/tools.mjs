@@ -1827,10 +1827,19 @@ function sandboxWrap(js, href) {
 }
 
 const SANDBOX_CSP = "sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline' data:; img-src data:; font-src data:; form-action 'none'";
+// No peer connections in the copy: request interception, the offline emulation and the CSP don't cover WebRTC, so the
+// sandbox target drops its constructors from every frame before any script runs. Registered on the sandbox target's own
+// session only: nothing outside its throwaway context changes.
+const NO_WEBRTC_SOURCE = `(() => {
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
+    try { delete globalThis[name]; } catch {}
+    try { if (name in globalThis) Object.defineProperty(globalThis, name, { value: undefined }); } catch {}
+  }
+})();`;
 const sandboxUnavailable = site => `Refused: on ${site} chrome_eval runs your script against a read-only copy of the page (no page session, storage or network), and this Chrome could not open the hidden sandbox it needs. Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`;
 
 // Serve the copy to a hidden target in a throwaway context on a side connection, run the script
-// there, and tear the context down. The side connection keeps the sandbox target's events off the
+// there (no WebRTC in that target), and tear the context down. The side connection keeps the sandbox target's events off the
 // daemon's own bridge (its dialog follower never sees it); the id and context are hidden from every
 // tab listing meanwhile. Returns the script's JSON value.
 async function sandboxEval(liveSession, info, js, href) {
@@ -1879,6 +1888,7 @@ async function sandboxEval(liveSession, info, js, href) {
     await send('Network.enable', {}, sessionId).catch(() => {});
     await send('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }, sessionId).catch(() => {});
     await send('Page.enable', {}, sessionId);
+    await send('Page.addScriptToEvaluateOnNewDocument', { source: NO_WEBRTC_SOURCE }, sessionId);
     await send('Page.navigate', { url: SENTINEL }, sessionId);
     const loadEnd = Date.now() + 8000;
     for (;;) {
