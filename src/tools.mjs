@@ -801,12 +801,19 @@ function activeFacts() {
 function factsOf(el) {
   const form = el.form || (el.closest && el.closest('form'));
   const sub = form ? form.querySelector('button:not([type]),button[type=submit],input[type=submit],input[type=image]') : null;
+  const isSubmit = (el.tagName === 'BUTTON' && (!el.getAttribute('type') || el.type === 'submit')) || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image'));
+  // Where a submission from here goes, and how: a submit control's own formaction and formmethod,
+  // else those of the form's default button (Enter in a field submits through it), else the form's
+  // action and method, resolved against the page as the browser does.
+  const by = isSubmit ? el : sub;
+  const own = name => !!by && by.hasAttribute(name) && String(by.getAttribute(name)).trim() !== '';
   return {
     secret: structSecret(el), desc: describe(el), tag: el.tagName.toLowerCase(), type: el.type || '',
     autocomplete: el.getAttribute('autocomplete') || '', inForm: !!form,
-    formMethod: form ? String(form.method || '') : '', submitDesc: sub ? describe(sub) : '',
-    href: (el.closest && el.closest('a[href]') || {}).href || '', formAction: form ? String(form.action || '') : '',
-    isSubmit: (el.tagName === 'BUTTON' && (!el.getAttribute('type') || el.type === 'submit')) || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')),
+    formMethod: form ? String((own('formmethod') ? by.formMethod : form.method) || '') : '', submitDesc: sub ? describe(sub) : '',
+    href: (el.closest && el.closest('a[href]') || {}).href || '',
+    formAction: form ? String((own('formaction') ? by.formAction : form.action) || '') : '',
+    isSubmit,
   };
 }
 function valueOf(q) {
@@ -909,57 +916,121 @@ const INPUT_WATCH = `(() => {
   const seen = e => { if (e.isTrusted) window.__predevSeen = (window.__predevSeen || 0) + 1; };
   for (const type of ['pointerdown', 'mousedown', 'keydown', 'keyup', 'beforeinput']) addEventListener(type, seen, true);
 })()`;
-// A passkey (WebAuthn) ceremony the AGENT'S own click or key starts in the user's Chrome is declined like a
-// cancelled sheet, so Touch ID never shows for a step the user did not start. A ceremony the USER starts (while
-// the agent is not acting, e.g. during a handoff) is left alone, so their passkey works. The page's API is
-// wrapped once; nothing is read about the call.
-const WEBAUTHN_WATCH = `(() => {
-  if (window.__predevWebauthnWatch) return; window.__predevWebauthnWatch = true;
-  const C = (typeof CredentialsContainer !== 'undefined') ? CredentialsContainer.prototype : null;
+// A passkey (WebAuthn) ceremony in an agent tab reaches the authenticator only when the latest activation in
+// the tab (a trusted click, tap or key) was the person's. Everything the daemon does to the page is the agent's:
+// each action tool, and each input it dispatches, is marked through `__predevPk` with a key only pre.dev holds
+// (one per tab, `T`, never in the page's reach), and a document that starts loading meanwhile starts as the
+// agent's (agentMark's new-document script). Any other trusted click, tap or key is the person's. A ceremony
+// after the agent's own action, however long after, or one with no activation at all in its document (a page
+// that asks on load), is declined like a cancelled sheet, so Touch ID never shows for a step the person did not
+// start; the agent is told on its next call (passkeyRefusal). Conditional (autofill) passkey requests are left
+// alone. What the watch knows lives in its closure, so the page can't change it; a frame from the same origin
+// asks its parent, and a frame from another origin can't reach it (it counts its own input only).
+const webauthnWatch = token => `(() => {
+  if (Object.getOwnPropertyDescriptor(window, '__predevPk')) return;
+  const T = ${JSON.stringify(token)};
+  const apply = Reflect.apply, define = Object.defineProperty, P = performance, pnow = Performance.prototype.now, t0 = P.timeOrigin;
+  const now = () => t0 + apply(pnow, P, []);
+  const top = window === window.parent;
+  let agent = false, agentAt = 0, personAt = 0, declined = null;
+  const up = name => { if (top) return null; try { const f = window.parent[name]; return typeof f === 'function' ? f : null; } catch (e) { return null; } };
+  const agentOn = () => { if (agent) return true; const f = up('__predevPkAgent'); return !!f && f() === true; };
+  const times = () => { const f = up('__predevPkTimes'); const p = f ? f() : null; return p ? [Math.max(agentAt, +p[0] || 0), Math.max(personAt, +p[1] || 0)] : [agentAt, personAt]; };
+  const note = (e, act) => { if (!e.isTrusted) return; if (agentOn()) agentAt = now(); else if (act) personAt = now(); };
+  for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'keydown', 'keyup', 'touchstart', 'touchend']) addEventListener(type, e => note(e, true), true);
+  for (const type of ['wheel', 'beforeinput', 'input', 'change', 'paste', 'drop']) addEventListener(type, e => note(e, false), true);
+  const record = name => { if (top) declined = { at: now(), ceremony: name }; else { const f = up('__predevPkDeclined'); if (f) f(name); } };
+  const fixed = (name, value) => { try { define(window, name, { value, configurable: false, enumerable: false, writable: false }); } catch (e) {} };
+  fixed('__predevPkAgent', () => agentOn());
+  fixed('__predevPkTimes', () => times());
+  fixed('__predevPkDeclined', name => record(name === 'create' ? 'create' : 'get'));
+  fixed('__predevPk', (t, op) => {
+    if (t !== T || !top) return null;
+    if (op === 'on' || op === 'off') { agent = op === 'on'; agentAt = now(); return true; }
+    if (op === 'idle') { agent = false; return true; }
+    if (op === 'take') { const d = declined; declined = null; return d && d.at > personAt ? d : null; }
+    return null;
+  });
+  const C = typeof CredentialsContainer !== 'undefined' ? CredentialsContainer.prototype : null;
   if (!C) return;
-  const acting = () => window.__predevAgentActing === true || Date.now() < (window.__predevActingGraceUntil || 0);
-  const wrap = (name) => {
+  const wrap = name => {
     const d = Object.getOwnPropertyDescriptor(C, name);
     if (!d || typeof d.value !== 'function') return;
     const orig = d.value;
     try {
-      Object.defineProperty(C, name, { ...d, value: function (options) {
-        const pk = options && typeof options === 'object' ? options.publicKey : undefined;
-        if (pk && (name !== 'get' || options.mediation !== 'conditional') && acting()) {
-          window.__predevPasskey = { at: Date.now(), ceremony: name };
-          return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+      define(C, name, { ...d, value: function (options) {
+        // One read of the caller's options, for the check and the call alike.
+        const o = options && typeof options === 'object' ? { ...options } : options;
+        const pk = o && typeof o === 'object' ? o.publicKey : undefined;
+        if (pk && (name !== 'get' || o.mediation !== 'conditional')) {
+          const [a, p] = times();
+          if (agentOn() || !(p > a)) {
+            record(name);
+            return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+          }
         }
-        return orig.apply(this, arguments);
+        return apply(orig, this, o === options ? arguments : [o]);
       } });
     } catch (e) {}
   };
   wrap('get'); wrap('create');
 })()`;
+H.pkTokens ||= new Map(); // targetId -> the tab's key for its passkey watch
+H.pkSession ||= new Map(); // targetId -> the session its watch scripts were added on (a new session adds them again)
+H.marked ||= new Map(); // session -> how many of the agent's actions are running there
+H.pkStart ||= new Map(); // session -> the new-document script that starts a page loading during them as the agent's
+const tabOfSession = session => { for (const [targetId, sid] of chrome.sessions) if (sid === session) return targetId; return null; };
+const pkCall = (targetId, op) => `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(H.pkTokens.get(targetId) || '')}, '${op}'))`;
 async function watchInput(info, session) {
-  if (!H.watched.has(info.targetId)) {
+  if (!H.pkTokens.has(info.targetId)) H.pkTokens.set(info.targetId, crypto.randomBytes(16).toString('hex'));
+  const watch = webauthnWatch(H.pkTokens.get(info.targetId));
+  if (!H.watched.has(info.targetId) || H.pkSession.get(info.targetId) !== session) {
     H.watched.add(info.targetId);
+    H.pkSession.set(info.targetId, session);
     // Every later page in this tab gets it before its own scripts run.
     await chrome.send('Page.enable', {}, session).catch(() => {});
     await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: INPUT_WATCH }, session).catch(() => {});
-    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: WEBAUTHN_WATCH }, session).catch(() => {});
+    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: watch }, session).catch(() => {});
   }
   await evaluate(session, INPUT_WATCH, 3000).catch(() => {});
-  await evaluate(session, WEBAUTHN_WATCH, 3000).catch(() => {});
+  // With none of the agent's actions running here, the watch counts input as the person's again (a mark a dialog
+  // kept from clearing ends here).
+  await evaluate(session, `${watch}; ${H.marked.get(session) ? 'true' : pkCall(info.targetId, 'idle')}`, 3000).catch(() => {});
+}
+// One of the agent's actions in this tab starts (on) or ends: its input and its effects are the agent's, and so is a
+// page that starts loading meanwhile. Nested marks count once.
+async function agentMark(session, on, extra = '') {
+  const depth = Math.max(0, (H.marked.get(session) || 0) + (on ? 1 : -1));
+  if (depth) H.marked.set(session, depth); else H.marked.delete(session);
+  const flip = on ? depth === 1 : depth === 0;
+  const tid = tabOfSession(session);
+  if (!tid || !H.watched.has(tid)) return;
+  if (flip && on) {
+    const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { ${pkCall(tid, 'on')}; } catch (e) {} })()` }, session).catch(() => null);
+    if (added?.identifier) H.pkStart.set(session, added.identifier);
+  } else if (flip) {
+    const id = H.pkStart.get(session);
+    H.pkStart.delete(session);
+    if (id) await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: id }, session).catch(() => {});
+  }
+  const expr = [extra, flip ? pkCall(tid, on ? 'on' : 'off') : ''].filter(Boolean).join('; ');
+  if (expr) await evaluate(session, expr, 3000).catch(() => {});
 }
 
-// After an action, the page asked for a passkey while the agent was acting (WEBAUTHN_WATCH declined it): the step
-// is the user's, in their own Chrome. Hand it off so they start it knowingly and the done check closes it.
-async function passkeyRefusal(args, session, startedAt) {
-  if (!handoffOn(args)) return null;
-  const seen = await evaluate(session, 'window.__predevPasskey || null', 3000).catch(() => null);
-  if (!seen || typeof seen !== 'object' || Number(seen.at) < startedAt) return null;
-  await evaluate(session, 'window.__predevPasskey = null', 3000).catch(() => {});
+// The page asked for a passkey after the agent's own action (the watch declined it): the step is the user's, in
+// their own Chrome. Hand it off so they start it knowingly and the done check closes it. `late`: the page asked
+// after the agent's call returned, and this is the agent's next call in the tab.
+async function passkeyRefusal(args, info, session, late = false) {
+  if (!handoffOn(args) || !H.watched.has(info.targetId)) return null;
+  const seen = await evaluate(session, pkCall(info.targetId, 'take'), 3000).catch(() => null);
+  if (!seen || typeof seen !== 'object') return null;
   const how = handTo(args, 'step_up', ' and a done check like {"kind":"url_changes"}');
   // The page asked to make a passkey (create) or to use one (get): the user is told the step it really is.
   const create = seen.ceremony === 'create';
+  const lead = late ? `After your last action in this tab, the page started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)` : `That started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)`;
   return refused(create
-    ? `That started creating a passkey (WebAuthn), which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
-    : `That started a passkey sign-in (WebAuthn), which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
+    ? `${lead}, which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
+    : `${lead}, which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
 }
 // Wraps the agent's own input so the watcher above doesn't count it as the user's.
 async function asAgent(info, session, fn) {
@@ -1075,6 +1146,11 @@ async function handoffGate(name, args, info, session) {
   await notePause(info, session, null);
   if (await pauseHeld(info, session, args)) {
     throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
+  }
+  // The page asked for a passkey after the agent's last call here returned (the watch declined it).
+  if (name !== 'chrome_close' && name !== 'chrome_show') {
+    const pk = await passkeyRefusal(args, info, session, true);
+    if (pk) throw pk;
   }
   if (READ_TOOLS.has(name)) H.reread.delete(info.targetId);
   else if (ACTION_TOOLS.has(name) && H.reread.has(info.targetId)) {
@@ -1302,11 +1378,15 @@ async function uncut(targetId) {
 }
 /** A call is about to send `planned` pieces of input to this session (what: the field or the tab they go to). */
 const planInput = (session, planned, what = 'tab') => { DLG.input.set(session, { at: Date.now(), planned, sent: 0, what }); };
-/** One input event. `piece`: it starts one of the planned pieces (a mouse press, a key down, the text, a scroll). */
-const sendInput = (method, params, session, timeout, piece = false) => {
-  if (DLG.cut.has(session)) return Promise.reject(new Error('A dialog the page opened cut this call short; the rest of its input was not sent.'));
+/** One input event. `piece`: it starts one of the planned pieces (a mouse press, a key down, the text, a scroll).
+ *  Input sent outside one of the agent's marked actions is marked on its own (markActing), so none of it ever
+ *  counts as the person's. */
+const sendInput = async (method, params, session, timeout, piece = false) => {
+  if (DLG.cut.has(session)) throw new Error('A dialog the page opened cut this call short; the rest of its input was not sent.');
   if (piece) { const plan = DLG.input.get(session); if (plan) plan.sent++; }
-  return chrome.send(method, params, session, timeout);
+  if (H.marked.get(session)) return chrome.send(method, params, session, timeout);
+  await markActing(session, true);
+  try { return await chrome.send(method, params, session, timeout); } finally { await markActing(session, false); }
 };
 
 /** What a run does about a dialog it can't close. */
@@ -1491,6 +1571,18 @@ async function accountRefusal(args, session, action, target, url, ctx) {
   return refused(`Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
 }
 const linkTarget = f => (f?.href ? ` (it goes to ${f.href})` : f?.isSubmit && f?.formAction ? ` (it submits to ${f.formAction})` : '');
+// Where a step on this element goes: its link, or where its form submits (a submit control, or a
+// field in a form when the step submits it); '' for neither.
+const goesTo = (f, submitsField = false) => (!f ? '' : f.href || (f.isSubmit || (submitsField && f.inForm) ? f.formAction || '' : ''));
+// The keep-sign-in check (accountRefusal) of a step on both sites it can touch: the page's, and the
+// one its link or form submission goes to, since a form on one site can submit to another's sign-out.
+async function keepRefusal(args, session, action, target, pageUrl, to, ctx) {
+  for (const url of to && siteKey(to) !== siteKey(pageUrl) ? [pageUrl, to] : [pageUrl]) {
+    const why = await accountRefusal(args, session, action, target, url, ctx);
+    if (why) return why;
+  }
+  return '';
+}
 
 const KEYS = {
   enter: ['Enter', 'Enter', 13, '\r'], return: ['Enter', 'Enter', 13, '\r'], tab: ['Tab', 'Tab', 9],
@@ -1504,18 +1596,9 @@ const MODIFIERS = { alt: 1, option: 1, ctrl: 2, control: 2, cmd: 4, meta: 4, com
 const MAC_COMMANDS = { a: 'selectAll', c: 'copy', v: 'paste', x: 'cut', z: 'undo' };
 
 // With handoffs on, an agent tab notes the user's own clicks and keys (INPUT_WATCH); the agent's
-// input is flagged around each dispatch so it never counts as the user's.
-async function markActing(session, on) {
-  let tid = null;
-  for (const [targetId, sid] of chrome.sessions) if (sid === session) tid = targetId;
-  if (!tid || !chrome.__predevHandoff?.watched?.has(tid)) return;
-  // A click/key handler can start a WebAuthn ceremony a tick after the input dispatch returns, so a short grace
-  // keeps it counted as the agent's (WEBAUTHN_WATCH declines only while the agent is acting).
-  const expr = on
-    ? 'window.__predevAgentActing = true; window.__predevActingGraceUntil = Date.now() + 1200'
-    : 'window.__predevAgentActing = false';
-  await evaluate(session, expr, 3000).catch(() => {});
-}
+// input is flagged around each dispatch so it never counts as the user's, and the passkey watch counts it
+// as the agent's (agentMark).
+const markActing = (session, on) => agentMark(session, on, `window.__predevAgentActing = ${on ? 'true' : 'false'}`);
 
 async function pressKeys(session, combos) {
   await markActing(session, true);
@@ -1588,6 +1671,10 @@ const FRAMED_FOCUS = '(() => { const el = document.activeElement; return !!el &&
 // The probe is the agent's own input, so the watcher never counts it as the user's.
 const PROBE_START = `(${INPUT_WATCH}, window.__predevAgentActing = true, [Number(window.__predevSeen || 0), ${FRAMED_FOCUS}])`;
 async function inputReaches(session) {
+  await agentMark(session, true);
+  try { return await probeInput(session); } finally { await agentMark(session, false); }
+}
+async function probeInput(session) {
   const start = await evaluate(session, PROBE_START, 3000).catch(() => null);
   const done = () => evaluate(session, 'window.__predevAgentActing = false', 3000).catch(() => {});
   if (!Array.isArray(start)) return null;
@@ -1836,6 +1923,8 @@ const NO_WEBRTC_SOURCE = `(() => {
     try { if (name in globalThis) Object.defineProperty(globalThis, name, { value: undefined }); } catch {}
   }
 })();`;
+// chrome_eval's result on a non-local page says once where it ran.
+const COPY_LINE = 'Ran on a copy of the page: forms, navigation and network do nothing here; use chrome_click / chrome_type to act on the real page.';
 const sandboxUnavailable = site => `Refused: on ${site} chrome_eval runs your script against a read-only copy of the page (no page session, storage or network), and this Chrome could not open the hidden sandbox it needs. Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`;
 
 // Serve the copy to a hidden target in a throwaway context on a side connection, run the script
@@ -1912,31 +2001,6 @@ async function sandboxEval(liveSession, info, js, href) {
     if (browserContextId) sandboxContexts.delete(browserContextId);
     try { ws.close(); } catch {}
   }
-}
-
-// A chrome_eval script, run so that while it runs it can't write a password, one-time code or
-// card field (structure: input type or autocomplete token), click, or submit a form.
-function guardedEval(js, args = {}) {
-  return `(async () => {
-  const SECRET = new Set(['current-password','new-password','one-time-code','cc-name','cc-number','cc-csc','cc-exp','cc-exp-month','cc-exp-year','cc-type','cc-given-name','cc-family-name','cc-additional-name']);
-  const isSecret = el => !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (String(el.type || '').toLowerCase() === 'password' || String(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/).some(t => SECRET.has(t)));
-  const refuse = what => { throw new Error('Refused by pre.dev: ' + what); };
-  const secretWhy = 'scripts never write passwords, one-time codes or card details; hand the step to the user with ${toHandOff(args) ? 'hand_off_to_user and this tab' : 'chrome_handoff'}.';
-  const clickWhy = "in the user's Chrome, clicks and submits go through chrome_click (it asks the user first where it must), not scripts.";
-  const restore = [];
-  const patch = (obj, key, make) => { const d = Object.getOwnPropertyDescriptor(obj, key); if (!d) return; Object.defineProperty(obj, key, make(d)); restore.push(() => Object.defineProperty(obj, key, d)); };
-  for (const P of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
-    patch(P, 'value', d => ({ ...d, set(v) { if (isSecret(this)) refuse(secretWhy); return d.set.call(this, v); } }));
-    patch(P, 'setRangeText', d => ({ ...d, value: function (...a) { if (isSecret(this)) refuse(secretWhy); return d.value.apply(this, a); } }));
-  }
-  patch(Element.prototype, 'setAttribute', d => ({ ...d, value: function (n, v) { if (String(n).toLowerCase() === 'value' && isSecret(this)) refuse(secretWhy); return d.value.call(this, n, v); } }));
-  patch(Document.prototype, 'execCommand', d => ({ ...d, value: function (cmd, ...a) { if (['inserttext', 'paste', 'inserthtml'].includes(String(cmd).toLowerCase()) && isSecret(document.activeElement)) refuse(secretWhy); return d.value.call(this, cmd, ...a); } }));
-  patch(HTMLElement.prototype, 'click', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(HTMLFormElement.prototype, 'submit', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(HTMLFormElement.prototype, 'requestSubmit', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(EventTarget.prototype, 'dispatchEvent', d => ({ ...d, value: function (e) { if (e && ['click', 'submit', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'keydown', 'keypress'].includes(e.type)) refuse(clickWhy); return d.value.call(this, e); } }));
-  try { return await (${js}\n); } finally { for (const r of restore.reverse()) { try { r(); } catch (e) {} } }
-})()`;
 }
 
 // The done check, from the URL and the page's structure only (never its text or field values).
@@ -2070,6 +2134,8 @@ const TOOLS = [
       ctx.dialogCall?.setTab(info.targetId);
       await pageOn(session);
       if (handoffOn(rest)) ownedBy(agentOf(rest)).add(info.targetId);
+      // Watched before the page loads, so its own scripts (a passkey request on load) run after the watch.
+      if (handoffOn(rest)) await watchInput(info, session);
       if (foreground) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
       let loaded;
       try {
@@ -2077,7 +2143,6 @@ const TOOLS = [
       } catch (error) {
         throw new Error(`${error.message} (tab ${tabId(info)} in ${p.name})`);
       }
-      if (handoffOn(rest)) await watchInput(info, session);
       return `Opened in ${p.name}\n${await pageLine(info, session)}\n${loaded ? LOADED : STILL_LOADING}`;
     },
   },
@@ -2152,12 +2217,15 @@ const TOOLS = [
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
-      if (handoffOn(args) && x !== undefined && y !== undefined && (keepsSignIn(args, before[0]) || signOutAsked(args, before[0]))) {
-        // A click by position: the control under that point.
+      if (handoffOn(args) && x !== undefined && y !== undefined) {
+        // A click by position: the control under that point, checked as a click on it by ref is (a
+        // submit control there submits its form, to its own formaction if it has one).
         const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
         if (f && !f.error) {
-          const keep = await accountRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], ctx);
+          const keep = await keepRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], goesTo(f), ctx);
           if (keep) throw keep;
+          const ask = await approvalRefusal(args, session, f.desc, f, before[0], ctx);
+          if (ask) throw ask;
         }
       }
       if (x === undefined || y === undefined) {
@@ -2165,7 +2233,8 @@ const TOOLS = [
         if (hit.error) throw new Error(hit.error);
         if (handoffOn(args)) {
           const facts = await inPage(session, `fieldFacts(${target(args)})`).catch(() => null);
-          const keep = await accountRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(facts && !facts.error ? facts : null)}`, before[0], ctx);
+          const f = facts && !facts.error ? facts : null;
+          const keep = await keepRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(f)}`, before[0], goesTo(f), ctx);
           if (keep) throw keep;
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
           if (ask) throw ask;
@@ -2180,13 +2249,12 @@ const TOOLS = [
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
-      const pkAt = Date.now();
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
       planInput(session, args.double ? 2 : 1);
       await click(session, x, y, args.double ? 2 : 1);
       if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       await settle(session, before);
-      const pk = await passkeyRefusal(args, session, pkAt);
+      const pk = await passkeyRefusal(args, info, session);
       if (pk) throw pk;
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -2212,7 +2280,14 @@ const TOOLS = [
         const secret = await secretRefusal(args, session, q, before[0], ctx);
         if (secret) throw secret;
         if (args.submit) {
+          // Its Enter is chrome_press Enter in that field: the keep-sign-in check on the page and on
+          // where the field's form submits, then ask first. Both before anything is typed.
           const facts = await inPage(session, `fieldFacts(${q})`).catch(() => null);
+          if (facts && !facts.error) {
+            const to = goesTo(facts, true);
+            const keep = await keepRefusal(args, session, 'Pressing Enter in', `${facts.desc}${to ? ` (it submits to ${to})` : ''}`, before[0], to, ctx);
+            if (keep) throw keep;
+          }
           if (facts && !facts.error && facts.inForm) {
             const ask = await approvalRefusal(args, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form)` : 'submitting this form', facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
             if (ask) throw ask;
@@ -2242,15 +2317,14 @@ const TOOLS = [
         try { await sendInput('Input.insertText', { text: args.text }, session, undefined, true); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
-      let pkAt = 0;
       if (args.submit) {
         const seen1 = handoffOn(args) ? await seenCount(session) : null;
-        pkAt = Date.now();
         await pressKeys(session, 'Enter');
         if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args, "the text went in, but this call's Enter didn't"), { kind: CHROME_DIALOG });
         await settle(session, before);
       }
-      if (pkAt) { const pk = await passkeyRefusal(args, session, pkAt); if (pk) throw pk; }
+      const pk = await passkeyRefusal(args, info, session);
+      if (pk) throw pk;
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
       return `Typed into ${field.desc}${value !== null ? `; value is now ${JSON.stringify(value)}` : ' and pressed Enter'}\n${await pageLine(info, session)}`;
     },
@@ -2290,7 +2364,6 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       await pageMustAnswer(rest, session, info);
       const before = await docState(session, info.url);
-      const pkAt = Date.now();
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
       planInput(session, keyCombos(keys).length, 'focused field or the tab');
       // One key at a time: Tab, shift+Tab or an arrow key can move the focus, so each Enter or Space
@@ -2303,26 +2376,27 @@ const TOOLS = [
           // An earlier key may have opened a dialog: then this one would wait in Chrome, past the checks.
           await pageMustAnswer(rest, session, info);
           const url = (await docState(session, before[0]))[0] || before[0];
-          if (keepsSignIn(rest, url) || signOutAsked(rest, url)) {
-            const facts = await inPage(session, 'activeFacts()').catch(() => null);
-            if (facts && !facts.error) {
-              const keep = await accountRefusal(withTab, session, `Pressing ${k.code} on`, `${facts.desc}${linkTarget(facts)}`, url, ctx);
-              if (keep) throw keep;
-            }
+          const facts = await inPage(session, 'activeFacts()').catch(() => null);
+          const f = facts && !facts.error ? facts : null;
+          // Enter in a field submits its form; Enter or Space on a submit control submits through it
+          // (to its own formaction if it has one). Each is checked where it goes, and on the page.
+          const sends = !!f && (f.isSubmit || (submits && f.inForm && !f.href));
+          if (f) {
+            const to = sends ? f.formAction || '' : submits ? f.href : '';
+            const keep = await keepRefusal(withTab, session, `Pressing ${k.code} on`, `${f.desc}${to ? (sends ? ` (it submits to ${to})` : ` (it goes to ${to})`) : ''}`, url, to, ctx);
+            if (keep) throw keep;
           }
-          if (submits) {
-            const facts = await inPage(session, 'activeFacts()').catch(() => null);
-            if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
-              const ask = await approvalRefusal(withTab, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, url, ctx);
-              if (ask) throw ask;
-            }
+          if (sends) {
+            const desc = f.isSubmit ? `${f.desc} (submitting the form with ${k.code})` : f.submitDesc ? `${f.submitDesc} (submitting the form with Enter)` : `${f.desc} (Enter)`;
+            const ask = await approvalRefusal(withTab, session, desc, f.isSubmit || !f.submitDesc ? f : { ...f, isSubmit: true }, url, ctx);
+            if (ask) throw ask;
           }
         }
         await pressKeys(session, combo);
       }
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(rest), { kind: CHROME_DIALOG });
       await settle(session, before);
-      const pk = await passkeyRefusal(rest, session, pkAt);
+      const pk = await passkeyRefusal(rest, info, session);
       if (pk) throw pk;
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
@@ -2489,10 +2563,12 @@ const TOOLS = [
         if (!isLocalDev(href)) {
           const value = await sandboxEval(session, info, js, href);
           const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
-          return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
+          return `${out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out}\n${COPY_LINE}`;
         }
       }
-      const value = await evaluate(session, expression, 30000);
+      if (handoffOn(rest)) await agentMark(session, true);
+      let value;
+      try { value = await evaluate(session, expression, 30000); } finally { if (handoffOn(rest)) await agentMark(session, false); }
       const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
       return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
     },
@@ -2662,6 +2738,8 @@ const TOOLS = [
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }
       let session = await chrome.session(info.targetId);
+      // The person's own input counts as theirs from here on, even if a dialog kept the agent's last mark from clearing.
+      if (H.watched.has(info.targetId)) await watchInput(info, session);
       const [startHref] = await docState(session);
       const startUrl = String(args.start_url || startHref || info.url);
       H.cancel.delete(info.targetId);
@@ -2857,6 +2935,8 @@ const TOOLS = [
 
 // With handoffs on, every tool that acts on a tab first passes the handoff gate: the agent's own
 // tabs only, nothing while the user holds or is using the tab, and a read after they did.
+// chrome_eval marks its own run: only on a local dev page does it run in the page.
+const MARKED_ACTIONS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_scroll']);
 const GATED = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
   'chrome_scroll', 'chrome_read', 'chrome_screenshot', 'chrome_wait', 'chrome_eval', 'chrome_upload', 'chrome_show', 'chrome_close']);
 for (const tool of TOOLS) {
@@ -2872,6 +2952,11 @@ for (const tool of TOOLS) {
         const session = await chrome.session(info.targetId);
         await pageOn(session);
         if (handoffOn(args)) await handoffGate(tool.name, args, info, session);
+        // An action's input and whatever the page does about it are the agent's (the passkey watch).
+        if (handoffOn(args) && MARKED_ACTIONS.has(tool.name)) {
+          await agentMark(session, true);
+          try { return await run.call(tool, args, ctx); } finally { await agentMark(session, false); }
+        }
       }
       return run.call(tool, args, ctx);
     });
