@@ -858,6 +858,7 @@ const H = chrome.__predevHandoff || (chrome.__predevHandoff = {
   reread: new Set(), cancel: new Set(), checks: new Map(), watched: new Set(), signedIn: new Map(),
 });
 H.signedIn ||= new Map();
+H.queuedAt ||= new Map(); // tab -> when its waiting chrome_handoff call came in (turns go in that order)
 // Per call, never from the daemon's own environment: one daemon serves agents with and without it.
 const handoffOn = args => args?.__predev_handoff === true;
 const agentOf = args => String(args?.__agent || 'agent');
@@ -926,12 +927,14 @@ const INPUT_WATCH = `(() => {
 // start; the agent is told on its next call (passkeyRefusal). Conditional (autofill) passkey requests are left
 // alone. What the watch knows lives in its closure, so the page can't change it; a frame from the same origin
 // asks its parent, and a frame from another origin can't reach it (it counts its own input only).
-const webauthnWatch = token => `(() => {
+const webauthnWatch = (token, root = false) => `(() => {
   if (Object.getOwnPropertyDescriptor(window, '__predevPk')) return;
   const T = ${JSON.stringify(token)};
   const apply = Reflect.apply, define = Object.defineProperty, P = performance, pnow = Performance.prototype.now, t0 = P.timeOrigin;
   const now = () => t0 + apply(pnow, P, []);
-  const top = window === window.parent;
+  // A cross-origin frame or a popup can't reach a parent closure, so it is its own root: it counts its own input
+  // and holds its own __predevPk (keyed by its own token), which the daemon marks through H.kids.
+  const top = ${root ? 'true' : 'window === window.parent'};
   let agent = false, agentAt = 0, personAt = 0, declined = null;
   const up = name => { if (top) return null; try { const f = window.parent[name]; return typeof f === 'function' ? f : null; } catch (e) { return null; } };
   const agentOn = () => { if (agent) return true; const f = up('__predevPkAgent'); return !!f && f() === true; };
@@ -943,7 +946,7 @@ const webauthnWatch = token => `(() => {
   const fixed = (name, value) => { try { define(window, name, { value, configurable: false, enumerable: false, writable: false }); } catch (e) {} };
   fixed('__predevPkAgent', () => agentOn());
   fixed('__predevPkTimes', () => times());
-  fixed('__predevPkDeclined', name => record(name === 'create' ? 'create' : 'get'));
+  fixed('__predevPkDeclined', name => record(name === 'create' ? 'create' : name === 'payment' ? 'payment' : 'get'));
   fixed('__predevPk', (t, op) => {
     if (t !== T || !top) return null;
     if (op === 'on' || op === 'off') { agent = op === 'on'; agentAt = now(); return true; }
@@ -974,13 +977,250 @@ const webauthnWatch = token => `(() => {
     } catch (e) {}
   };
   wrap('get'); wrap('create');
+  // Secure Payment Confirmation goes through PaymentRequest.show() with the 'secure-payment-confirmation' method
+  // and, like a passkey, reaches the person's authenticator. Same rule: after the agent's own action, or with no
+  // activation of the person's, it is declined rather than shown. The instance is tagged at construction (that is
+  // where the method is named), and show() is refused for a tagged one.
+  try {
+    const prDesc = Object.getOwnPropertyDescriptor(window, 'PaymentRequest');
+    if (prDesc && typeof prDesc.value === 'function' && typeof Proxy !== 'undefined') {
+      const Orig = prDesc.value;
+      const isSpc = new WeakSet();
+      const Proxied = new Proxy(Orig, {
+        construct(target, argv, newTarget) {
+          const inst = Reflect.construct(target, argv, newTarget);
+          try { const md = argv[0]; if (Array.isArray(md) && md.some(m => m && m.supportedMethods === 'secure-payment-confirmation')) isSpc.add(inst); } catch (e) {}
+          return inst;
+        },
+      });
+      define(window, 'PaymentRequest', { ...prDesc, value: Proxied });
+      const showDesc = Object.getOwnPropertyDescriptor(Orig.prototype, 'show');
+      if (showDesc && typeof showDesc.value === 'function') {
+        const origShow = showDesc.value;
+        define(Orig.prototype, 'show', { ...showDesc, value: function (...a) {
+          if (isSpc.has(this)) {
+            const [av, pv] = times();
+            if (agentOn() || !(pv > av)) { record('payment'); return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError')); }
+          }
+          return apply(origShow, this, a);
+        } });
+      }
+    }
+  } catch (e) {}
 })()`;
 H.pkTokens ||= new Map(); // targetId -> the tab's key for its passkey watch
 H.pkSession ||= new Map(); // targetId -> the session its watch scripts were added on (a new session adds them again)
 H.marked ||= new Map(); // session -> how many of the agent's actions are running there
 H.pkStart ||= new Map(); // session -> the new-document script that starts a page loading during them as the agent's
+H.kids ||= new Map(); // tab targetId -> Map(childSession -> childToken): its cross-origin frames and popups, each its own watch
+H.kidSeen ||= new Set(); // child sessions already set up, so a re-attach doesn't double-install
+H.autoAttach ||= new Set(); // tab sessions Target.setAutoAttach is on for (cross-origin frames)
+H.popupOn ||= false; // browser-level auto-attach for popups is on (installed once)
 const tabOfSession = session => { for (const [targetId, sid] of chrome.sessions) if (sid === session) return targetId; return null; };
 const pkCall = (targetId, op) => `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(H.pkTokens.get(targetId) || '')}, '${op}'))`;
+
+// The person's secrets, captured during a handoff on that tab (the reporter below), kept in memory only and
+// masked out of everything the agent is handed back. Capped so a long run can't grow it without bound.
+H.secretValues ||= new Set();   // the distinct values the person typed into secret fields during a handoff
+H.handedSites ||= new Set();     // siteKeys of tabs a handoff signed in to or handed back: their URLs get masked too
+// The network guard (page-script paths): on a kept tab, a request the page itself started after the
+// agent's last activation, when it is a navigation or a non-GET fetch/XHR, is run through the keep-sign-in and
+// ask-first checks and failed if it would sign the user out or send/post as them. The agent is told on that call
+// or the next one. The person's own clicks pass untouched.
+H.netOn ||= new Set();           // sessions Fetch is enabled on
+H.netArgs ||= new Map();         // targetId -> { args, ctx, session } for a pause handler that has no call scope
+H.netAsked ||= new Map();        // `${targetId}:${frameId}` -> { reason, url, at }: a frameRequestedNavigation
+H.netRefused ||= new Map();      // targetId -> { refusal, at }: a page-started request the guard failed, to tell the agent
+
+// The reporter. While a navigation is pending, Chrome holds every command to the page, so nothing can be read
+// from the page when the network guard has to judge it. What the guard needs is told to the daemon as it happens
+// instead: each document of an agent tab (and of a handed tab) gets one listener script in its own isolated
+// world, which the page's scripts can't see or reach, with a binding only that world has. It reports each
+// trusted click, tap or key (whose it was is the daemon's call: the agent's if one of its actions was running
+// in the tab then, otherwise the person's), and, once a secret field is done (change, Enter, submit, the page
+// going away), the values in the secret fields (the same field classes the snapshot hides). The daemon keeps
+// the values only while the person has the tab for a handoff.
+const ACT_WORLD = 'predev-act';
+H.actBinding ||= `__predevAct_${crypto.randomBytes(8).toString('hex')}`;
+H.actAt ||= new Map();       // targetId -> { who: 'agent' | 'person', at }: whose trusted activation in the tab is the latest
+H.markSpans ||= new Map();   // targetId -> [{ s, e }]: when the agent's actions ran in the tab (newest last, capped)
+H.actWorlds ||= new Map();   // session -> Map(frameId -> the reporter's context in that frame's current document)
+H.reportOn ||= new Map();    // targetId -> the session the reporter follows that tab's documents on
+const REPORTER = binding => `(() => {
+  if (globalThis.__predevAct) return true;
+  const f = globalThis[${JSON.stringify(binding)}];
+  if (typeof f !== 'function') return false;
+  const send = o => { try { f(JSON.stringify(o)); } catch (e) {} };
+  const RE = /password|passwd|passcode|passphrase|pwd|cv[vc]2?|security.?code|card.?(num|no)|cc.?num|social.?sec|one.?time|totp|2fa|mfa|verification.?code|auth.?code|secret|api.?key|access.?key|token|(^|[^a-z])(pass|pin|ssn|otp|csc)([^a-z]|$)/i;
+  const secret = el => {
+    try {
+      if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return false;
+      if (el.type === 'password') return true;
+      if (/password|cc-number|cc-csc|cc-exp|one-time-code/i.test(el.getAttribute('autocomplete') || '')) return true;
+      const label = el.labels && el.labels[0] ? el.labels[0].innerText : '';
+      return RE.test([el.getAttribute('name'), el.id, el.getAttribute('aria-label'), el.getAttribute('placeholder'), label].filter(Boolean).join(' '));
+    } catch (e) { return false; }
+  };
+  const vals = new Map();
+  const from = e => (e.composedPath && e.composedPath()[0]) || e.target;
+  const keep = el => { if (secret(el) && typeof el.value === 'string') vals.set(el, el.value); };
+  const values = () => [...vals.values()].filter(v => v.length >= 4 && v.length <= 256);
+  const flush = () => { const v = values(); if (v.length) send({ s: v }); };
+  for (const type of ['pointerdown', 'mousedown', 'keydown', 'touchstart']) addEventListener(type, e => { if (e.isTrusted) send({ a: Date.now() }); }, true);
+  addEventListener('input', e => { if (e.isTrusted) keep(from(e)); }, true);
+  addEventListener('change', e => { if (e.isTrusted) { keep(from(e)); flush(); } }, true);
+  addEventListener('keydown', e => { if (e.isTrusted && e.key === 'Enter') { keep(from(e)); flush(); } }, true);
+  addEventListener('submit', () => flush(), true);
+  addEventListener('pagehide', () => flush(), true);
+  globalThis.__predevAct = { values };
+  return true;
+})()`;
+// The reporter in one frame's current document (a new document needs it again: Page.frameNavigated).
+async function installReporter(session, frameId) {
+  if (!session || !frameId) return;
+  try {
+    const { executionContextId } = await chrome.send('Page.createIsolatedWorld', { frameId, worldName: ACT_WORLD, grantUniveralAccess: false }, session, 3000);
+    await chrome.send('Runtime.addBinding', { name: H.actBinding, executionContextId }, session, 3000);
+    const r = await chrome.send('Runtime.evaluate', { expression: REPORTER(H.actBinding), contextId: executionContextId, returnByValue: true }, session, 3000);
+    if (r?.result?.value !== true) return;
+    if (!H.actWorlds.has(session)) H.actWorlds.set(session, new Map());
+    H.actWorlds.get(session).set(frameId, executionContextId);
+  } catch {}
+}
+async function reportFrames(session) {
+  const tree = await chrome.send('Page.getFrameTree', {}, session, 3000).catch(() => null);
+  const walk = async node => {
+    if (!node?.frame) return;
+    await installReporter(session, node.frame.id);
+    for (const child of node.childFrames || []) await walk(child);
+  };
+  await walk(tree?.frameTree);
+}
+// The tab's documents get the reporter from now on (an agent tab, or a tab handed to the person).
+async function reporterOn(targetId, session) {
+  if (!session || H.reportOn.get(targetId) === session) return;
+  H.reportOn.set(targetId, session);
+  await chrome.send('Page.enable', {}, session).catch(() => {});
+  await reportFrames(session);
+}
+// The tab a reporter session belongs to: the tab's own, or one of its cross-origin frames or popups.
+function reportTab(targetId, sessionId) {
+  if (targetId && H.reportOn.has(targetId)) return targetId;
+  if (sessionId) {
+    for (const [tab, sid] of H.reportOn) if (sid === sessionId) return tab;
+    for (const [tab, kids] of H.kids) if (kids.has(sessionId)) return tab;
+  }
+  return null;
+}
+// The agent's actions in a tab: an activation then is the agent's.
+function noteMark(targetId, on) {
+  const spans = H.markSpans.get(targetId) || [];
+  const now = Date.now();
+  if (on) spans.push({ s: now, e: null });
+  else { const last = spans[spans.length - 1]; if (last && last.e === null) last.e = now; }
+  while (spans.length > 20) spans.shift();
+  H.markSpans.set(targetId, spans);
+  const cur = H.actAt.get(targetId);
+  if (!cur || now >= cur.at) H.actAt.set(targetId, { who: 'agent', at: now });
+}
+const agentRanAt = (targetId, t) => {
+  const session = chrome.sessions.get(targetId);
+  if (session && H.marked.get(session)) return true;
+  return (H.markSpans.get(targetId) || []).some(({ s, e }) => t >= s - 20 && (e === null || t <= e + 20));
+};
+// Page.frameNavigated (a new document: the reporter goes in again) and Runtime.bindingCalled (a report).
+function reporterEvent(targetId, method, params = {}, sessionId) {
+  if (method === 'Page.frameNavigated') {
+    const tab = reportTab(targetId, sessionId);
+    const session = sessionId || (targetId && chrome.sessions.get(targetId));
+    if (tab && session && params.frame?.id) void installReporter(session, params.frame.id);
+    return;
+  }
+  if (method !== 'Runtime.bindingCalled' || params.name !== H.actBinding) return;
+  const tab = reportTab(targetId, sessionId);
+  if (!tab) return;
+  let m;
+  try { m = JSON.parse(String(params.payload || '')); } catch { return; }
+  if (typeof m?.a === 'number') {
+    const who = agentRanAt(tab, m.a) ? 'agent' : 'person';
+    const cur = H.actAt.get(tab);
+    if (!cur || m.a >= cur.at) H.actAt.set(tab, { who, at: m.a });
+  }
+  if (Array.isArray(m?.s) && H.handoff.get(tab)?.waiting) addSecrets(m.s);
+}
+function addSecrets(values) {
+  for (const v of values) {
+    if (typeof v !== 'string' || v.length < 4 || v.length > 256) continue;
+    H.secretValues.add(v);
+    while (H.secretValues.size > 500) H.secretValues.delete(H.secretValues.values().next().value);
+  }
+}
+// Reads what the reporter holds now in the tab's documents (and its cross-origin frames') into H.secretValues:
+// when a handoff ends, for a field the person never left.
+async function noteSecrets(targetId, session) {
+  if (!session || !H.handoff.get(targetId)?.waiting) return;
+  const read = async (sid, contexts) => {
+    for (const contextId of contexts.values()) {
+      const r = await chrome.send('Runtime.evaluate', { expression: 'globalThis.__predevAct ? globalThis.__predevAct.values() : []', contextId, returnByValue: true }, sid, 3000).catch(() => null);
+      if (Array.isArray(r?.result?.value)) addSecrets(r.result.value);
+    }
+  };
+  await read(session, H.actWorlds.get(session) || new Map());
+  for (const sid of (H.kids.get(targetId) || new Map()).keys()) await read(sid, H.actWorlds.get(sid) || new Map());
+}
+// The query/fragment keys whose values are masked on a kept or just-handed-back tab's URLs.
+const SECRET_URL_KEY = /(^|[_.-])(password|passwd|pwd|pass|token|otp|code|secret|key)$/i;
+// `relative`: the text is a kept tab's own (its links can be written relative to the page, /path?query).
+function maskUrlsIn(text, keptSites, relative = false) {
+  // Only the values change: the rest of the address stays as written, byte for byte.
+  const maskPairs = part => part.replace(/(^|[?&#;])([^=&#;?]+)=([^&#;]*)/g, (m, sep, k, v) => {
+    let key = k;
+    try { key = decodeURIComponent(k.replace(/\+/g, ' ')); } catch {}
+    return v && SECRET_URL_KEY.test(key) ? `${sep}${k}=[masked]` : m;
+  });
+  const out = text.replace(/https?:\/\/[^\s"'<>)\]]+/g, m => {
+    try {
+      if (!keptSites.has(siteKey(new URL(m).href))) return m;
+      const at = m.search(/[?#]/);
+      return at < 0 ? m : m.slice(0, at) + maskPairs(m.slice(at));
+    } catch { return m; }
+  });
+  // An address written without its scheme (a tab list's short label: host/path?query).
+  const bare = out.replace(/(^|[^\w/.:@%-])((?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*|localhost)(:\d+)?(\/[^\s"'<>)\]?#]*[?#][^\s"'<>)\]]*)/gi, (m, lead, host, port, rest) => {
+    if (!keptSites.has(siteKey(`http://${host}`))) return m;
+    const at = rest.search(/[?#]/);
+    return lead + host + (port || '') + rest.slice(0, at) + maskPairs(rest.slice(at));
+  });
+  if (!relative) return bare;
+  return bare.replace(/(^|[^\w:/.%-])(\/(?!\/)[^\s"'<>)\]?#]*[?#][^\s"'<>)\]]*|\?[^\s"'<>)\]]+)/g, (m, lead, ref) => {
+    const at = ref.search(/[?#]/);
+    return lead + ref.slice(0, at) + maskPairs(ref.slice(at));
+  });
+}
+// Masks the person's captured secrets (in each form they might appear in) and secret-keyed URL values on kept
+// sites, in a string handed to the agent. The person's own ordinary query values stay visible.
+function maskSecrets(text, args) {
+  if (typeof text !== 'string' || !text) return text;
+  // Secret-keyed URL values first (while each address is still whole), then the typed values anywhere.
+  let out = text;
+  const kept = new Set([...H.signedIn.keys(), ...H.handedSites]);
+  if (Array.isArray(args?.__predev_signed_in)) for (const s of args.__predev_signed_in) { const k = siteKey(s); if (k) kept.add(k); }
+  if (kept.size) {
+    let own = false;
+    try { const info = args?.tab ? findTab(args.tab) : null; own = !!info && kept.has(siteKey(info.url)); } catch {}
+    out = maskUrlsIn(out, kept, own);
+  }
+  for (const v of H.secretValues) {
+    if (!v) continue;
+    // As typed, as a URL component, as a GET form encodes it (only letters, digits and *-._ stay as they are; a
+    // space is +), and as it sits inside a JSON string.
+    const form = encodeURIComponent(v).replace(/[!'()~]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+    for (const variant of new Set([v, encodeURIComponent(v), form, v.replace(/ /g, '+'), JSON.stringify(v).slice(1, -1)])) {
+      if (variant) out = out.split(variant).join('[masked]');
+    }
+  }
+  return out;
+}
 async function watchInput(info, session) {
   if (!H.pkTokens.has(info.targetId)) H.pkTokens.set(info.targetId, crypto.randomBytes(16).toString('hex'));
   const watch = webauthnWatch(H.pkTokens.get(info.targetId));
@@ -991,11 +1231,97 @@ async function watchInput(info, session) {
     await chrome.send('Page.enable', {}, session).catch(() => {});
     await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: INPUT_WATCH }, session).catch(() => {});
     await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: watch }, session).catch(() => {});
+    // Cross-origin frames are their own debugger targets: auto-attach catches them before they load, so the watch
+    // goes in there too (installKid, on Target.attachedToTarget). A new session lost the old kids. Not over a
+    // connection that can't reach a child session (the extension): a frame paused for it would never resume.
+    H.kids.delete(info.targetId);
+    if (!H.autoAttach.has(session) && chrome.childSessions !== false) {
+      H.autoAttach.add(session);
+      await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, session).catch(() => { H.autoAttach.delete(session); });
+    }
   }
+  await popupWatch();
+  await reporterOn(info.targetId, session);
   await evaluate(session, INPUT_WATCH, 3000).catch(() => {});
   // With none of the agent's actions running here, the watch counts input as the person's again (a mark a dialog
   // kept from clearing ends here).
   await evaluate(session, `${watch}; ${H.marked.get(session) ? 'true' : pkCall(info.targetId, 'idle')}`, 3000).catch(() => {});
+}
+// Popups opened from a watched tab are their own top-level targets; only browser-level auto-attach catches them
+// before they load. Installed once (where the connection supports it: the daemon and raw CDP, not the extension,
+// whose popups stay best effort). The attach handler installs the watch on a popup whose opener is watched and
+// resumes it; it resumes and lets go of anything else, so normal tab opening is untouched.
+async function popupWatch() {
+  if (H.popupOn || typeof chrome.send !== 'function' || chrome.childSessions === false) return;
+  if (/^(0|off|false|no)$/i.test(String(process.env.PREDEV_POPUP_WATCH || ''))) { H.popupOn = true; return; }
+  H.popupOn = true;
+  const ok = await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'page', exclude: false }] }).then(() => true, () => false);
+  if (!ok) H.popupOn = false;
+}
+// Installs the watch (passkey and input; the reporter follows its documents) on a cross-origin frame or popup's
+// own session, as its own root, and marks it the agent's if the tab is acting right now. No evaluate before the
+// resume: the scripts run as the document loads. Returns once set up.
+async function installKid(tabId, childSession, info, ownTarget = null) {
+  if (!childSession || H.kidSeen.has(childSession)) return;
+  H.kidSeen.add(childSession);
+  // A popup is a tab of its own too: it keeps one token, so the agent's later calls in it (watchInput, agentMark)
+  // reach the same watch. A cross-origin frame gets a token of its own.
+  let token = ownTarget ? H.pkTokens.get(ownTarget) : null;
+  if (!token) token = crypto.randomBytes(16).toString('hex');
+  if (ownTarget) H.pkTokens.set(ownTarget, token);
+  if (!H.kids.has(tabId)) H.kids.set(tabId, new Map());
+  H.kids.get(tabId).set(childSession, token);
+  const topSession = chrome.sessions.get(tabId);
+  const acting = topSession && H.marked.get(topSession) ? true : false;
+  for (const source of [INPUT_WATCH, webauthnWatch(token, true)]) {
+    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source }, childSession).catch(() => {});
+  }
+  // The reporter goes into each of its documents as it commits (Page.frameNavigated), one already there now.
+  await chrome.send('Page.enable', {}, childSession).catch(() => {});
+  if (acting) {
+    // Kept in pkStart so the end of the agent's action takes it out again (agentMark); if the action already
+    // ended while this was being set up, it comes out now.
+    const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { window.__predevPk(${JSON.stringify(token)}, 'on'); } catch (e) {} })()` }, childSession).catch(() => null);
+    if (added?.identifier) {
+      if (H.marked.get(topSession)) H.pkStart.set(childSession, added.identifier);
+      else await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: added.identifier }, childSession).catch(() => {});
+    }
+  }
+  // Nested frames of this frame get the same treatment.
+  await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, childSession).catch(() => {});
+  if (info?.waitingForDebugger) await chrome.send('Runtime.runIfWaitingForDebugger', {}, childSession).catch(() => {});
+  else await reportFrames(childSession);
+}
+// Target.attachedToTarget, from a watched tab's session (a cross-origin frame) or browser-level (a popup). The 4th
+// arg is the parent session (the tab's) or null for a browser-level event. Sets the child up or lets it go.
+async function onAttached(parentTargetId, params, parentSession) {
+  const child = params?.sessionId;
+  const info = params?.targetInfo;
+  if (!child || !info) return;
+  if (info.type === 'iframe') {
+    // A cross-origin frame of a watched tab.
+    const tabId = parentTargetId || (parentSession && tabOfSession(parentSession));
+    if (tabId && H.watched.has(tabId)) { await installKid(tabId, child, params); return; }
+    await chrome.send('Runtime.runIfWaitingForDebugger', {}, child).catch(() => {});
+    return;
+  }
+  if (info.type === 'page') {
+    // A popup (browser-level auto-attach, paused before it loads). Only a paused page is auto-attach's: an attach
+    // this connection asked for itself (chrome.session, any attachToTarget) is never paused, and its event can come
+    // before the reply has put it in chrome.sessions, so it is left alone.
+    if (!params.waitingForDebugger) return;
+    const opener = info.openerId;
+    if (opener && H.watched.has(opener)) {
+      await chrome.send('Page.setWebLifecycleState', { state: 'active' }, child).catch(() => {});
+      await chrome.send('Emulation.setFocusEmulationEnabled', { enabled: true }, child).catch(() => {});
+      await installKid(opener, child, params, info.targetId);
+      return;
+    }
+    // Anything else (a tab chrome_open made, the person's own new tab): resume it, and let go of the auto-attach
+    // session unless it is one of ours.
+    await chrome.send('Runtime.runIfWaitingForDebugger', {}, child).catch(() => {});
+    if (![...chrome.sessions.values()].includes(child)) await chrome.send('Target.detachFromTarget', { sessionId: child }).catch(() => {});
+  }
 }
 // One of the agent's actions in this tab starts (on) or ends: its input and its effects are the agent's, and so is a
 // page that starts loading meanwhile. Nested marks count once.
@@ -1004,6 +1330,7 @@ async function agentMark(session, on, extra = '') {
   if (depth) H.marked.set(session, depth); else H.marked.delete(session);
   const flip = on ? depth === 1 : depth === 0;
   const tid = tabOfSession(session);
+  if (tid && flip) noteMark(tid, on);
   if (!tid || !H.watched.has(tid)) return;
   if (flip && on) {
     const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { ${pkCall(tid, 'on')}; } catch (e) {} })()` }, session).catch(() => null);
@@ -1015,6 +1342,34 @@ async function agentMark(session, on, extra = '') {
   }
   const expr = [extra, flip ? pkCall(tid, on ? 'on' : 'off') : ''].filter(Boolean).join('; ');
   if (expr) await evaluate(session, expr, 3000).catch(() => {});
+  // The tab's cross-origin frames and popups each hold their own watch (their own token); mark them too, so the
+  // agent's action in one of them is the agent's there as well, and a page loading in one meanwhile starts marked.
+  const kids = flip ? H.kids.get(tid) : null;
+  if (kids) for (const [childSession, token] of kids) {
+    if (on) {
+      const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { window.__predevPk(${JSON.stringify(token)}, 'on'); } catch (e) {} })()` }, childSession).catch(() => null);
+      if (added?.identifier) H.pkStart.set(childSession, added.identifier);
+    } else {
+      const id = H.pkStart.get(childSession);
+      H.pkStart.delete(childSession);
+      if (id) await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: id }, childSession).catch(() => {});
+    }
+    await evaluate(childSession, `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(token)}, '${on ? 'on' : 'off'}'))`, 3000).catch(() => {});
+  }
+}
+// Target.attachedToTarget / detachedFromTarget and the reporter's events, over the one event stream (registered once,
+// the latest copy handles it).
+function attachEvent(targetId, method, params = {}, sessionId) {
+  if (method === 'Page.frameNavigated' || method === 'Runtime.bindingCalled') { reporterEvent(targetId, method, params, sessionId); return; }
+  if (method === 'Target.attachedToTarget') { void onAttached(targetId, params, sessionId).catch(() => {}); return; }
+  if (method === 'Target.detachedFromTarget') {
+    const child = params.sessionId;
+    if (!child) return;
+    H.kidSeen.delete(child);
+    for (const [tab, kids] of H.kids) if (kids.delete(child) && kids.size === 0) H.kids.delete(tab);
+    H.pkStart.delete(child);
+    H.actWorlds.delete(child);
+  }
 }
 
 // The page asked for a passkey after the agent's own action (the watch declined it): the step is the user's, in
@@ -1022,15 +1377,32 @@ async function agentMark(session, on, extra = '') {
 // after the agent's call returned, and this is the agent's next call in the tab.
 async function passkeyRefusal(args, info, session, late = false) {
   if (!handoffOn(args) || !H.watched.has(info.targetId)) return null;
-  const seen = await evaluate(session, pkCall(info.targetId, 'take'), 3000).catch(() => null);
+  const seen = await pkTake(info, session);
   if (!seen || typeof seen !== 'object') return null;
+  // A passkey sign-in (get), creating a passkey (create), or a Secure Payment Confirmation (payment): the user is
+  // told the step it really is, and it is handed to them (payment confirms as them, so it asks like an approval).
+  if (seen.ceremony === 'payment') {
+    const how = handTo(args, 'approval', ' and a done check like {"kind":"url_changes"}');
+    const lead = late ? 'After your last action in this tab, the page started a Secure Payment Confirmation (WebAuthn)' : 'That started a Secure Payment Confirmation (WebAuthn)';
+    return refused(`${lead}, which confirms a payment with the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than confirm as them. Don't press it again; hand it to the user: ${how}. The user confirms the payment, and pre.dev carries on.`, { kind: 'passkey', ceremony: 'payment' });
+  }
   const how = handTo(args, 'step_up', ' and a done check like {"kind":"url_changes"}');
-  // The page asked to make a passkey (create) or to use one (get): the user is told the step it really is.
   const create = seen.ceremony === 'create';
   const lead = late ? `After your last action in this tab, the page started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)` : `That started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)`;
   return refused(create
     ? `${lead}, which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
     : `${lead}, which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
+}
+// A declined ceremony recorded on the tab's top page or on any of its cross-origin frames or popups (H.kids).
+async function pkTake(info, session) {
+  const top = await evaluate(session, pkCall(info.targetId, 'take'), 3000).catch(() => null);
+  if (top && typeof top === 'object') return top;
+  const kids = H.kids.get(info.targetId);
+  if (kids) for (const [childSession, childToken] of kids) {
+    const d = await evaluate(childSession, `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(childToken)}, 'take'))`, 3000).catch(() => null);
+    if (d && typeof d === 'object') return d;
+  }
+  return null;
 }
 // Wraps the agent's own input so the watcher above doesn't count it as the user's.
 async function asAgent(info, session, fn) {
@@ -1136,13 +1508,14 @@ const READ_TOOLS = new Set(['chrome_snapshot', 'chrome_read']);
 const ACTION_TOOLS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_eval', 'chrome_scroll']);
 
 // Every tab tool, with handoffs on: scope, the user's control, a handoff in progress, the re-read.
-async function handoffGate(name, args, info, session) {
+async function handoffGate(name, args, info, session, ctx) {
   if (!handoffOn(args)) return;
   const agent = agentOf(args);
   if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
   const h = H.handoff.get(info.targetId);
   if (h && h.waiting) throw refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' });
   await watchInput(info, session);
+  await netGuard(info, session, args, ctx);
   await notePause(info, session, null);
   if (await pauseHeld(info, session, args)) {
     throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
@@ -1151,6 +1524,12 @@ async function handoffGate(name, args, info, session) {
   if (name !== 'chrome_close' && name !== 'chrome_show') {
     const pk = await passkeyRefusal(args, info, session, true);
     if (pk) throw pk;
+  }
+  // A request the page started on its own after the agent's last action (the network guard failed it): tell the
+  // agent now, once. chrome_close and chrome_show say nothing about it (they never act in the page).
+  if (name !== 'chrome_close' && name !== 'chrome_show') {
+    const nr = H.netRefused.get(info.targetId);
+    if (nr) { H.netRefused.delete(info.targetId); throw nr.refusal; }
   }
   if (READ_TOOLS.has(name)) H.reread.delete(info.targetId);
   else if (ACTION_TOOLS.has(name) && H.reread.has(info.targetId)) {
@@ -1164,7 +1543,9 @@ async function judged(ctx, session, key, condition) {
   if (!ctx?.apiKey) return null;
   let p = null;
   try {
-    const r = await predev(ctx, '/browser/check', { condition, page: await pageState(session).catch(() => '') || '(empty page)' });
+    // No session: the page can't be read now (a navigation of it is pending), so the check goes by the condition.
+    const page = session ? await pageState(session).catch(() => '') || '(empty page)' : '(the page is navigating; its content is not available)';
+    const r = await predev(ctx, '/browser/check', { condition, page });
     p = Number(r?.probability);
   } catch (error) { log('handoff check failed', error.message); return null; }
   if (Number.isFinite(p)) { H.checks.set(key, p); if (H.checks.size > 2000) H.checks.delete(H.checks.keys().next().value); }
@@ -1190,7 +1571,7 @@ async function secretRefusal(args, session, q, url, ctx) {
 }
 
 // Rule 2: ask first before a click or submit that sends, posts, buys or deletes.
-async function approvalRefusal(args, session, desc, facts, url, ctx) {
+async function approvalRefusal(args, session, desc, facts, url, ctx, action = 'Clicking') {
   if (!handoffOn(args) || isLocalDev(url)) return '';
   // The person who typed the cloud run approved exactly this control on this page on pre.dev's card: once.
   const ok = fromWeb(args) ? APPROVED.get(agentOf(args)) : null;
@@ -1200,7 +1581,7 @@ async function approvalRefusal(args, session, desc, facts, url, ctx) {
     return '';
   }
   let p = await judged(ctx, session, `act|${pagePath(url)}|${desc}`,
-    `Clicking ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`);
+    `${action} ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`);
   // No verdict (no pre.dev key, or pre.dev unreachable): a form submit sent with POST asks first.
   if (p === null) p = facts?.isSubmit && /^post$/i.test(facts.formMethod || '') ? 1 : 0;
   if (p < 0.7) return '';
@@ -1303,6 +1684,24 @@ DLG.handle = onDialogEvent;
 if (!DLG.hooked && typeof chrome.onEvent === 'function') {
   DLG.hooked = true;
   chrome.onEvent((targetId, method, params) => DLG.handle?.(targetId, method, params));
+}
+// The network guard reads events the same way (the latest copy of this file handles them). A fallback keeps the
+// page working if the handler is ever missing: an unjudged paused request is continued, not left hanging.
+H.netHandle = netEvent;
+if (!H.netHooked && typeof chrome.onEvent === 'function') {
+  H.netHooked = true;
+  chrome.onEvent((targetId, method, params) => {
+    const h = H.netHandle;
+    if (h) return void h(targetId, method, params);
+    if (method === 'Fetch.requestPaused') chrome.send('Fetch.continueRequest', { requestId: params.requestId }, chrome.sessions.get(targetId)).catch(() => {});
+  });
+}
+// Cross-origin frames and popups (Target.attachedToTarget): their own passkey watch goes in there before they load.
+// The reporter's events (Page.frameNavigated, Runtime.bindingCalled) come the same way.
+H.attachHandle = attachEvent;
+if (!H.attachHooked && typeof chrome.onEvent === 'function') {
+  H.attachHooked = true;
+  chrome.onEvent((targetId, method, params, sessionId) => H.attachHandle?.(targetId, method, params, sessionId));
 }
 const ALERT_AUTO_OK = !/^(0|off|false|no)$/i.test(String(process.env.PREDEV_ALERT_AUTO_OK || ''));
 // "A tab a call is using": one in flight there; or an agent's own tab (handoffs on) one used in the last 2 minutes.
@@ -1582,6 +1981,109 @@ async function keepRefusal(args, session, action, target, pageUrl, to, ctx) {
     if (why) return why;
   }
   return '';
+}
+
+// ---------------------------------------------------------------- the network guard (page-script paths)
+// A page on a kept tab can reach a sign-out or send/post without a click the element guard sees: a select's
+// onchange, an upload's change, an onclick on a plain element that calls form.submit(), a location change, or a
+// fetch/XHR. These all show at the network layer, so with a kept site in play the guard watches requests there
+// (CDP Fetch, request stage). Only a navigation (any method) or a non-GET fetch/XHR counts; a GET subresource
+// passes. A request the page started after the agent's own last activation is run through the same keep-sign-in
+// and ask-first checks as a click; the person's own click (the latest activation is theirs) passes untouched.
+const NET_TYPES = new Set(['Document', 'XHR', 'Fetch', 'Ping', 'Other']);
+const NET_PASS_METHOD = /^(GET|HEAD|OPTIONS)$/i;
+const NET_NAV_REASONS = new Set(['formSubmissionGet', 'formSubmissionPost', 'scriptInitiated', 'anchorClick', 'initialFrameNavigation', 'reload', 'other']);
+// Any kept site at all: only then is it worth watching the network on this tab.
+const anyKept = args => H.signedIn.size > 0 || (Array.isArray(args?.__predev_signed_in) && args.__predev_signed_in.length > 0);
+// Called from the handoff gate on each call: turn the watch on for a kept tab, and keep the latest call's args
+// and ctx so the pause handler (which has no call scope) can build a refusal and reach pre.dev's check.
+async function netGuard(info, session, args, ctx) {
+  if (!handoffOn(args) || !anyKept(args)) return;
+  H.netArgs.set(info.targetId, { args: pickPredevArgs(args), ctx: ctx && { apiKey: ctx.apiKey, apiUrl: ctx.apiUrl }, session });
+  if (H.netOn.has(session)) return;
+  H.netOn.add(session);
+  const ok = await chrome.send('Fetch.enable', { patterns: NET_PATTERNS() }, session).then(() => true, () => false);
+  if (!ok) H.netOn.delete(session);
+}
+const NET_PATTERNS = () => [...NET_TYPES].map(resourceType => ({ urlPattern: '*', resourceType, requestStage: 'Request' }));
+// Only the __predev_* flags and the tab travel to the handler; never a signal or other live objects.
+function pickPredevArgs(args) {
+  const out = { tab: args.tab };
+  for (const k of Object.keys(args)) if (k.startsWith('__')) out[k] = args[k];
+  return out;
+}
+// The event listener (registered once, like the dialog one). frameRequestedNavigation says a navigation was the
+// page's own (and why); the paused request is then judged. Runs its own async work and never blocks the socket.
+function netEvent(targetId, method, params = {}) {
+  if (!targetId) return;
+  if (method === 'Page.frameRequestedNavigation') {
+    H.netAsked.set(`${targetId}:${params.frameId}`, { reason: params.reason, url: params.url, at: Date.now() });
+    return;
+  }
+  if (method !== 'Fetch.requestPaused') return;
+  void netDecide(targetId, params).catch(() => {});
+}
+async function netDecide(targetId, params) {
+  const stored = H.netArgs.get(targetId);
+  const session = chrome.sessions.get(targetId) || stored?.session;
+  const requestId = params.requestId;
+  const cont = () => chrome.send('Fetch.continueRequest', { requestId }, session).catch(() => {});
+  // A refused navigation is cancelled (Aborted), so the page the person is on stays as it was; Chrome would put
+  // its own error page there for BlockedByClient. A refused fetch/XHR fails as blocked.
+  const errorReason = params.resourceType === 'Document' ? 'Aborted' : 'BlockedByClient';
+  const fail = () => chrome.send('Fetch.failRequest', { requestId, errorReason }, session).catch(() => {});
+  try {
+    if (!session) return void cont();
+    // The person has the tab (a handoff): everything they do goes through.
+    if (H.handoff.get(targetId)?.waiting) return void cont();
+    if (!stored) return void cont();
+    const refusal = await Promise.race([
+      netVerdict(targetId, session, params, stored).catch(() => null),
+      sleep(25000).then(() => 'timeout'),
+    ]);
+    if (refusal === 'timeout') return void fail();           // a check that never came back blocks rather than allows
+    if (!refusal) return void cont();
+    H.netRefused.set(targetId, { refusal, at: Date.now() });
+    return void fail();
+  } catch { return void cont(); }
+}
+// The refusal for this paused request, or null to let it through.
+async function netVerdict(targetId, session, params, stored) {
+  const { args, ctx } = stored;
+  const method = String(params.request?.method || 'GET');
+  const url = String(params.request?.url || '');
+  const type = params.resourceType;
+  const isDoc = type === 'Document';
+  const isRedirect = !!params.redirectedRequestId;
+  if (!isDoc && NET_PASS_METHOD.test(method)) return null;    // a GET subresource is not watched
+  if (!NET_TYPES.has(type)) return null;
+  if (isDoc) {
+    // A navigation the page started (a script, a form, a link), or a redirect of one; Chrome's own
+    // Page.navigate / reload (the agent's chrome_navigate, which the element path handles) sends no
+    // frameRequestedNavigation, so it is not page-started and passes here.
+    const key = `${targetId}:${params.frameId}`;
+    const asked = H.netAsked.get(key);
+    if (asked && !isRedirect) H.netAsked.delete(key);  // one request per page-started navigation
+    const pageStarted = isRedirect || (asked && Date.now() - asked.at < 15000 && NET_NAV_REASONS.has(asked.reason));
+    if (!pageStarted) return null;
+  }
+  // Whose activation is latest in the tab: the agent's while one of its actions runs, otherwise what the reporter
+  // last told (nothing can be asked of the page while its navigation is pending). A short settle lets a report
+  // sent just before the request land first. None known counts as the agent's.
+  let owner = H.marked.get(session) ? 'agent' : null;
+  if (!owner) { await sleep(30); owner = H.marked.get(session) || H.actAt.get(targetId)?.who !== 'person' ? 'agent' : 'person'; }
+  if (owner === 'person') return null;                        // the person's own click: untouched
+  const pageUrl = chrome.targets.get(targetId)?.url || url;
+  if (!keepsSignIn(args, pageUrl) && !keepsSignIn(args, url)) return null;
+  const post = !NET_PASS_METHOD.test(method);
+  const action = isDoc ? (post ? 'Submitting a form (POST) to' : 'Going to') : 'Sending a POST request to';
+  const target = `${url} (the page did it on its own after the agent's last action)`;
+  // A pending navigation holds every command to its page, so a navigation's check can't read the page.
+  const readable = isDoc ? null : session;
+  const keep = await keepRefusal(args, readable, action, target, pageUrl, url, ctx);
+  if (keep) return keep;
+  const appr = await approvalRefusal(args, readable, `the request the page sent to ${url}`, { isSubmit: post, formMethod: method }, url, ctx, 'Sending');
+  return appr || null;
 }
 
 const KEYS = {
@@ -2619,7 +3121,9 @@ const TOOLS = [
         }, session, 5000);
         const objectId = found.result?.objectId;
         if (!objectId) throw new Error('No file input found. Pass the ref of the button that opens the file picker (chrome_snapshot), or a selector for the <input type=file>.');
-        await chrome.send('DOM.setFileInputFiles', { files, objectId }, session, 15000);
+        // Setting the files fires trusted input/change events: they are the agent's, not the user's.
+        await markActing(session, true);
+        try { await chrome.send('DOM.setFileInputFiles', { files, objectId }, session, 15000); } finally { await markActing(session, false); }
         const count = await chrome.send('Runtime.callFunctionOn', {
           objectId, functionDeclaration: 'function () { return this.files ? this.files.length : -1; }', returnByValue: true,
         }, session, 5000).then(r => r.result?.value).catch(() => '?');
@@ -2663,6 +3167,7 @@ const TOOLS = [
     },
     async run(args = {}, ctx = {}) {
       if (!handoffOn(args)) throw new Error('chrome_handoff needs handoffs turned on (PREDEV_HANDOFF=1 for this MCP server).');
+      const calledAt = Date.now(); // handoffs take turns by when their calls came in
       const agent = agentOf(args);
       // After Chrome quit and came back (a caller that saw chrome_gone): the handoff's page
       // is open again in a new tab with a new id. Take it up by the page's address.
@@ -2693,7 +3198,13 @@ const TOOLS = [
         H.handoff.delete(id);
         if (H.active === id) H.active = null;
         H.ackAt.set(id, Date.now());
-        if (status === 'done' || status === 'released' || status === 'resumed') H.reread.add(id);
+        if (status === 'done' || status === 'released' || status === 'resumed') {
+          H.reread.add(id);
+          // A tab a handoff signed in to or handed back: its URLs are masked for secret-keyed values too.
+          const u = chrome.targets.get(id)?.url || h?.startUrl;
+          const k = u && siteKey(u);
+          if (k) H.handedSites.add(k);
+        }
         return h;
       };
       if (args.peek) {
@@ -2749,6 +3260,9 @@ const TOOLS = [
       if (reason === 'user_control' && !H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: Date.now() });
       if (reason === 'user_control') await pauseHeld(info, session);
       H.handoff.set(info.targetId, { agent, reason, waiting: true, since: Date.now(), startUrl, done: args.done });
+      // While the person has the tab, the reporter tells the values they type into secret fields as each is done,
+      // so the done line and everything after can be masked.
+      await reporterOn(info.targetId, session);
       if (args.wait === false) {
         // Another agent's handoff is the user's now: this tab waits its turn (a wait: true call on it comes
         // forward when that one ends) and never comes forward over it.
@@ -2756,17 +3270,34 @@ const TOOLS = [
         if (!busy && await chromeInFront()) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
         return handoffLines('started', info, startUrl, busy ? 'Another agent\'s handoff is open on this computer: wait with wait: true, and this tab comes forward when that one ends.' : '');
       }
-      // One handoff at a time on this bridge: wait for another agent's to end first.
+      // One handoff at a time on this bridge, in the order the calls came in: wait for the ones before this to end.
       const id0 = info.targetId;
       H.queue.push(id0);
+      H.queuedAt.set(id0, calledAt);
       const limit = Number(args.timeout) > 0 ? Date.now() + Number(args.timeout) * 1000 : Infinity;
       const cancelled = () => H.cancel.has(info.targetId) || H.cancel.has(id0);
+      const inLine = id => !!H.handoff.get(id)?.waiting && chrome.targets.has(id);
+      const firstInLine = () => H.queue.filter(inLine).sort((a, b) => (H.queuedAt.get(a) || 0) - (H.queuedAt.get(b) || 0))[0];
+      const othersFirst = () => (H.active && H.active !== id0 && chrome.targets.has(H.active) && H.handoff.has(H.active)) || (firstInLine() || id0) !== id0;
       try {
-        while (H.active && H.active !== id0 && chrome.targets.has(H.active)) {
+        while (othersFirst()) {
           if (ctx.signal?.aborted || cancelled()) { end(id0, 'cancelled'); return handoffLines('cancelled', info, startUrl); }
           if (Date.now() > limit) { end(id0, 'timeout'); return handoffLines('timeout', info, startUrl); }
           // Its own tab closed while it waited its turn (Chrome quitting is told after the wait, as chrome_gone).
           if (chrome.connected && await tabClosed(id0)) { end(id0, 'tab_closed'); return handoffLines('tab_closed', null, startUrl, TAB_CLOSED_NOTE); }
+          // The user already did this step in its tab while it waited its turn: done now, out of turn (the same
+          // done check as below).
+          if (reason !== 'user_control' && !waitsForInput(reason, args.done)) {
+            const s1 = await chrome.session(id0).catch(() => null);
+            const v = s1 && await evaluate(s1, doneExpression(args.done, startUrl), 5000).catch(() => null);
+            if (v?.ok) {
+              await noteSecrets(id0, s1);
+              noteSignedIn(reason, v.url || info.url);
+              end(id0, 'done');
+              await waitForLoad(s1, 10000).catch(() => {});
+              return `${handoffLines('done', info, v.url)}${await pageLine(info, s1)}\nThe user finished. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
+            }
+          }
           await sleep(500);
         }
         H.active = id0;
@@ -2827,6 +3358,7 @@ const TOOLS = [
             if (v) misses = 0;
             if (v?.url) lastUrl = v.url;
             if (v?.ok) {
+              await noteSecrets(info.targetId, session);
               noteSignedIn(reason, v.url || info.url);
               end(info.targetId, 'done');
               await waitForLoad(session, 10000).catch(() => {});
@@ -2837,6 +3369,7 @@ const TOOLS = [
         }
       } finally {
         H.queue = H.queue.filter(t => t !== id0 && t !== info.targetId);
+        H.queuedAt.delete(id0);
         if (H.active === id0 || H.active === info.targetId) {
           if (!H.handoff.has(H.active)) H.active = null;
         }
@@ -2951,11 +3484,21 @@ for (const tool of TOOLS) {
       if (info) {
         const session = await chrome.session(info.targetId);
         await pageOn(session);
-        if (handoffOn(args)) await handoffGate(tool.name, args, info, session);
+        if (handoffOn(args)) await handoffGate(tool.name, args, info, session, ctx);
         // An action's input and whatever the page does about it are the agent's (the passkey watch).
         if (handoffOn(args) && MARKED_ACTIONS.has(tool.name)) {
+          const at = Date.now();
+          let result, failed;
           await agentMark(session, true);
-          try { return await run.call(tool, args, ctx); } finally { await agentMark(session, false); }
+          try { result = await run.call(tool, args, ctx); } catch (error) { failed = error; } finally { await agentMark(session, false); }
+          // A request the page started during this very action (a select onchange, a form.submit()) that the
+          // network guard failed: refuse this call. A request that lands after it returns is told on the next call
+          // (handoffGate). A short settle gives a just-fired one time to be judged before this returns.
+          await sleep(120);
+          const nr = H.netRefused.get(info.targetId);
+          if (nr && nr.at >= at) { H.netRefused.delete(info.targetId); throw nr.refusal; }
+          if (failed) throw failed;
+          return result;
         }
       }
       return run.call(tool, args, ctx);
@@ -2982,6 +3525,31 @@ for (const tool of TOOLS) {
     H.signedIn.delete(siteKey(note.host));
     const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : result;
     return out?.isError ? out : { ...out, signedOut: { site: note.host } };
+  };
+}
+
+// Outermost (so it covers every inner wrapper): with handoffs on, the person's secrets captured during a
+// handoff, and secret-keyed query/fragment values on kept sites, are masked out of everything the agent is
+// handed back: tool text, {content:[...]} items, and a refusal's message and string fields.
+for (const tool of TOOLS) {
+  const run = tool.run;
+  tool.run = async (args = {}, ctx = {}) => {
+    if (!handoffOn(args)) return run.call(tool, args, ctx);
+    const mask = text => maskSecrets(text, args);
+    try {
+      const result = await run.call(tool, args, ctx);
+      if (typeof result === 'string') return mask(result);
+      if (result && Array.isArray(result.content)) {
+        return { ...result, content: result.content.map(c => (c && typeof c.text === 'string' ? { ...c, text: mask(c.text) } : c)) };
+      }
+      return result;
+    } catch (error) {
+      if (error && typeof error.message === 'string') { try { error.message = mask(error.message); } catch (e) {} }
+      if (error && error.refusal && typeof error.refusal === 'object') {
+        for (const k of Object.keys(error.refusal)) if (typeof error.refusal[k] === 'string') { try { error.refusal[k] = mask(error.refusal[k]); } catch (e) {} }
+      }
+      throw error;
+    }
   };
 }
 

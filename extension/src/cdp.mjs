@@ -97,7 +97,9 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
     if (!listeners.size) return;
     const targetId = source.targetId || (source.tabId != null ? targetOfTab(source.tabId) : null);
     if (!targetId || !sessions.has(targetId)) return;
-    for (const listener of listeners) { try { listener(targetId, method, params); } catch {} }
+    // The 4th arg is the raw child session (unused here: chrome.debugger can't drive a cross-origin frame or
+    // popup's own session, so those stay best effort in the extension; the daemon path covers them).
+    for (const listener of listeners) { try { listener(targetId, method, params, source.sessionId || null); } catch {} }
   });
 
   function timed(promise, timeout, method) {
@@ -156,6 +158,9 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
   const conn = {
     targets,
     sessions,
+    // send() reaches a tab's own session only, not a child session (a cross-origin frame or popup that
+    // auto-attach would pause before it loads), so tools.mjs leaves auto-attach off here.
+    childSessions: false,
     get connected() { return true; },
     async connect() { await refresh(); },
     send(method, params = {}, sessionId, timeout = 15000) {

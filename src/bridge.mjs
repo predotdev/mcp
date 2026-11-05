@@ -179,10 +179,14 @@ class Chrome {
     } else if (method === 'Target.detachedFromTarget') {
       for (const [targetId, sessionId] of this.sessions) if (sessionId === params.sessionId) this.sessions.delete(targetId);
     }
-    if (message.sessionId && this.listeners.size) {
+    if (this.listeners.size) {
+      // The session's tab (if the event is on an attached tab's session), the method, the params, and the raw
+      // sessionId. A browser-level event (no sessionId) or one on a child session we don't track as a tab still
+      // reaches listeners with a null targetId: the passkey guard needs Target.attachedToTarget for popups and
+      // cross-origin frames, and the dialog and network guards ignore events whose targetId is null.
       let targetId = null;
-      for (const [t, s] of this.sessions) if (s === message.sessionId) { targetId = t; break; }
-      if (targetId) for (const listener of this.listeners) { try { listener(targetId, method, params); } catch {} }
+      if (message.sessionId) for (const [t, s] of this.sessions) if (s === message.sessionId) { targetId = t; break; }
+      for (const listener of this.listeners) { try { listener(targetId, method, params, message.sessionId || null); } catch {} }
     }
   }
 
