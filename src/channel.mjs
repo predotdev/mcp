@@ -389,12 +389,22 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
     args.__agent = agent;
     args.__predev_handoff = true;
     args.__via = 'web';
-    // The hand-back of the tab after the user had it (a card's Done): nothing else of chrome_handoff.
+    // Of chrome_handoff, a handed task's run may: take the tab back after the user had it (a card's Done); hand the
+    // user a sign-in step in its own tab without waiting (a passkey: the browser and Touch ID do it, nothing is typed),
+    // with a done check from the URL or the page's structure; and run that check. Never a wait, a release of another
+    // agent's tab, or any other reason.
+    let handoffArgs = null;
     if (name === HANDOFF_TOOL) {
-      if (!args.tab || args.reason !== 'user_control' || args.resume !== true) return text('Only the hand-back of the tab is available to this run.');
-      return callTool(HANDOFF_TOOL, { tab: args.tab, reason: 'user_control', resume: true, __agent: agent, __predev_handoff: true, __via: 'web' }, { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl });
-    }
-    if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
+      const base = { tab: args.tab, __agent: agent, __predev_handoff: true, __via: 'web' };
+      const kinds = ['url_changes', 'url_leaves', 'element_gone', 'element_present'];
+      const done = args.done && typeof args.done === 'object' && kinds.includes(args.done.kind)
+        ? { kind: args.done.kind, ...(typeof args.done.value === 'string' ? { value: args.done.value.slice(0, 300) } : {}) } : { kind: 'url_changes' };
+      if (!args.tab) return text('A call for this task must name its tab.');
+      if (args.reason === 'user_control' && args.resume === true) handoffArgs = { ...base, reason: 'user_control', resume: true };
+      else if (args.check === true) handoffArgs = { ...base, check: true };
+      else if ((args.reason === 'login_required' || args.reason === 'step_up') && args.wait === false) handoffArgs = { ...base, reason: args.reason, wait: false, done };
+      else return text('Only the hand-back of the tab, a sign-in step handed to the user in it, and its check are available to this run.');
+    } else if (!TASK_TOOLS.has(name)) return text(`${name || 'That tool'} isn't available to pre.dev's cloud run of this task.`);
     if (args.tab) {
       const info = tabInfo(args.tab);
       if (!info) return refusedText(`Tab ${String(args.tab).slice(0, 12)} is closed.`, { kind: 'tab_closed' });
@@ -406,6 +416,7 @@ ${local ? '<p class="warn">This address is on this computer or your own network.
         H.owned.get(agent).add(info.targetId);
       }
     } else if (name !== 'chrome_open') return text('A call for this task must name its tab.');
+    if (handoffArgs) return callTool(HANDOFF_TOOL, handoffArgs, { apiKey: key(), apiUrl: pairing()?.apiUrl || defaultApiUrl });
     if (name === 'chrome_open' && !args.profile) args.profile = profiles().find(p => p.lastUsed)?.dir || profiles()[0]?.dir || 'Default';
     const blocked = await sitesAllowed(name, args, body, port, api);
     if (blocked) return blocked;
