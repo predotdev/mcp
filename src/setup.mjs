@@ -492,6 +492,8 @@ export function createSetup(ctx) {
   }
 
   function logout() {
+    // pre.dev's saved answer for the key (bridge.mjs features.json) goes with it.
+    fs.rmSync(path.join(baseStateDir, 'features.json'), { force: true });
     fs.rmSync(credentialsFile, { force: true });
     console.log(cliLogin()
       ? 'Deleted the saved pre.dev key. You are still signed in through the pre.dev CLI; run `predev logout` to sign out there too.'
