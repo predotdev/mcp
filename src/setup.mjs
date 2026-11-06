@@ -493,6 +493,8 @@ export function createSetup(ctx) {
 
   function logout() {
     fs.rmSync(credentialsFile, { force: true });
+    // The saved profile listing (bridge.mjs profiles.json: profile names and site domains) goes with it.
+    fs.rmSync(path.join(baseStateDir, 'profiles.json'), { force: true });
     console.log(cliLogin()
       ? 'Deleted the saved pre.dev key. You are still signed in through the pre.dev CLI; run `predev logout` to sign out there too.'
       : 'Signed out: the saved pre.dev key is deleted. Plain-words actions are off until you run login again.');
