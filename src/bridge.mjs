@@ -364,6 +364,9 @@ const CLOUD = !/^(0|off|false|no)$/i.test(process.env.PREDEV_MCP_CLOUD || '');
  *  agent's tabs, no typing into password, code or card fields, ask first before send, post, buy
  *  or delete). Off by default; off, every tool works as before. */
 const HANDOFF = /^(1|true|on|yes)$/i.test(process.env.PREDEV_HANDOFF || '');
+/** BROWSER_PROFILES=1 and BROWSER_AGENTS_LOCAL_NETWORK=1 (with handoffs on): `network`, the sites
+ *  pre.dev cloud runs reach through this computer (network.mjs). Off, the commands and help are as before. */
+const LOCAL_NETWORK = HANDOFF && /^(1|true|on|yes)$/i.test(process.env.BROWSER_PROFILES || '') && /^(1|true|on|yes)$/i.test(process.env.BROWSER_AGENTS_LOCAL_NETWORK || '');
 /** PREDEV_MCP_FROM_PREDEV=1: started by pre.dev's own CLI, whose agent knows what its user
  *  asked for. Only then may a call lift the kept sign-in (__predev_signout_ok); from any other
  *  agent it is dropped, so a model can't lift it by passing the argument itself. */
@@ -687,6 +690,11 @@ const PAIR_HELP = `  predev-mcp pair       let pre.dev web runs you start do ste
   predev-mcp start-at-login on|off
                         keep pre.dev connected when you log in (pair asks)
 `;
+// Reaching sites through this computer, only with its flags on.
+const NETWORK_HELP = `  predev-mcp network    sites pre.dev cloud runs you start reach through this computer's network
+                        (internal sites behind a VPN or an office IP list); \`network add <site>\`,
+                        \`network remove <site>\`, \`network log\` (host, bytes, run; never content)
+`;
 
 async function runCheck() {
   let failed = false;
@@ -826,7 +834,8 @@ else if (command === 'stop') runStop();
 else if (command === '--version' || command === '-v') console.log(PKG.version || '0.0.0');
 else if (HANDOFF && (command === 'pair' || command === 'unpair')) runSetupCommand(command);
 else if (HANDOFF && (command === 'sites' || command === 'start-at-login')) runSetupCommand(command === 'sites' ? 'sites' : 'startAtLogin', process.argv.slice(3));
-else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HANDOFF ? HELP.replace('  predev-mcp uninstall', `${PAIR_HELP}  predev-mcp uninstall`) : HELP);
+else if (LOCAL_NETWORK && command === 'network') runSetupCommand('network', process.argv.slice(3));
+else if (command === '--help' || command === '-h' || command === 'help') process.stdout.write(HANDOFF ? HELP.replace('  predev-mcp uninstall', `${PAIR_HELP}${LOCAL_NETWORK ? NETWORK_HELP : ''}  predev-mcp uninstall`) : HELP);
 else if (command === '' || command === 'mcp') {
   if (process.stdin.isTTY && !command) process.stderr.write(HELP);
   else runMcp();
