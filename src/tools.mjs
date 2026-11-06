@@ -1507,19 +1507,24 @@ const RESUME_WAIT_MS = 45000;
 const READ_TOOLS = new Set(['chrome_snapshot', 'chrome_read']);
 const ACTION_TOOLS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_eval', 'chrome_scroll']);
 
+// The user has the tab: a handoff of it in progress, or the agent paused over their own clicks or keys there.
+function handoffHeld(args, info) {
+  const h = H.handoff.get(info.targetId);
+  return h && h.waiting ? refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' }) : null;
+}
+const pausedRefusal = (args, info) => refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
+
 // Every tab tool, with handoffs on: scope, the user's control, a handoff in progress, the re-read.
 async function handoffGate(name, args, info, session, ctx) {
   if (!handoffOn(args)) return;
   const agent = agentOf(args);
   if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
-  const h = H.handoff.get(info.targetId);
-  if (h && h.waiting) throw refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' });
+  const held = handoffHeld(args, info);
+  if (held) throw held;
   await watchInput(info, session);
   await netGuard(info, session, args, ctx);
   await notePause(info, session, null);
-  if (await pauseHeld(info, session, args)) {
-    throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
-  }
+  if (await pauseHeld(info, session, args)) throw pausedRefusal(args, info);
   // The page asked for a passkey after the agent's last call here returned (the watch declined it).
   if (name !== 'chrome_close' && name !== 'chrome_show') {
     const pk = await passkeyRefusal(args, info, session, true);
@@ -1535,6 +1540,33 @@ async function handoffGate(name, args, info, session, ctx) {
   else if (ACTION_TOOLS.has(name) && H.reread.has(info.targetId)) {
     throw refused('The user just had this tab and may have changed the page. Read it first (chrome_snapshot or chrome_read), then act.', { kind: 'reread' });
   }
+}
+
+// OFF_WEB: in a chrome_navigate call's ctx, the web address Chrome already took the tab to (navigateOffWeb).
+const OFF_WEB = Symbol('offWeb');
+// chrome_navigate on a tab the pre.dev extension can't attach to (the person took the run's tab to chrome:// or another
+// extension's page): Chrome takes the tab to the web address itself (chrome.leaveForWeb), after the gate's checks that
+// need no page, and the call attaches there. Returns that address, or '' when this isn't that case (a tab the debugger
+// can use, back/forward/reload, an address that isn't http(s), or the daemon): the call goes on as before, and on a
+// non-web tab chrome.session refuses it, as it does every other call there.
+async function navigateOffWeb(args, info, ctx) {
+  if (!chrome.offWeb?.(info.targetId) || ['back', 'forward', 'reload'].includes(args.url)) return '';
+  const dest = normalizeUrl(args.url);
+  if (!/^https?:/i.test(dest)) return '';
+  // (Scope and pre.dev's own tabs are checked before this, on every gated call.)
+  if (handoffOn(args)) {
+    const held = handoffHeld(args, info);
+    if (held) throw held;
+    if (H.paused.has(info.targetId)) throw pausedRefusal(args, info);
+    const nr = H.netRefused.get(info.targetId);
+    if (nr) { H.netRefused.delete(info.targetId); throw nr.refusal; }
+    const keep = await accountRefusal(args, null, 'Opening', dest, dest, ctx);
+    if (keep) throw keep;
+    // There is no page here to read first (no call can attach to it): the navigate replaces it.
+    H.reread.delete(info.targetId);
+  }
+  await chrome.leaveForWeb(info.targetId, dest);
+  return dest;
 }
 
 // The guard's model check (pre.dev's /browser/check on the user's key), cached per page + element.
@@ -2655,6 +2687,8 @@ const TOOLS = [
     async run({ tab, url, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
+      // Chrome already took the tab off a non-web page to this address, its checks done (navigateOffWeb): wait for it.
+      if (ctx[OFF_WEB]) return `${await pageLine(info, session)}\n${(await waitForLoad(session, 20000)) ? LOADED : STILL_LOADING}`;
       if (handoffOn(rest) && url !== 'reload') {
         let dest = url;
         if (url === 'back' || url === 'forward') {
@@ -3482,6 +3516,9 @@ for (const tool of TOOLS) {
     if (info && handoffOn(args) && !mayUse(agentOf(args), info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
     return dialogCall(args, info, async () => {
       if (info) {
+        // A navigate to a web page from a tab on a non-web page goes there first (navigateOffWeb), then attaches.
+        const movedTo = tool.name === 'chrome_navigate' ? await navigateOffWeb(args, info, ctx) : '';
+        if (movedTo) ctx = { ...ctx, [OFF_WEB]: movedTo };
         const session = await chrome.session(info.targetId);
         await pageOn(session);
         if (handoffOn(args)) await handoffGate(tool.name, args, info, session, ctx);

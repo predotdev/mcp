@@ -13,12 +13,16 @@
 //             params): tools.mjs follows the page's own dialogs with it
 //
 // Only web pages: chrome.debugger itself refuses chrome:// pages, other extensions and the Web Store,
-// and this adapter refuses anything but http(s) and blank pages.
+// and this adapter refuses anything but http(s) and blank pages. One way out of such a page: a navigate
+// to a web page (leaveForWeb), which Chrome does through chrome.tabs before the debugger attaches.
 
 /** The one browser context an extension sees: its own profile. */
 export const CONTEXT = 'default';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const ATTACHABLE = /^(https?:|about:blank|$)/;
+const NOT_WEB = 'pre.dev works only on web pages (http and https) in this Chrome.';
+/** How long leaveForWeb waits for Chrome to put the web page in the tab. */
+const LEAVE_MS = 15000;
 
 export function createDebuggerChrome({ log = () => {}, beforeAttach = async () => {}, onDetach = () => {} } = {}) {
   const targets = new Map();
@@ -175,7 +179,7 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
       if (!targets.has(targetId)) await refresh();
       const info = targets.get(targetId);
       if (!info) throw new Error('That tab is closed.');
-      if (!ATTACHABLE.test(info.url)) throw new Error('pre.dev works only on web pages (http and https) in this Chrome.');
+      if (!ATTACHABLE.test(info.url)) throw new Error(NOT_WEB);
       await beforeAttach(targetId);
       try {
         await chrome.debugger.attach({ targetId }, '1.3');
@@ -195,6 +199,31 @@ export function createDebuggerChrome({ log = () => {}, beforeAttach = async () =
       await conn.send('Page.setWebLifecycleState', { state: 'active' }, targetId).catch(() => {});
       await conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }, targetId).catch(() => {});
       return targetId;
+    },
+    /** A tab on a page the debugger can't attach to (chrome://, another extension's page): session() refuses it. */
+    offWeb(targetId) {
+      const info = targets.get(targetId);
+      return !!info && !ATTACHABLE.test(info.url);
+    },
+    /** Takes such a tab to a web page through chrome.tabs (the person moved the run's tab off the web), and returns
+     *  once Chrome has that page in it, so session() attaches as usual. The same holds as an attach: nothing while
+     *  paused or with developer tools off (beforeAttach). */
+    async leaveForWeb(targetId, url) {
+      if (!/^https?:/i.test(url)) throw new Error(NOT_WEB);
+      await beforeAttach(targetId);
+      const tabId = await tabIdOf(targetId);
+      // A session left from the web page before: Chrome can't drive the tab through it here.
+      await conn.detach(targetId);
+      await chrome.tabs.update(tabId, { url });
+      const end = Date.now() + LEAVE_MS;
+      while (Date.now() < end) {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) throw new Error('That tab is closed.');
+        // tab.url is the page the tab shows (a pending one is tab.pendingUrl).
+        if (/^https?:/i.test(tab.url || '')) { await refresh(); return; }
+        await sleep(100);
+      }
+      throw new Error(`Chrome did not open ${url} in that tab within ${LEAVE_MS / 1000}s.`);
     },
     /** Let one tab go (Chrome's bar goes away once no tab is attached). */
     async detach(targetId) {
