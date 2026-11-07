@@ -6,6 +6,9 @@
   "bin": {
     "predev-mcp": "src/bridge.mjs"
   },
+  "scripts": {
+    "build:extension": "node extension/build.mjs"
+  },
   "files": [
     "src",
     "README.md",

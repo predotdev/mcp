@@ -13,7 +13,10 @@ const { chrome, contextDirs, failedProbes, triedDirs, saveProfileMap, log, sleep
 const CHROME_DIR = core.chromeDir;
 
 
+// The Chrome profiles this Chrome has. A client that reaches Chrome another way (the pre.dev Chrome
+// extension, which lives in one profile) says so through core.chromeProfiles.
 function chromeProfiles() {
+  if (core.chromeProfiles) return core.chromeProfiles();
   const state = JSON.parse(fs.readFileSync(path.join(CHROME_DIR, 'Local State'), 'utf8'));
   const open = new Set(state.profile?.last_active_profiles || []);
   return Object.entries(state.profile?.info_cache || {}).map(([dir, info]) => ({
@@ -631,6 +634,38 @@ function snapshot(max, peek, strict) {
   const more = rows.length - keep.length;
   return head + (lines.join('\n') || '(no interactive elements)') + (more > 0 ? '\n… ' + more + ' more offscreen; scroll or pass a larger max' : '');
 }
+// pre.dev's runs: what structure says about each input among the refs, for the run's check of what it types
+// (sign-in fields): the type attribute, the autocomplete tokens, and whether the input's form holds a password
+// field. Inputs only, and no names, values or page text.
+function inputFacts() {
+  const out = {};
+  for (const [ref, hit] of window.__agentRefs || []) {
+    const el = hit.__agentInput || hit;
+    if (el.tagName !== 'INPUT') continue;
+    out[ref] = { type: String(el.getAttribute('type') || '').trim().toLowerCase() || 'text', autocomplete: el.getAttribute('autocomplete') || '', formHasPassword: formHasPassword(el) };
+  }
+  return out;
+}
+// The input's form, or else the nearest box around it that also holds a button (a form with no <form> tag).
+function formBox(el) {
+  const form = el.form || el.closest('form,[role=form]');
+  if (form) return form;
+  let n = el;
+  for (let depth = 0; depth < 8; depth++) {
+    n = n.parentElement || n.getRootNode().host || null;
+    if (!n || n === document.body || n === document.documentElement) return null;
+    if (n.querySelector('button,[role=button],input[type=submit],input[type=image],input[type=button]')) return n;
+  }
+  return null;
+}
+function formHasPassword(el) {
+  const box = formBox(el);
+  return !!box && !!box.querySelector('input[type=password i]');
+}
+function snapshotWithInputs(max) {
+  const text = snapshot(max);
+  return { text, inputs: inputFacts() };
+}
 function deepQuery(root, selector) {
   const hit = root.querySelector(selector);
   if (hit) return hit;
@@ -766,12 +801,19 @@ function activeFacts() {
 function factsOf(el) {
   const form = el.form || (el.closest && el.closest('form'));
   const sub = form ? form.querySelector('button:not([type]),button[type=submit],input[type=submit],input[type=image]') : null;
+  const isSubmit = (el.tagName === 'BUTTON' && (!el.getAttribute('type') || el.type === 'submit')) || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image'));
+  // Where a submission from here goes, and how: a submit control's own formaction and formmethod,
+  // else those of the form's default button (Enter in a field submits through it), else the form's
+  // action and method, resolved against the page as the browser does.
+  const by = isSubmit ? el : sub;
+  const own = name => !!by && by.hasAttribute(name) && String(by.getAttribute(name)).trim() !== '';
   return {
     secret: structSecret(el), desc: describe(el), tag: el.tagName.toLowerCase(), type: el.type || '',
     autocomplete: el.getAttribute('autocomplete') || '', inForm: !!form,
-    formMethod: form ? String(form.method || '') : '', submitDesc: sub ? describe(sub) : '',
-    href: (el.closest && el.closest('a[href]') || {}).href || '', formAction: form ? String(form.action || '') : '',
-    isSubmit: (el.tagName === 'BUTTON' && (!el.getAttribute('type') || el.type === 'submit')) || (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'image')),
+    formMethod: form ? String((own('formmethod') ? by.formMethod : form.method) || '') : '', submitDesc: sub ? describe(sub) : '',
+    href: (el.closest && el.closest('a[href]') || {}).href || '',
+    formAction: form ? String((own('formaction') ? by.formAction : form.action) || '') : '',
+    isSubmit,
   };
 }
 function valueOf(q) {
@@ -793,7 +835,7 @@ function selectOption(q, text) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
   return { desc: describe(el), chosen: clean(opt.text) };
 }
-window.__agent = { snapshot, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts, factsAt };
+window.__agent = { snapshot, snapshotWithInputs, point, focus, valueOf, selectOption, read, noMatch, fieldFacts, activeFacts, factsAt };
 })();`;
 // Pages keep the injected helpers; a changed source gets a new version and is re-injected.
 const PAGE_LIB = PAGE_LIB_SOURCE.replaceAll('__LIBVER__', crypto.createHash('sha1').update(PAGE_LIB_SOURCE).digest('hex').slice(0, 12));
@@ -816,6 +858,7 @@ const H = chrome.__predevHandoff || (chrome.__predevHandoff = {
   reread: new Set(), cancel: new Set(), checks: new Map(), watched: new Set(), signedIn: new Map(),
 });
 H.signedIn ||= new Map();
+H.queuedAt ||= new Map(); // tab -> when its waiting chrome_handoff call came in (turns go in that order)
 // Per call, never from the daemon's own environment: one daemon serves agents with and without it.
 const handoffOn = args => args?.__predev_handoff === true;
 const agentOf = args => String(args?.__agent || 'agent');
@@ -874,57 +917,492 @@ const INPUT_WATCH = `(() => {
   const seen = e => { if (e.isTrusted) window.__predevSeen = (window.__predevSeen || 0) + 1; };
   for (const type of ['pointerdown', 'mousedown', 'keydown', 'keyup', 'beforeinput']) addEventListener(type, seen, true);
 })()`;
-// A passkey (WebAuthn) ceremony the AGENT'S own click or key starts in the user's Chrome is declined like a
-// cancelled sheet, so Touch ID never shows for a step the user did not start. A ceremony the USER starts (while
-// the agent is not acting, e.g. during a handoff) is left alone, so their passkey works. The page's API is
-// wrapped once; nothing is read about the call.
-const WEBAUTHN_WATCH = `(() => {
-  if (window.__predevWebauthnWatch) return; window.__predevWebauthnWatch = true;
-  const C = (typeof CredentialsContainer !== 'undefined') ? CredentialsContainer.prototype : null;
+// A passkey (WebAuthn) ceremony in an agent tab reaches the authenticator only when the latest activation in
+// the tab (a trusted click, tap or key) was the person's. Everything the daemon does to the page is the agent's:
+// each action tool, and each input it dispatches, is marked through `__predevPk` with a key only pre.dev holds
+// (one per tab, `T`, never in the page's reach), and a document that starts loading meanwhile starts as the
+// agent's (agentMark's new-document script). Any other trusted click, tap or key is the person's. A ceremony
+// after the agent's own action, however long after, or one with no activation at all in its document (a page
+// that asks on load), is declined like a cancelled sheet, so Touch ID never shows for a step the person did not
+// start; the agent is told on its next call (passkeyRefusal). Conditional (autofill) passkey requests are left
+// alone. What the watch knows lives in its closure, so the page can't change it; a frame from the same origin
+// asks its parent, and a frame from another origin can't reach it (it counts its own input only).
+const webauthnWatch = (token, root = false) => `(() => {
+  if (Object.getOwnPropertyDescriptor(window, '__predevPk')) return;
+  const T = ${JSON.stringify(token)};
+  const apply = Reflect.apply, define = Object.defineProperty, P = performance, pnow = Performance.prototype.now, t0 = P.timeOrigin;
+  const now = () => t0 + apply(pnow, P, []);
+  // A cross-origin frame or a popup can't reach a parent closure, so it is its own root: it counts its own input
+  // and holds its own __predevPk (keyed by its own token), which the daemon marks through H.kids.
+  const top = ${root ? 'true' : 'window === window.parent'};
+  let agent = false, agentAt = 0, personAt = 0, declined = null;
+  const up = name => { if (top) return null; try { const f = window.parent[name]; return typeof f === 'function' ? f : null; } catch (e) { return null; } };
+  const agentOn = () => { if (agent) return true; const f = up('__predevPkAgent'); return !!f && f() === true; };
+  const times = () => { const f = up('__predevPkTimes'); const p = f ? f() : null; return p ? [Math.max(agentAt, +p[0] || 0), Math.max(personAt, +p[1] || 0)] : [agentAt, personAt]; };
+  const note = (e, act) => { if (!e.isTrusted) return; if (agentOn()) agentAt = now(); else if (act) personAt = now(); };
+  for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'keydown', 'keyup', 'touchstart', 'touchend']) addEventListener(type, e => note(e, true), true);
+  for (const type of ['wheel', 'beforeinput', 'input', 'change', 'paste', 'drop']) addEventListener(type, e => note(e, false), true);
+  const record = name => { if (top) declined = { at: now(), ceremony: name }; else { const f = up('__predevPkDeclined'); if (f) f(name); } };
+  const fixed = (name, value) => { try { define(window, name, { value, configurable: false, enumerable: false, writable: false }); } catch (e) {} };
+  fixed('__predevPkAgent', () => agentOn());
+  fixed('__predevPkTimes', () => times());
+  fixed('__predevPkDeclined', name => record(name === 'create' ? 'create' : name === 'payment' ? 'payment' : 'get'));
+  fixed('__predevPk', (t, op) => {
+    if (t !== T || !top) return null;
+    if (op === 'on' || op === 'off') { agent = op === 'on'; agentAt = now(); return true; }
+    if (op === 'idle') { agent = false; return true; }
+    if (op === 'take') { const d = declined; declined = null; return d && d.at > personAt ? d : null; }
+    return null;
+  });
+  const C = typeof CredentialsContainer !== 'undefined' ? CredentialsContainer.prototype : null;
   if (!C) return;
-  const acting = () => window.__predevAgentActing === true || Date.now() < (window.__predevActingGraceUntil || 0);
-  const wrap = (name) => {
+  const wrap = name => {
     const d = Object.getOwnPropertyDescriptor(C, name);
     if (!d || typeof d.value !== 'function') return;
     const orig = d.value;
     try {
-      Object.defineProperty(C, name, { ...d, value: function (options) {
-        const pk = options && typeof options === 'object' ? options.publicKey : undefined;
-        if (pk && (name !== 'get' || options.mediation !== 'conditional') && acting()) {
-          window.__predevPasskey = { at: Date.now(), ceremony: name };
-          return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+      define(C, name, { ...d, value: function (options) {
+        // One read of the caller's options, for the check and the call alike.
+        const o = options && typeof options === 'object' ? { ...options } : options;
+        const pk = o && typeof o === 'object' ? o.publicKey : undefined;
+        if (pk && (name !== 'get' || o.mediation !== 'conditional')) {
+          const [a, p] = times();
+          if (agentOn() || !(p > a)) {
+            record(name);
+            return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError'));
+          }
         }
-        return orig.apply(this, arguments);
+        return apply(orig, this, o === options ? arguments : [o]);
       } });
     } catch (e) {}
   };
   wrap('get'); wrap('create');
+  // Secure Payment Confirmation goes through PaymentRequest.show() with the 'secure-payment-confirmation' method
+  // and, like a passkey, reaches the person's authenticator. Same rule: after the agent's own action, or with no
+  // activation of the person's, it is declined rather than shown. The instance is tagged at construction (that is
+  // where the method is named), and show() is refused for a tagged one.
+  try {
+    const prDesc = Object.getOwnPropertyDescriptor(window, 'PaymentRequest');
+    if (prDesc && typeof prDesc.value === 'function' && typeof Proxy !== 'undefined') {
+      const Orig = prDesc.value;
+      const isSpc = new WeakSet();
+      const Proxied = new Proxy(Orig, {
+        construct(target, argv, newTarget) {
+          const inst = Reflect.construct(target, argv, newTarget);
+          try { const md = argv[0]; if (Array.isArray(md) && md.some(m => m && m.supportedMethods === 'secure-payment-confirmation')) isSpc.add(inst); } catch (e) {}
+          return inst;
+        },
+      });
+      define(window, 'PaymentRequest', { ...prDesc, value: Proxied });
+      const showDesc = Object.getOwnPropertyDescriptor(Orig.prototype, 'show');
+      if (showDesc && typeof showDesc.value === 'function') {
+        const origShow = showDesc.value;
+        define(Orig.prototype, 'show', { ...showDesc, value: function (...a) {
+          if (isSpc.has(this)) {
+            const [av, pv] = times();
+            if (agentOn() || !(pv > av)) { record('payment'); return Promise.reject(new DOMException('The operation either timed out or was not allowed.', 'NotAllowedError')); }
+          }
+          return apply(origShow, this, a);
+        } });
+      }
+    }
+  } catch (e) {}
 })()`;
+H.pkTokens ||= new Map(); // targetId -> the tab's key for its passkey watch
+H.pkSession ||= new Map(); // targetId -> the session its watch scripts were added on (a new session adds them again)
+H.marked ||= new Map(); // session -> how many of the agent's actions are running there
+H.pkStart ||= new Map(); // session -> the new-document script that starts a page loading during them as the agent's
+H.kids ||= new Map(); // tab targetId -> Map(childSession -> childToken): its cross-origin frames and popups, each its own watch
+H.kidSeen ||= new Set(); // child sessions already set up, so a re-attach doesn't double-install
+H.autoAttach ||= new Set(); // tab sessions Target.setAutoAttach is on for (cross-origin frames)
+H.popupOn ||= false; // browser-level auto-attach for popups is on (installed once)
+const tabOfSession = session => { for (const [targetId, sid] of chrome.sessions) if (sid === session) return targetId; return null; };
+const pkCall = (targetId, op) => `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(H.pkTokens.get(targetId) || '')}, '${op}'))`;
+
+// The person's secrets, captured during a handoff on that tab (the reporter below), kept in memory only and
+// masked out of everything the agent is handed back. Capped so a long run can't grow it without bound.
+H.secretValues ||= new Set();   // the distinct values the person typed into secret fields during a handoff
+H.handedSites ||= new Set();     // siteKeys of tabs a handoff signed in to or handed back: their URLs get masked too
+// The network guard (page-script paths): on a kept tab, a request the page itself started after the
+// agent's last activation, when it is a navigation or a non-GET fetch/XHR, is run through the keep-sign-in and
+// ask-first checks and failed if it would sign the user out or send/post as them. The agent is told on that call
+// or the next one. The person's own clicks pass untouched.
+H.netOn ||= new Set();           // sessions Fetch is enabled on
+H.netArgs ||= new Map();         // targetId -> { args, ctx, session } for a pause handler that has no call scope
+H.netAsked ||= new Map();        // `${targetId}:${frameId}` -> { reason, url, at }: a frameRequestedNavigation
+H.netRefused ||= new Map();      // targetId -> { refusal, at }: a page-started request the guard failed, to tell the agent
+
+// The reporter. While a navigation is pending, Chrome holds every command to the page, so nothing can be read
+// from the page when the network guard has to judge it. What the guard needs is told to the daemon as it happens
+// instead: each document of an agent tab (and of a handed tab) gets one listener script in its own isolated
+// world, which the page's scripts can't see or reach, with a binding only that world has. It reports each
+// trusted click, tap or key (whose it was is the daemon's call: the agent's if one of its actions was running
+// in the tab then, otherwise the person's), and, once a secret field is done (change, Enter, submit, the page
+// going away), the values in the secret fields (the same field classes the snapshot hides). The daemon keeps
+// the values only while the person has the tab for a handoff.
+const ACT_WORLD = 'predev-act';
+H.actBinding ||= `__predevAct_${crypto.randomBytes(8).toString('hex')}`;
+H.actAt ||= new Map();       // targetId -> { who: 'agent' | 'person', at }: whose trusted activation in the tab is the latest
+H.markSpans ||= new Map();   // targetId -> [{ s, e }]: when the agent's actions ran in the tab (newest last, capped)
+H.actWorlds ||= new Map();   // session -> Map(frameId -> the reporter's context in that frame's current document)
+H.reportOn ||= new Map();    // targetId -> the session the reporter follows that tab's documents on
+const REPORTER = binding => `(() => {
+  if (globalThis.__predevAct) return true;
+  const f = globalThis[${JSON.stringify(binding)}];
+  if (typeof f !== 'function') return false;
+  const send = o => { try { f(JSON.stringify(o)); } catch (e) {} };
+  const RE = /password|passwd|passcode|passphrase|pwd|cv[vc]2?|security.?code|card.?(num|no)|cc.?num|social.?sec|one.?time|totp|2fa|mfa|verification.?code|auth.?code|secret|api.?key|access.?key|token|(^|[^a-z])(pass|pin|ssn|otp|csc)([^a-z]|$)/i;
+  const secret = el => {
+    try {
+      if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA')) return false;
+      if (el.type === 'password') return true;
+      if (/password|cc-number|cc-csc|cc-exp|one-time-code/i.test(el.getAttribute('autocomplete') || '')) return true;
+      const label = el.labels && el.labels[0] ? el.labels[0].innerText : '';
+      return RE.test([el.getAttribute('name'), el.id, el.getAttribute('aria-label'), el.getAttribute('placeholder'), label].filter(Boolean).join(' '));
+    } catch (e) { return false; }
+  };
+  const vals = new Map();
+  const from = e => (e.composedPath && e.composedPath()[0]) || e.target;
+  const keep = el => { if (secret(el) && typeof el.value === 'string') vals.set(el, el.value); };
+  const values = () => [...vals.values()].filter(v => v.length >= 4 && v.length <= 256);
+  const flush = () => { const v = values(); if (v.length) send({ s: v }); };
+  for (const type of ['pointerdown', 'mousedown', 'keydown', 'touchstart']) addEventListener(type, e => { if (e.isTrusted) send({ a: Date.now() }); }, true);
+  addEventListener('input', e => { if (e.isTrusted) keep(from(e)); }, true);
+  addEventListener('change', e => { if (e.isTrusted) { keep(from(e)); flush(); } }, true);
+  addEventListener('keydown', e => { if (e.isTrusted && e.key === 'Enter') { keep(from(e)); flush(); } }, true);
+  addEventListener('submit', () => flush(), true);
+  addEventListener('pagehide', () => flush(), true);
+  globalThis.__predevAct = { values };
+  return true;
+})()`;
+// The reporter in one frame's current document (a new document needs it again: Page.frameNavigated).
+async function installReporter(session, frameId) {
+  if (!session || !frameId) return;
+  try {
+    const { executionContextId } = await chrome.send('Page.createIsolatedWorld', { frameId, worldName: ACT_WORLD, grantUniveralAccess: false }, session, 3000);
+    await chrome.send('Runtime.addBinding', { name: H.actBinding, executionContextId }, session, 3000);
+    const r = await chrome.send('Runtime.evaluate', { expression: REPORTER(H.actBinding), contextId: executionContextId, returnByValue: true }, session, 3000);
+    if (r?.result?.value !== true) return;
+    if (!H.actWorlds.has(session)) H.actWorlds.set(session, new Map());
+    H.actWorlds.get(session).set(frameId, executionContextId);
+  } catch {}
+}
+async function reportFrames(session) {
+  const tree = await chrome.send('Page.getFrameTree', {}, session, 3000).catch(() => null);
+  const walk = async node => {
+    if (!node?.frame) return;
+    await installReporter(session, node.frame.id);
+    for (const child of node.childFrames || []) await walk(child);
+  };
+  await walk(tree?.frameTree);
+}
+// The tab's documents get the reporter from now on (an agent tab, or a tab handed to the person).
+async function reporterOn(targetId, session) {
+  if (!session || H.reportOn.get(targetId) === session) return;
+  H.reportOn.set(targetId, session);
+  await chrome.send('Page.enable', {}, session).catch(() => {});
+  await reportFrames(session);
+}
+// The tab a reporter session belongs to: the tab's own, or one of its cross-origin frames or popups.
+function reportTab(targetId, sessionId) {
+  if (targetId && H.reportOn.has(targetId)) return targetId;
+  if (sessionId) {
+    for (const [tab, sid] of H.reportOn) if (sid === sessionId) return tab;
+    for (const [tab, kids] of H.kids) if (kids.has(sessionId)) return tab;
+  }
+  return null;
+}
+// The agent's actions in a tab: an activation then is the agent's.
+function noteMark(targetId, on) {
+  const spans = H.markSpans.get(targetId) || [];
+  const now = Date.now();
+  if (on) spans.push({ s: now, e: null });
+  else { const last = spans[spans.length - 1]; if (last && last.e === null) last.e = now; }
+  while (spans.length > 20) spans.shift();
+  H.markSpans.set(targetId, spans);
+  const cur = H.actAt.get(targetId);
+  if (!cur || now >= cur.at) H.actAt.set(targetId, { who: 'agent', at: now });
+}
+const agentRanAt = (targetId, t) => {
+  const session = chrome.sessions.get(targetId);
+  if (session && H.marked.get(session)) return true;
+  return (H.markSpans.get(targetId) || []).some(({ s, e }) => t >= s - 20 && (e === null || t <= e + 20));
+};
+// Page.frameNavigated (a new document: the reporter goes in again) and Runtime.bindingCalled (a report).
+function reporterEvent(targetId, method, params = {}, sessionId) {
+  if (method === 'Page.frameNavigated') {
+    const tab = reportTab(targetId, sessionId);
+    const session = sessionId || (targetId && chrome.sessions.get(targetId));
+    if (tab && session && params.frame?.id) void installReporter(session, params.frame.id);
+    return;
+  }
+  if (method !== 'Runtime.bindingCalled' || params.name !== H.actBinding) return;
+  const tab = reportTab(targetId, sessionId);
+  if (!tab) return;
+  let m;
+  try { m = JSON.parse(String(params.payload || '')); } catch { return; }
+  if (typeof m?.a === 'number') {
+    const who = agentRanAt(tab, m.a) ? 'agent' : 'person';
+    const cur = H.actAt.get(tab);
+    if (!cur || m.a >= cur.at) H.actAt.set(tab, { who, at: m.a });
+  }
+  if (Array.isArray(m?.s) && H.handoff.get(tab)?.waiting) addSecrets(m.s);
+}
+function addSecrets(values) {
+  for (const v of values) {
+    if (typeof v !== 'string' || v.length < 4 || v.length > 256) continue;
+    H.secretValues.add(v);
+    while (H.secretValues.size > 500) H.secretValues.delete(H.secretValues.values().next().value);
+  }
+}
+// Reads what the reporter holds now in the tab's documents (and its cross-origin frames') into H.secretValues:
+// when a handoff ends, for a field the person never left.
+async function noteSecrets(targetId, session) {
+  if (!session || !H.handoff.get(targetId)?.waiting) return;
+  const read = async (sid, contexts) => {
+    for (const contextId of contexts.values()) {
+      const r = await chrome.send('Runtime.evaluate', { expression: 'globalThis.__predevAct ? globalThis.__predevAct.values() : []', contextId, returnByValue: true }, sid, 3000).catch(() => null);
+      if (Array.isArray(r?.result?.value)) addSecrets(r.result.value);
+    }
+  };
+  await read(session, H.actWorlds.get(session) || new Map());
+  for (const sid of (H.kids.get(targetId) || new Map()).keys()) await read(sid, H.actWorlds.get(sid) || new Map());
+}
+// The query/fragment keys whose values are masked on a kept or just-handed-back tab's URLs.
+const SECRET_URL_KEY = /(^|[_.-])(password|passwd|pwd|pass|token|otp|code|secret|key)$/i;
+// `relative`: the text is a kept tab's own (its links can be written relative to the page, /path?query).
+function maskUrlsIn(text, keptSites, relative = false) {
+  // Only the values change: the rest of the address stays as written, byte for byte.
+  const maskPairs = part => part.replace(/(^|[?&#;])([^=&#;?]+)=([^&#;]*)/g, (m, sep, k, v) => {
+    let key = k;
+    try { key = decodeURIComponent(k.replace(/\+/g, ' ')); } catch {}
+    return v && SECRET_URL_KEY.test(key) ? `${sep}${k}=[masked]` : m;
+  });
+  const out = text.replace(/https?:\/\/[^\s"'<>)\]]+/g, m => {
+    try {
+      if (!keptSites.has(siteKey(new URL(m).href))) return m;
+      const at = m.search(/[?#]/);
+      return at < 0 ? m : m.slice(0, at) + maskPairs(m.slice(at));
+    } catch { return m; }
+  });
+  // An address written without its scheme (a tab list's short label: host/path?query).
+  const bare = out.replace(/(^|[^\w/.:@%-])((?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*|localhost)(:\d+)?(\/[^\s"'<>)\]?#]*[?#][^\s"'<>)\]]*)/gi, (m, lead, host, port, rest) => {
+    if (!keptSites.has(siteKey(`http://${host}`))) return m;
+    const at = rest.search(/[?#]/);
+    return lead + host + (port || '') + rest.slice(0, at) + maskPairs(rest.slice(at));
+  });
+  if (!relative) return bare;
+  return bare.replace(/(^|[^\w:/.%-])(\/(?!\/)[^\s"'<>)\]?#]*[?#][^\s"'<>)\]]*|\?[^\s"'<>)\]]+)/g, (m, lead, ref) => {
+    const at = ref.search(/[?#]/);
+    return lead + ref.slice(0, at) + maskPairs(ref.slice(at));
+  });
+}
+// Masks the person's captured secrets (in each form they might appear in) and secret-keyed URL values on kept
+// sites, in a string handed to the agent. The person's own ordinary query values stay visible.
+function maskSecrets(text, args) {
+  if (typeof text !== 'string' || !text) return text;
+  // Secret-keyed URL values first (while each address is still whole), then the typed values anywhere.
+  let out = text;
+  const kept = new Set([...H.signedIn.keys(), ...H.handedSites]);
+  if (Array.isArray(args?.__predev_signed_in)) for (const s of args.__predev_signed_in) { const k = siteKey(s); if (k) kept.add(k); }
+  if (kept.size) {
+    let own = false;
+    try { const info = args?.tab ? findTab(args.tab) : null; own = !!info && kept.has(siteKey(info.url)); } catch {}
+    out = maskUrlsIn(out, kept, own);
+  }
+  for (const v of H.secretValues) {
+    if (!v) continue;
+    // As typed, as a URL component, as a GET form encodes it (only letters, digits and *-._ stay as they are; a
+    // space is +), and as it sits inside a JSON string.
+    const form = encodeURIComponent(v).replace(/[!'()~]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, '+');
+    for (const variant of new Set([v, encodeURIComponent(v), form, v.replace(/ /g, '+'), JSON.stringify(v).slice(1, -1)])) {
+      if (variant) out = out.split(variant).join('[masked]');
+    }
+  }
+  return out;
+}
 async function watchInput(info, session) {
-  if (!H.watched.has(info.targetId)) {
+  if (!H.pkTokens.has(info.targetId)) H.pkTokens.set(info.targetId, crypto.randomBytes(16).toString('hex'));
+  const watch = webauthnWatch(H.pkTokens.get(info.targetId));
+  if (!H.watched.has(info.targetId) || H.pkSession.get(info.targetId) !== session) {
     H.watched.add(info.targetId);
+    H.pkSession.set(info.targetId, session);
     // Every later page in this tab gets it before its own scripts run.
     await chrome.send('Page.enable', {}, session).catch(() => {});
     await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: INPUT_WATCH }, session).catch(() => {});
-    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: WEBAUTHN_WATCH }, session).catch(() => {});
+    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: watch }, session).catch(() => {});
+    // Cross-origin frames are their own debugger targets: auto-attach catches them before they load, so the watch
+    // goes in there too (installKid, on Target.attachedToTarget). A new session lost the old kids. Not over a
+    // connection that can't reach a child session (the extension): a frame paused for it would never resume.
+    H.kids.delete(info.targetId);
+    if (!H.autoAttach.has(session) && chrome.childSessions !== false) {
+      H.autoAttach.add(session);
+      await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, session).catch(() => { H.autoAttach.delete(session); });
+    }
   }
+  await popupWatch();
+  await reporterOn(info.targetId, session);
   await evaluate(session, INPUT_WATCH, 3000).catch(() => {});
-  await evaluate(session, WEBAUTHN_WATCH, 3000).catch(() => {});
+  // With none of the agent's actions running here, the watch counts input as the person's again (a mark a dialog
+  // kept from clearing ends here).
+  await evaluate(session, `${watch}; ${H.marked.get(session) ? 'true' : pkCall(info.targetId, 'idle')}`, 3000).catch(() => {});
+}
+// Popups opened from a watched tab are their own top-level targets; only browser-level auto-attach catches them
+// before they load. Installed once (where the connection supports it: the daemon and raw CDP, not the extension,
+// whose popups stay best effort). The attach handler installs the watch on a popup whose opener is watched and
+// resumes it; it resumes and lets go of anything else, so normal tab opening is untouched.
+async function popupWatch() {
+  if (H.popupOn || typeof chrome.send !== 'function' || chrome.childSessions === false) return;
+  if (/^(0|off|false|no)$/i.test(String(process.env.PREDEV_POPUP_WATCH || ''))) { H.popupOn = true; return; }
+  H.popupOn = true;
+  const ok = await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true, filter: [{ type: 'page', exclude: false }] }).then(() => true, () => false);
+  if (!ok) H.popupOn = false;
+}
+// Installs the watch (passkey and input; the reporter follows its documents) on a cross-origin frame or popup's
+// own session, as its own root, and marks it the agent's if the tab is acting right now. No evaluate before the
+// resume: the scripts run as the document loads. Returns once set up.
+async function installKid(tabId, childSession, info, ownTarget = null) {
+  if (!childSession || H.kidSeen.has(childSession)) return;
+  H.kidSeen.add(childSession);
+  // A popup is a tab of its own too: it keeps one token, so the agent's later calls in it (watchInput, agentMark)
+  // reach the same watch. A cross-origin frame gets a token of its own.
+  let token = ownTarget ? H.pkTokens.get(ownTarget) : null;
+  if (!token) token = crypto.randomBytes(16).toString('hex');
+  if (ownTarget) H.pkTokens.set(ownTarget, token);
+  if (!H.kids.has(tabId)) H.kids.set(tabId, new Map());
+  H.kids.get(tabId).set(childSession, token);
+  const topSession = chrome.sessions.get(tabId);
+  const acting = topSession && H.marked.get(topSession) ? true : false;
+  for (const source of [INPUT_WATCH, webauthnWatch(token, true)]) {
+    await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source }, childSession).catch(() => {});
+  }
+  // The reporter goes into each of its documents as it commits (Page.frameNavigated), one already there now.
+  await chrome.send('Page.enable', {}, childSession).catch(() => {});
+  if (acting) {
+    // Kept in pkStart so the end of the agent's action takes it out again (agentMark); if the action already
+    // ended while this was being set up, it comes out now.
+    const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { window.__predevPk(${JSON.stringify(token)}, 'on'); } catch (e) {} })()` }, childSession).catch(() => null);
+    if (added?.identifier) {
+      if (H.marked.get(topSession)) H.pkStart.set(childSession, added.identifier);
+      else await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: added.identifier }, childSession).catch(() => {});
+    }
+  }
+  // Nested frames of this frame get the same treatment.
+  await chrome.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, childSession).catch(() => {});
+  if (info?.waitingForDebugger) await chrome.send('Runtime.runIfWaitingForDebugger', {}, childSession).catch(() => {});
+  else await reportFrames(childSession);
+}
+// Target.attachedToTarget, from a watched tab's session (a cross-origin frame) or browser-level (a popup). The 4th
+// arg is the parent session (the tab's) or null for a browser-level event. Sets the child up or lets it go.
+async function onAttached(parentTargetId, params, parentSession) {
+  const child = params?.sessionId;
+  const info = params?.targetInfo;
+  if (!child || !info) return;
+  if (info.type === 'iframe') {
+    // A cross-origin frame of a watched tab.
+    const tabId = parentTargetId || (parentSession && tabOfSession(parentSession));
+    if (tabId && H.watched.has(tabId)) { await installKid(tabId, child, params); return; }
+    await chrome.send('Runtime.runIfWaitingForDebugger', {}, child).catch(() => {});
+    return;
+  }
+  if (info.type === 'page') {
+    // A popup (browser-level auto-attach, paused before it loads). Only a paused page is auto-attach's: an attach
+    // this connection asked for itself (chrome.session, any attachToTarget) is never paused, and its event can come
+    // before the reply has put it in chrome.sessions, so it is left alone.
+    if (!params.waitingForDebugger) return;
+    const opener = info.openerId;
+    if (opener && H.watched.has(opener)) {
+      await chrome.send('Page.setWebLifecycleState', { state: 'active' }, child).catch(() => {});
+      await chrome.send('Emulation.setFocusEmulationEnabled', { enabled: true }, child).catch(() => {});
+      await installKid(opener, child, params, info.targetId);
+      return;
+    }
+    // Anything else (a tab chrome_open made, the person's own new tab): resume it, and let go of the auto-attach
+    // session unless it is one of ours.
+    await chrome.send('Runtime.runIfWaitingForDebugger', {}, child).catch(() => {});
+    if (![...chrome.sessions.values()].includes(child)) await chrome.send('Target.detachFromTarget', { sessionId: child }).catch(() => {});
+  }
+}
+// One of the agent's actions in this tab starts (on) or ends: its input and its effects are the agent's, and so is a
+// page that starts loading meanwhile. Nested marks count once.
+async function agentMark(session, on, extra = '') {
+  const depth = Math.max(0, (H.marked.get(session) || 0) + (on ? 1 : -1));
+  if (depth) H.marked.set(session, depth); else H.marked.delete(session);
+  const flip = on ? depth === 1 : depth === 0;
+  const tid = tabOfSession(session);
+  if (tid && flip) noteMark(tid, on);
+  if (!tid || !H.watched.has(tid)) return;
+  if (flip && on) {
+    const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { ${pkCall(tid, 'on')}; } catch (e) {} })()` }, session).catch(() => null);
+    if (added?.identifier) H.pkStart.set(session, added.identifier);
+  } else if (flip) {
+    const id = H.pkStart.get(session);
+    H.pkStart.delete(session);
+    if (id) await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: id }, session).catch(() => {});
+  }
+  const expr = [extra, flip ? pkCall(tid, on ? 'on' : 'off') : ''].filter(Boolean).join('; ');
+  if (expr) await evaluate(session, expr, 3000).catch(() => {});
+  // The tab's cross-origin frames and popups each hold their own watch (their own token); mark them too, so the
+  // agent's action in one of them is the agent's there as well, and a page loading in one meanwhile starts marked.
+  const kids = flip ? H.kids.get(tid) : null;
+  if (kids) for (const [childSession, token] of kids) {
+    if (on) {
+      const added = await chrome.send('Page.addScriptToEvaluateOnNewDocument', { source: `(() => { try { window.__predevPk(${JSON.stringify(token)}, 'on'); } catch (e) {} })()` }, childSession).catch(() => null);
+      if (added?.identifier) H.pkStart.set(childSession, added.identifier);
+    } else {
+      const id = H.pkStart.get(childSession);
+      H.pkStart.delete(childSession);
+      if (id) await chrome.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: id }, childSession).catch(() => {});
+    }
+    await evaluate(childSession, `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(token)}, '${on ? 'on' : 'off'}'))`, 3000).catch(() => {});
+  }
+}
+// Target.attachedToTarget / detachedFromTarget and the reporter's events, over the one event stream (registered once,
+// the latest copy handles it).
+function attachEvent(targetId, method, params = {}, sessionId) {
+  if (method === 'Page.frameNavigated' || method === 'Runtime.bindingCalled') { reporterEvent(targetId, method, params, sessionId); return; }
+  if (method === 'Target.attachedToTarget') { void onAttached(targetId, params, sessionId).catch(() => {}); return; }
+  if (method === 'Target.detachedFromTarget') {
+    const child = params.sessionId;
+    if (!child) return;
+    H.kidSeen.delete(child);
+    for (const [tab, kids] of H.kids) if (kids.delete(child) && kids.size === 0) H.kids.delete(tab);
+    H.pkStart.delete(child);
+    H.actWorlds.delete(child);
+  }
 }
 
-// After an action, the page asked for a passkey while the agent was acting (WEBAUTHN_WATCH declined it): the step
-// is the user's, in their own Chrome. Hand it off so they start it knowingly and the done check closes it.
-async function passkeyRefusal(args, session, startedAt) {
-  if (!handoffOn(args)) return null;
-  const seen = await evaluate(session, 'window.__predevPasskey || null', 3000).catch(() => null);
-  if (!seen || typeof seen !== 'object' || Number(seen.at) < startedAt) return null;
-  await evaluate(session, 'window.__predevPasskey = null', 3000).catch(() => {});
+// The page asked for a passkey after the agent's own action (the watch declined it): the step is the user's, in
+// their own Chrome. Hand it off so they start it knowingly and the done check closes it. `late`: the page asked
+// after the agent's call returned, and this is the agent's next call in the tab.
+async function passkeyRefusal(args, info, session, late = false) {
+  if (!handoffOn(args) || !H.watched.has(info.targetId)) return null;
+  const seen = await pkTake(info, session);
+  if (!seen || typeof seen !== 'object') return null;
+  // A passkey sign-in (get), creating a passkey (create), or a Secure Payment Confirmation (payment): the user is
+  // told the step it really is, and it is handed to them (payment confirms as them, so it asks like an approval).
+  if (seen.ceremony === 'payment') {
+    const how = handTo(args, 'approval', ' and a done check like {"kind":"url_changes"}');
+    const lead = late ? 'After your last action in this tab, the page started a Secure Payment Confirmation (WebAuthn)' : 'That started a Secure Payment Confirmation (WebAuthn)';
+    return refused(`${lead}, which confirms a payment with the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than confirm as them. Don't press it again; hand it to the user: ${how}. The user confirms the payment, and pre.dev carries on.`, { kind: 'passkey', ceremony: 'payment' });
+  }
   const how = handTo(args, 'step_up', ' and a done check like {"kind":"url_changes"}');
-  // The page asked to make a passkey (create) or to use one (get): the user is told the step it really is.
   const create = seen.ceremony === 'create';
+  const lead = late ? `After your last action in this tab, the page started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)` : `That started ${create ? 'creating a passkey' : 'a passkey sign-in'} (WebAuthn)`;
   return refused(create
-    ? `That started creating a passkey (WebAuthn), which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
-    : `That started a passkey sign-in (WebAuthn), which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
+    ? `${lead}, which needs the user's own device: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand creating the passkey to the user: ${how}. The user creates their passkey, and pre.dev carries on.`
+    : `${lead}, which needs the user's own passkey: Touch ID, their phone or a security key. pre.dev declined it rather than act as them. Don't press it again; hand the sign-in to the user: ${how}. The user signs in with their passkey, and pre.dev carries on.`, { kind: 'passkey', ceremony: create ? 'create' : 'get' });
+}
+// A declined ceremony recorded on the tab's top page or on any of its cross-origin frames or popups (H.kids).
+async function pkTake(info, session) {
+  const top = await evaluate(session, pkCall(info.targetId, 'take'), 3000).catch(() => null);
+  if (top && typeof top === 'object') return top;
+  const kids = H.kids.get(info.targetId);
+  if (kids) for (const [childSession, childToken] of kids) {
+    const d = await evaluate(childSession, `(typeof window.__predevPk === 'function' && window.__predevPk(${JSON.stringify(childToken)}, 'take'))`, 3000).catch(() => null);
+    if (d && typeof d === 'object') return d;
+  }
+  return null;
 }
 // Wraps the agent's own input so the watcher above doesn't count it as the user's.
 async function asAgent(info, session, fn) {
@@ -944,18 +1422,26 @@ async function userTouchedAt(info, session) {
 // until the user lets it continue, through a channel the model can't use: the "Let the agent continue" button pre.dev
 // shows at the top of the tab (a trusted click, in a script world the page can't reach), or, from pre.dev's own CLI,
 // the user's answer on its card (__predev_user_said_go: the bridge passes it only for that CLI, which never takes it
-// from its model). Nothing else lifts it: not a resume the agent asks for, not a release, cancel or another handoff.
-H.paused ||= new Map(); // targetId -> { at }: when the user took the tab
+// from its model). On a tab of a task handed here from pre.dev's cloud run, the run's card on pre.dev is the one way
+// back: the bar has no button there, and the run's hand-back after the person's Done on its user_control card lifts
+// the pause (__predev_card_done: set only by web_rules.mjs taskCall, for a hand-back that names that card). Nothing
+// else lifts it: not a resume the agent asks for, not a release, cancel or another handoff, and not the hand-back
+// after any other card (a dialog card that closed by itself, a sign-in's Done).
+H.paused ||= new Map(); // targetId -> { at, card? }: when the user took the tab; card: a handed cloud run's tab
 H.pauseWorlds ||= new Map(); // targetId -> the bar's script world in the tab's current page
 const PAUSE_WORLD = 'predev-pause';
-// One line and one button, in a closed shadow root: the page's scripts can't see, click or fake it.
-const PAUSE_BAR = `(() => {
+// One line and one button, in a closed shadow root: the page's scripts can't see, click or fake it. On a handed cloud
+// run's tab, one line and no button: the person presses Done on the run's card on pre.dev.
+const PAUSE_LINE = "pre.dev\\'s agent is paused while you use this tab.";
+const CARD_LINE = "pre.dev\\'s agent is paused while you use this tab. Press Done on the pre.dev card to continue.";
+const PAUSE_BUTTON = '<button type="button" style="margin-left:auto;cursor:pointer;border-radius:6px;border:1px solid rgba(251,191,36,.6);background:rgba(245,158,11,.15);color:#fef3c7;padding:4px 10px;font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">Let the agent continue</button>';
+const pauseBar = card => `(() => {
   if (window.__predevPauseBar && document.documentElement.contains(window.__predevPauseBar)) return true;
   const host = document.createElement('div');
   host.style.cssText = 'all:initial;position:fixed;top:0;left:0;right:0;z-index:2147483647';
   const root = host.attachShadow({ mode: 'closed' });
-  root.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#14161a;color:rgba(255,255,255,.85);font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;border-bottom:1px solid rgba(255,255,255,.12)"><span>pre.dev\\'s agent is paused while you use this tab.</span><button type="button" style="margin-left:auto;cursor:pointer;border-radius:6px;border:1px solid rgba(251,191,36,.6);background:rgba(245,158,11,.15);color:#fef3c7;padding:4px 10px;font:600 12px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">Let the agent continue</button></div>';
-  root.querySelector('button').addEventListener('click', e => {
+  root.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:#14161a;color:rgba(255,255,255,.85);font:13px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;border-bottom:1px solid rgba(255,255,255,.12)"><span>${card ? CARD_LINE : PAUSE_LINE}</span>${card ? '' : PAUSE_BUTTON}</div>';
+  root.querySelector('button')?.addEventListener('click', e => {
     if (!e.isTrusted) return;
     window.__predevContinueAt = Date.now();
     host.remove();
@@ -964,6 +1450,8 @@ const PAUSE_BAR = `(() => {
   (document.body || document.documentElement).appendChild(host);
   return true;
 })()`;
+const PAUSE_BAR = pauseBar(false);
+const PAUSE_BAR_CARD = pauseBar(true);
 // Runs `expression` in the bar's own script world in the tab's page (a new page gets a new one).
 async function inPauseWorld(info, session, expression) {
   for (let i = 0; i < 2; i++) {
@@ -991,18 +1479,25 @@ async function liftPause(info, session) {
   H.reread.add(info.targetId);
   await inPauseWorld(info, session, 'window.__predevPauseBar ? (window.__predevPauseBar.remove(), true) : true').catch(() => {});
 }
-// Still paused? Their click on the bar lifts it; otherwise the bar is (re)shown.
-async function pauseHeld(info, session) {
+// A call from pre.dev's cloud run of a task handed here (web_rules.mjs taskCall, its own guard scope).
+const handedRun = args => fromWeb(args) && agentOf(args).startsWith('handed:');
+// Still paused? Their click on the bar lifts it; otherwise the bar is (re)shown (on a handed cloud run's tab, the
+// bar without a button).
+async function pauseHeld(info, session, args) {
   const p = H.paused.get(info.targetId);
   if (!p) return false;
+  if (handedRun(args)) p.card = true;
   const clicked = Number(await inPauseWorld(info, session, 'window.__predevContinueAt || 0').catch(() => 0)) || 0;
   if (clicked > p.at) { await liftPause(info, session); return false; }
-  await inPauseWorld(info, session, PAUSE_BAR).catch(() => {});
+  await inPauseWorld(info, session, p.card ? PAUSE_BAR_CARD : PAUSE_BAR).catch(() => {});
   return true;
 }
 const cliSaidGo = args => fromCli(args) && args?.__predev_user_said_go === true;
+// The person pressed Done on a handed cloud run's card on pre.dev: that run's hand-back of the tab.
+const cardSaidGo = args => handedRun(args) && args?.__predev_card_done === true;
 // What the agent does about a takeover, by where the call comes from.
 function keepGoing(args) {
+  if (handedRun(args)) return 'The run waits for them on its card on pre.dev: once they press Done there, the tab is the run\'s again. Read the page again before acting.';
   if (fromCli(args)) return `Ask them whether to keep going: call hand_off_to_user with tab "${String(args?.tab || '')}" and reason "user_control". They answer on its card, or click "Let the agent continue" at the top of the tab, and the run carries on once they say so. Don't try to take the tab back yourself; read the page again before acting.`;
   if (fromWeb(args)) return 'Ask them whether to keep going, then wait for them: once they click "Let the agent continue" at the top of the tab in their Chrome, it is the agent\'s again. Don\'t try to take it back before that; read the page again before acting.';
   return 'Ask them whether to keep going, then wait for them: they click "Let the agent continue" at the top of the tab. chrome_handoff with this tab, reason "user_control", resume: true and wait: true returns once they have. Then read the page again before acting.';
@@ -1012,17 +1507,34 @@ const RESUME_WAIT_MS = 45000;
 const READ_TOOLS = new Set(['chrome_snapshot', 'chrome_read']);
 const ACTION_TOOLS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_eval', 'chrome_scroll']);
 
+// The user has the tab: a handoff of it in progress, or the agent paused over their own clicks or keys there.
+function handoffHeld(args, info) {
+  const h = H.handoff.get(info.targetId);
+  return h && h.waiting ? refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' }) : null;
+}
+const pausedRefusal = (args, info) => refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
+
 // Every tab tool, with handoffs on: scope, the user's control, a handoff in progress, the re-read.
-async function handoffGate(name, args, info, session) {
+async function handoffGate(name, args, info, session, ctx) {
   if (!handoffOn(args)) return;
   const agent = agentOf(args);
   if (!mayUse(agent, info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
-  const h = H.handoff.get(info.targetId);
-  if (h && h.waiting) throw refused(`The user has this tab for a handoff (${h.reason}); the agent sees and does nothing in it until ${toHandOff(args) ? 'the handoff ends' : 'chrome_handoff returns'}.`, { kind: 'user_control' });
+  const held = handoffHeld(args, info);
+  if (held) throw held;
   await watchInput(info, session);
+  await netGuard(info, session, args, ctx);
   await notePause(info, session, null);
-  if (await pauseHeld(info, session)) {
-    throw refused(`The user is using this tab (they clicked or typed in it at ${new Date(H.paused.get(info.targetId).at).toLocaleTimeString()}), so the agent is paused here and won't act over them. ${keepGoing(args)}`, { kind: 'user_control' });
+  if (await pauseHeld(info, session, args)) throw pausedRefusal(args, info);
+  // The page asked for a passkey after the agent's last call here returned (the watch declined it).
+  if (name !== 'chrome_close' && name !== 'chrome_show') {
+    const pk = await passkeyRefusal(args, info, session, true);
+    if (pk) throw pk;
+  }
+  // A request the page started on its own after the agent's last action (the network guard failed it): tell the
+  // agent now, once. chrome_close and chrome_show say nothing about it (they never act in the page).
+  if (name !== 'chrome_close' && name !== 'chrome_show') {
+    const nr = H.netRefused.get(info.targetId);
+    if (nr) { H.netRefused.delete(info.targetId); throw nr.refusal; }
   }
   if (READ_TOOLS.has(name)) H.reread.delete(info.targetId);
   else if (ACTION_TOOLS.has(name) && H.reread.has(info.targetId)) {
@@ -1030,18 +1542,51 @@ async function handoffGate(name, args, info, session) {
   }
 }
 
-// The guard's model check (pre.dev's /browser/check on the user's key), cached per page + element.
-async function judged(ctx, session, key, condition) {
-  if (H.checks.has(key)) return H.checks.get(key);
+// OFF_WEB: in a chrome_navigate call's ctx, the web address Chrome already took the tab to (navigateOffWeb).
+const OFF_WEB = Symbol('offWeb');
+// chrome_navigate on a tab the pre.dev extension can't attach to (the person took the run's tab to chrome:// or another
+// extension's page): Chrome takes the tab to the web address itself (chrome.leaveForWeb), after the gate's checks that
+// need no page, and the call attaches there. Returns that address, or '' when this isn't that case (a tab the debugger
+// can use, back/forward/reload, an address that isn't http(s), or the daemon): the call goes on as before, and on a
+// non-web tab chrome.session refuses it, as it does every other call there.
+async function navigateOffWeb(args, info, ctx) {
+  if (!chrome.offWeb?.(info.targetId) || ['back', 'forward', 'reload'].includes(args.url)) return '';
+  const dest = normalizeUrl(args.url);
+  if (!/^https?:/i.test(dest)) return '';
+  // (Scope and pre.dev's own tabs are checked before this, on every gated call.)
+  if (handoffOn(args)) {
+    const held = handoffHeld(args, info);
+    if (held) throw held;
+    if (H.paused.has(info.targetId)) throw pausedRefusal(args, info);
+    const nr = H.netRefused.get(info.targetId);
+    if (nr) { H.netRefused.delete(info.targetId); throw nr.refusal; }
+    const keep = await accountRefusal(args, null, 'Opening', dest, dest, ctx);
+    if (keep) throw keep;
+    // There is no page here to read first (no call can attach to it): the navigate replaces it.
+    H.reread.delete(info.targetId);
+  }
+  await chrome.leaveForWeb(info.targetId, dest);
+  return dest;
+}
+
+// The guard's model check (pre.dev's /browser/check on the user's key), cached per mode + page + element.
+// kind 'action' asks what the step would do (keep sign-in, ask first); the default asks what the page shows.
+async function judged(ctx, session, key, condition, kind = 'page') {
+  const cacheKey = `${kind}|${key}`;
+  if (H.checks.has(cacheKey)) return H.checks.get(cacheKey);
   if (!ctx?.apiKey) return null;
   let p = null;
   try {
-    const r = await predev(ctx, '/browser/check', { condition, page: await pageState(session).catch(() => '') || '(empty page)' });
+    // No session: the page can't be read now (a navigation of it is pending), so the check goes by the condition.
+    const page = session ? await pageState(session).catch(() => '') || '(empty page)' : '(the page is navigating; its content is not available)';
+    const r = await predev(ctx, '/browser/check', kind === 'action' ? { condition, page, kind } : { condition, page });
     p = Number(r?.probability);
   } catch (error) { log('handoff check failed', error.message); return null; }
-  if (Number.isFinite(p)) { H.checks.set(key, p); if (H.checks.size > 2000) H.checks.delete(H.checks.keys().next().value); }
+  if (Number.isFinite(p)) { H.checks.set(cacheKey, p); if (H.checks.size > 2000) H.checks.delete(H.checks.keys().next().value); }
   return Number.isFinite(p) ? p : null;
 }
+// Action checks refuse from 0.6: real sign-out steps on a sign-in page score as low as 0.70 (C.20 probe), so 0.7 has no margin.
+const ACTION_REFUSE_AT = 0.6;
 const pagePath = href => { try { const u = new URL(href); return u.origin + u.pathname; } catch { return String(href || ''); } };
 
 // Rule 1: never type into a password, one-time code or card field (structure first, then the check).
@@ -1062,7 +1607,7 @@ async function secretRefusal(args, session, q, url, ctx) {
 }
 
 // Rule 2: ask first before a click or submit that sends, posts, buys or deletes.
-async function approvalRefusal(args, session, desc, facts, url, ctx) {
+async function approvalRefusal(args, session, desc, facts, url, ctx, action = 'Clicking') {
   if (!handoffOn(args) || isLocalDev(url)) return '';
   // The person who typed the cloud run approved exactly this control on this page on pre.dev's card: once.
   const ok = fromWeb(args) ? APPROVED.get(agentOf(args)) : null;
@@ -1072,10 +1617,10 @@ async function approvalRefusal(args, session, desc, facts, url, ctx) {
     return '';
   }
   let p = await judged(ctx, session, `act|${pagePath(url)}|${desc}`,
-    `Clicking ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`);
+    `${action} ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`, 'action');
   // No verdict (no pre.dev key, or pre.dev unreachable): a form submit sent with POST asks first.
   if (p === null) p = facts?.isSubmit && /^post$/i.test(facts.formMethod || '') ? 1 : 0;
-  if (p < 0.7) return '';
+  if (p < ACTION_REFUSE_AT) return '';
   const askFirst = { kind: 'approval', desc, page: pagePath(url) };
   return toHandOff(args)
     ? refused(`Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"send|post|buy|delete|other","summary":"what it does"} and doneCheck {"kind":"element_gone","value":"<a selector for that control>"}; they review it and click it themselves in their Chrome, and the run resumes once it's done.`, askFirst)
@@ -1129,16 +1674,311 @@ const KEEP_SIGNIN = site => `A handoff signed the user in to ${site}, and the ag
 // A click, key or script needs the page to answer the guard's checks first. While a dialog the page
 // opened (an alert, a confirm or a prompt) is up, or the page is busy, it doesn't: the checks would
 // go without their facts, and the input would wait in Chrome and land once the page answers, past
-// every check. So the guard refuses at once, from the tab's last known address.
+// every check. So the guard refuses at once (dialogRefused, below), from the tab's last known address.
 const pageAnswers = session => evaluate(session, '1', 3000).then(() => true, () => false);
-async function pageMustAnswer(args, session, info, what) {
+async function pageMustAnswer(args, session, info) {
   if (!handoffOn(args)) return;
+  const open = liveDialog(info.targetId);
+  if (open) throw dialogRefused(args, info, open);
   if (await pageAnswers(session)) return;
-  const site = keepsSignIn(args, info.url) ? hostOf(info.url) : '';
-  if (site) throw refused(`Refused: ${what} on ${site} can't be checked, because the page isn't answering (a dialog it opened, such as an alert, is most likely up). ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
-  throw refused(pageBusy(hostOf(info.url), what), { kind: 'page_busy' });
+  throw dialogRefused(args, info, liveDialog(info.targetId));
 }
-const pageBusy = (site, what) => `Refused: ${what} didn't happen, because the page on ${site} isn't answering: a dialog it opened (an alert, a confirm or a prompt) is most likely up, or the page is busy, so the agent can't check what it would do. Don't retry at once. Read the tab again in a few seconds; if it still doesn't answer, ask the user to close the dialog on ${site}.`;
+
+// ---------------------------------------------------------------- the page's own dialogs
+// alert, confirm, prompt and "Leave site?" (beforeunload), per tab, from Page.javascriptDialogOpening and
+// Page.javascriptDialogClosed on the tabs calls use (their Page domain is turned on for it). While one is open,
+// Chrome holds the page: its scripts, and every read or input sent to it, wait until the dialog closes. So:
+//   - an alert in a tab a call is using: pre.dev presses OK on it at once, and the call says so (`dialogs`, and a
+//     line in its text). `PREDEV_ALERT_AUTO_OK=off`, or `__predev_alert_auto_ok: false` on pre.dev's call for that
+//     tab, leaves alerts to the person, like a confirm;
+//   - a confirm, a prompt or "Leave site?" is the person's: never answered here. The call that opened it returns at
+//     once as landed, with the dialog, and input it had left to send is dropped. Every later call on that tab is
+//     refused at once (page_busy, with the dialog) until the person closes it;
+//   - no such dialog, but the page doesn't answer (a busy page, or a dialog of Chrome's own): the call is refused
+//     (page_busy, dialog null) within 12 s, instead of failing after Chrome's 15 to 20 s.
+// A connection without dialog events (a background process an older version started) gets the last rule only.
+const DIALOG_WORDS = { alert: 'message (an alert)', confirm: 'confirm dialog', prompt: 'prompt dialog', beforeunload: '"Leave site?" dialog' };
+const DLG = chrome.__predevDialogs || (chrome.__predevDialogs = {
+  open: new Map(),      // targetId -> { type, message, url, at } while a dialog is up
+  noAnswer: new Map(),  // targetId -> when the page last didn't answer, with no dialog (until a probe answers)
+  closed: new Map(),    // targetId -> alerts pressed OK between calls, for the next call there to report
+  pageOn: new Set(),    // sessions whose Page domain is on (they report dialogs)
+  calls: new Set(),     // calls in flight: { tab, dialog, closed, wake }
+  cut: new Map(),       // session -> a call a dialog cut short, still running: its input is dropped
+  manual: new Set(),    // tabs whose alerts stay for the person (pre.dev's call said so)
+  usedAt: new Map(),    // targetId -> when a call last used it
+  hooked: false,
+  handle: null,
+});
+DLG.usedAt ||= new Map();
+// session -> the input the current call means to send there, counted in pieces (a click, a key or chord, a piece of
+// text, a scroll step): { at, planned, sent, what }. When the page stops answering during the call, it tells whether
+// all of it went out.
+DLG.input ||= new Map();
+// The latest copy of these tools handles the events (the daemon re-imports this file when it changes).
+DLG.handle = onDialogEvent;
+if (!DLG.hooked && typeof chrome.onEvent === 'function') {
+  DLG.hooked = true;
+  chrome.onEvent((targetId, method, params) => DLG.handle?.(targetId, method, params));
+}
+// The network guard reads events the same way (the latest copy of this file handles them). A fallback keeps the
+// page working if the handler is ever missing: an unjudged paused request is continued, not left hanging.
+H.netHandle = netEvent;
+if (!H.netHooked && typeof chrome.onEvent === 'function') {
+  H.netHooked = true;
+  chrome.onEvent((targetId, method, params) => {
+    const h = H.netHandle;
+    if (h) return void h(targetId, method, params);
+    if (method === 'Fetch.requestPaused') chrome.send('Fetch.continueRequest', { requestId: params.requestId }, chrome.sessions.get(targetId)).catch(() => {});
+  });
+}
+// Cross-origin frames and popups (Target.attachedToTarget): their own passkey watch goes in there before they load.
+// The reporter's events (Page.frameNavigated, Runtime.bindingCalled) come the same way.
+H.attachHandle = attachEvent;
+if (!H.attachHooked && typeof chrome.onEvent === 'function') {
+  H.attachHooked = true;
+  chrome.onEvent((targetId, method, params, sessionId) => H.attachHandle?.(targetId, method, params, sessionId));
+}
+const ALERT_AUTO_OK = !/^(0|off|false|no)$/i.test(String(process.env.PREDEV_ALERT_AUTO_OK || ''));
+// "A tab a call is using": one in flight there; or an agent's own tab (handoffs on) one used in the last 2 minutes.
+// Never while the user has the tab: the user's own tabs keep their alerts between calls.
+const IN_USE_MS = 120000;
+const agentsTab = targetId => [...H.owned.values()].some(tabs => tabs.has(targetId));
+const inUse = targetId => [...DLG.calls].some(c => c.tab === targetId)
+  || (agentsTab(targetId) && Date.now() - (DLG.usedAt?.get(targetId) || 0) < IN_USE_MS);
+const alertsAutoOk = targetId => ALERT_AUTO_OK && inUse(targetId) && !DLG.manual.has(targetId) && !H.handoff.has(targetId) && !PRIVATE.has(targetId);
+const NO_ANSWER_MS = 12000;
+
+function onDialogEvent(targetId, method, params = {}) {
+  if (!targetId) return;
+  if (method === 'Page.javascriptDialogOpening') {
+    const type = DIALOG_WORDS[params.type] ? params.type : 'alert';
+    const d = { type, message: String(params.message || '').slice(0, 300), url: String(params.url || chrome.targets.get(targetId)?.url || ''), at: Date.now() };
+    DLG.open.set(targetId, d);
+    DLG.noAnswer.delete(targetId);
+    if (type === 'alert' && alertsAutoOk(targetId)) void pressOk(targetId, d);
+    else dialogChanged(targetId);
+  } else if (method === 'Page.javascriptDialogClosed') {
+    if (DLG.open.delete(targetId)) dialogChanged(targetId);
+  }
+}
+
+// OK on an alert, as the person would press it. Left open when Chrome won't (then it is the person's, like a confirm).
+async function pressOk(targetId, d) {
+  const session = chrome.sessions.get(targetId);
+  const ok = !!session && await chrome.send('Page.handleJavaScriptDialog', { accept: true }, session, 3000).then(() => true, () => false);
+  if (!ok) { dialogChanged(targetId); return; }
+  if (DLG.open.get(targetId) === d) DLG.open.delete(targetId);
+  const closed = { type: 'alert', message: d.message, closed: 'ok' };
+  const calls = [...DLG.calls].filter(c => c.tab === targetId);
+  for (const c of calls) c.closed.push(closed);
+  if (!calls.length) DLG.closed.set(targetId, [...(DLG.closed.get(targetId) || []), closed].slice(-5));
+  log('dialog', `pressed OK on an alert on ${hostOf(d.url) || 'a page'}`);
+  try { core.onDialog?.({ targetId, site: hostOf(d.url), ...closed }); } catch {}
+  dialogChanged(targetId);
+}
+
+// A dialog opened or closed: a call on that tab that is still waiting lands now, and held pings look again.
+function dialogChanged(targetId) {
+  const d = DLG.open.get(targetId);
+  if (d) for (const c of DLG.calls) if (c.tab === targetId && !c.dialog) { c.dialog = d; c.wake?.(); }
+  try { core.onBusy?.(targetId); } catch {}
+}
+
+/** The dialog open on this tab now, or null. */
+function liveDialog(targetId) {
+  if (!targetId) return null;
+  if (!chrome.targets.has(targetId)) { DLG.open.delete(targetId); DLG.noAnswer.delete(targetId); DLG.closed.delete(targetId); return null; }
+  return DLG.open.get(targetId) || null;
+}
+
+/** Does the page run a script within ms? Only a timeout is no: an error (a page between documents) is an answer. */
+const answers = (session, ms) => chrome.send('Runtime.evaluate', { expression: '1', returnByValue: true }, session, ms)
+  .then(() => true, error => !/did not answer/.test(String(error?.message)));
+
+/** The Page domain on for this session, so its dialogs are reported. */
+async function pageOn(session) {
+  if (!DLG.hooked || !session || DLG.pageOn.has(session)) return;
+  if (await chrome.send('Page.enable', {}, session, 2000).then(() => true, () => false)) DLG.pageOn.add(session);
+}
+
+/** A call a dialog cut short may still be running: its input is dropped (sendInput), and the next call on that tab
+ *  waits a moment for it to end. */
+async function uncut(targetId) {
+  const session = chrome.sessions.get(targetId);
+  const left = session && DLG.cut.get(session);
+  if (!left) return;
+  await Promise.race([left, sleep(3000)]);
+  DLG.cut.delete(session);
+}
+/** A call is about to send `planned` pieces of input to this session (what: the field or the tab they go to). */
+const planInput = (session, planned, what = 'tab') => { DLG.input.set(session, { at: Date.now(), planned, sent: 0, what }); };
+/** One input event. `piece`: it starts one of the planned pieces (a mouse press, a key down, the text, a scroll).
+ *  Input sent outside one of the agent's marked actions is marked on its own (markActing), so none of it ever
+ *  counts as the person's. */
+const sendInput = async (method, params, session, timeout, piece = false) => {
+  if (DLG.cut.has(session)) throw new Error('A dialog the page opened cut this call short; the rest of its input was not sent.');
+  if (piece) { const plan = DLG.input.get(session); if (plan) plan.sent++; }
+  if (H.marked.get(session)) return chrome.send(method, params, session, timeout);
+  await markActing(session, true);
+  try { return await chrome.send(method, params, session, timeout); } finally { await markActing(session, false); }
+};
+
+/** What a run does about a dialog it can't close. */
+const dialogNext = args => (fromWeb(args)
+  ? 'pre.dev asks the user to close it in their Chrome, and the run carries on once they have: read the tab again then, before acting.'
+  : 'Tell the user in one line what it asks and that it is waiting in their Chrome; once they have answered it, read the tab again before acting.');
+const dialogSays = d => (d.message ? ` It says: "${d.message.slice(0, 200)}".` : '');
+
+/** Refused, because a dialog the page opened is up (d), or the page doesn't answer (no d). A new tab's call
+ *  (chrome_open) names the tab first. */
+function dialogRefused(args, info, d, { tabLine = false } = {}) {
+  const site = hostOf(info?.url || d?.url || '') || 'this page';
+  const kept = keepsSignIn(args, info?.url) ? ` ${KEEP_SIGNIN(site)}` : '';
+  const tab = tabLine && info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  if (d) {
+    return refused(`${tab}Refused: a ${DIALOG_WORDS[d.type]} the page on ${site} opened is waiting for the user, and the page answers nothing until it closes.${dialogSays(d)} pre.dev never answers it for them. Don't retry, and don't press keys to close it: ${dialogNext(args)}${kept}`,
+      { kind: 'page_busy', dialog: { type: d.type, message: d.message } });
+  }
+  return refused(`${tab}Refused: the page on ${site} isn't answering (it is busy, or a dialog of Chrome's own is over it), so the agent can't read it or act in it. Don't retry at once: read the tab again in a few seconds; if it still doesn't answer, ask the user to look at that tab in their Chrome.${kept}`,
+    { kind: 'page_busy', dialog: null });
+}
+
+/** The call that opened a dialog only the person may answer: it landed. */
+function landedResult(args, info, d) {
+  const site = hostOf(info?.url || d.url) || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || d.url).slice(0, 160)}\n` : '';
+  return {
+    content: [{ type: 'text', text: `${tab}It landed: the page on ${site} opened a ${DIALOG_WORDS[d.type]} that waits for the user.${dialogSays(d)} pre.dev never answers it for them, and every call on this tab is refused until they do. ${dialogNext(args)}` }],
+    landed: true,
+    dialog: { type: d.type, message: d.message },
+  };
+}
+
+/** The call sent all of its input, and then the page stopped answering (busy with what it set off, or a dialog of
+ *  Chrome's own over it): it landed, and must not be done again. Every call on the tab is refused until the page
+ *  answers again. */
+function busyLandedResult(info) {
+  const site = hostOf(info?.url || '') || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  return { content: [{ type: 'text', text: `${tab}It landed: the page on ${site} then stopped answering (busy with what this call set off, or a dialog of Chrome's own is over it). Don't do it again. Read the tab again in a few seconds; if it still doesn't answer, ask the user to look at that tab in their Chrome.` }] };
+}
+
+/** The page stopped answering before all of the call's input went out (some keys of a sequence, the text but not
+ *  its Enter): how much of it reached the page is unknown, so it never says it landed. */
+function busyPartResult(info, plan) {
+  const site = hostOf(info?.url || '') || 'the page';
+  const tab = info ? `Tab ${tabId(info)} · ${String(info.url || '').slice(0, 160)}\n` : '';
+  return {
+    content: [{ type: 'text', text: `${tab}Part of it may have gone through: the page on ${site} stopped answering while this call's input was going out. Read the ${plan.what} before sending it again; if the page still doesn't answer, ask the user to look at that tab in their Chrome.` }],
+    partial: { sent: plan.sent, planned: plan.planned },
+  };
+}
+
+/** A result, with the alerts pre.dev pressed OK on during (or just before) its call. */
+function withClosedAlerts(result, closed) {
+  if (!closed.length) return result;
+  const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : { ...result };
+  const lines = closed.map(c => `The page showed a message (an alert)${c.message ? `: "${c.message.slice(0, 200)}"` : ''}. pre.dev pressed OK on it.`);
+  out.content = [...(out.content || []), { type: 'text', text: lines.join('\n') }];
+  out.dialogs = closed.map(({ type, message, closed: how }) => ({ type, message, closed: how }));
+  return out;
+}
+
+/** One call, with the page's dialogs in view (above). `info` is its tab (null for chrome_open, which names its new
+ *  tab with call.setTab once it has one); run(call) does the work. */
+async function dialogCall(args, info, run) {
+  const manual = args?.__predev_alert_auto_ok === false;
+  const setManual = targetId => { if (manual) DLG.manual.add(targetId); else if (fromWeb(args)) DLG.manual.delete(targetId); };
+  if (info) {
+    setManual(info.targetId);
+    const open = liveDialog(info.targetId);
+    if (open) throw dialogRefused(args, info, open);
+    const session = chrome.sessions.get(info.targetId);
+    // It didn't answer last time: a light look first, so a page that still doesn't answer is refused at once.
+    if (session && DLG.noAnswer.has(info.targetId)) {
+      if (!(await answers(session, 1000))) throw dialogRefused(args, info, liveDialog(info.targetId));
+      DLG.noAnswer.delete(info.targetId);
+      try { core.onBusy?.(info.targetId); } catch {}
+    }
+  }
+  const call = { tab: info?.targetId || null, dialog: null, closed: [...(info && DLG.closed.get(info.targetId) || [])], wake: null };
+  const startedAt = Date.now();
+  if (info) DLG.closed.delete(info.targetId);
+  call.setTab = targetId => { call.tab = targetId; setManual(targetId); };
+  const landed = new Promise(resolve => { call.wake = resolve; });
+  let stop = false;
+  // Not answering: from 2 s into the call, a light look every 2 s while the page answers (each waits 2.5 s); two in a
+  // row unanswered is a refusal, 7 s into a call on a page that doesn't answer (or 7 s after it stops answering).
+  const stuck = (async () => {
+    await sleep(2000);
+    let missed = 0;
+    while (!stop) {
+      const session = call.tab && chrome.sessions.get(call.tab);
+      if (!session || liveDialog(call.tab)) { missed = 0; await sleep(500); continue; }
+      const ok = await answers(session, 2500);
+      if (stop) return null;
+      missed = ok ? 0 : missed + 1;
+      if (missed >= 2) return true;
+      if (ok) await sleep(2000);
+    }
+    return null;
+  })();
+  DLG.calls.add(call);
+  // A call a dialog cut short on this tab ends first (uncut); the look above keeps watching meanwhile.
+  const work = (info ? uncut(info.targetId) : Promise.resolve()).then(() => run(call));
+  try {
+    const first = await Promise.race([
+      work.then(value => ({ value }), error => ({ error })),
+      landed.then(() => ({ landed: true })),
+      stuck.then(hit => (hit ? { stuck: true } : new Promise(() => {}))),
+    ]);
+    if (first.landed || first.stuck) {
+      // The call stops here; what it had left to do runs out without input (sendInput) and nobody waits on it.
+      const session = call.tab && chrome.sessions.get(call.tab);
+      const left = work.catch(() => {});
+      if (session) {
+        DLG.cut.set(session, left);
+        void left.then(() => { if (DLG.cut.get(session) === left) DLG.cut.delete(session); });
+      }
+      const tabInfo = call.tab ? chrome.targets.get(call.tab) || info : info;
+      if (first.landed) return withClosedAlerts(landedResult(args, tabInfo, call.dialog), call.closed);
+      // Since when the page doesn't answer: a later call that finds it still so keeps the first time.
+      if (!DLG.noAnswer.has(call.tab)) DLG.noAnswer.set(call.tab, Date.now());
+      try { core.onBusy?.(call.tab); } catch {}
+      // This call's own input went out before the page stopped answering. All of it: it landed (never done again).
+      // Only part of it (the page stopped during a later piece): it may have gone through in part, so it says that.
+      const plan = session && DLG.input.get(session);
+      if (plan && plan.at >= startedAt && plan.sent > 0 && !liveDialog(call.tab)) {
+        return withClosedAlerts(plan.sent >= plan.planned ? busyLandedResult(tabInfo) : busyPartResult(tabInfo, plan), call.closed);
+      }
+      throw dialogRefused(args, tabInfo, liveDialog(call.tab), { tabLine: !info });
+    }
+    if (first.error) throw first.error;
+    return withClosedAlerts(first.value, call.closed);
+  } finally {
+    stop = true;
+    DLG.calls.delete(call);
+    if (call.tab) DLG.usedAt.set(call.tab, Date.now());
+  }
+}
+
+/** pre.dev's ping for a handed task: is its tab busy? { type } of the dialog open there ('no_answer' when the page
+ *  doesn't answer, with no dialog), or null. */
+async function busyOf(tab) {
+  const wanted = String(tab || '').trim().toUpperCase();
+  if (!wanted) return null;
+  const hits = [...chrome.targets.values()].filter(t => t.targetId.toUpperCase().startsWith(wanted));
+  if (hits.length !== 1) return null;
+  const { targetId } = hits[0];
+  const d = liveDialog(targetId);
+  if (d) return { type: d.type };
+  if (!DLG.noAnswer.has(targetId)) return null;
+  const session = chrome.sessions.get(targetId);
+  if (session && !(await answers(session, 1000))) return { type: 'no_answer' };
+  DLG.noAnswer.delete(targetId);
+  return null;
+}
 // The model check on the target (pre.dev's /browser/check, as ask-first uses): does this sign the
 // user out or open account security? No verdict (no pre.dev key, or the check failed or timed out):
 // the step never goes through. With handoffs on it goes to the user to decide; otherwise a refusal.
@@ -1149,8 +1989,8 @@ async function accountRefusal(args, session, action, target, url, ctx) {
   const site = hostOf(url);
   const keyless = !ctx?.apiKey;
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
-    `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
-  if (asked) { if (p !== null && p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
+    `${action} ${target} would sign the person out of this site (log out, sign out, switch account) or open the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`, 'action');
+  if (asked) { if (p !== null && p >= ACTION_REFUSE_AT && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
   if (p === null) {
     log(keyless ? 'keep sign-in: no pre.dev key, not done' : 'keep sign-in: no verdict, not done', target);
     const unchecked = keyless
@@ -1162,10 +2002,125 @@ async function accountRefusal(args, session, action, target, url, ctx) {
       ? refused(`${unchecked} Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"other","summary":"what it does"} and doneCheck {"kind":"url_changes"}; they decide and do it themselves in their Chrome, and the run resumes once it's done.`, why)
       : refused(`${unchecked} Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"url_changes"}; they decide and do it in the tab themselves, and you carry on after.`, why);
   }
-  if (p < 0.7) return '';
+  if (p < ACTION_REFUSE_AT) return '';
   return refused(`Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
 }
 const linkTarget = f => (f?.href ? ` (it goes to ${f.href})` : f?.isSubmit && f?.formAction ? ` (it submits to ${f.formAction})` : '');
+// Where a step on this element goes: its link, or where its form submits (a submit control, or a
+// field in a form when the step submits it); '' for neither.
+const goesTo = (f, submitsField = false) => (!f ? '' : f.href || (f.isSubmit || (submitsField && f.inForm) ? f.formAction || '' : ''));
+// The keep-sign-in check (accountRefusal) of a step on both sites it can touch: the page's, and the
+// one its link or form submission goes to, since a form on one site can submit to another's sign-out.
+async function keepRefusal(args, session, action, target, pageUrl, to, ctx) {
+  for (const url of to && siteKey(to) !== siteKey(pageUrl) ? [pageUrl, to] : [pageUrl]) {
+    const why = await accountRefusal(args, session, action, target, url, ctx);
+    if (why) return why;
+  }
+  return '';
+}
+
+// ---------------------------------------------------------------- the network guard (page-script paths)
+// A page on a kept tab can reach a sign-out or send/post without a click the element guard sees: a select's
+// onchange, an upload's change, an onclick on a plain element that calls form.submit(), a location change, or a
+// fetch/XHR. These all show at the network layer, so with a kept site in play the guard watches requests there
+// (CDP Fetch, request stage). Only a navigation (any method) or a non-GET fetch/XHR counts; a GET subresource
+// passes. A request the page started after the agent's own last activation is run through the same keep-sign-in
+// and ask-first checks as a click; the person's own click (the latest activation is theirs) passes untouched.
+const NET_TYPES = new Set(['Document', 'XHR', 'Fetch', 'Ping', 'Other']);
+const NET_PASS_METHOD = /^(GET|HEAD|OPTIONS)$/i;
+const NET_NAV_REASONS = new Set(['formSubmissionGet', 'formSubmissionPost', 'scriptInitiated', 'anchorClick', 'initialFrameNavigation', 'reload', 'other']);
+// Any kept site at all: only then is it worth watching the network on this tab.
+const anyKept = args => H.signedIn.size > 0 || (Array.isArray(args?.__predev_signed_in) && args.__predev_signed_in.length > 0);
+// Called from the handoff gate on each call: turn the watch on for a kept tab, and keep the latest call's args
+// and ctx so the pause handler (which has no call scope) can build a refusal and reach pre.dev's check.
+async function netGuard(info, session, args, ctx) {
+  if (!handoffOn(args) || !anyKept(args)) return;
+  H.netArgs.set(info.targetId, { args: pickPredevArgs(args), ctx: ctx && { apiKey: ctx.apiKey, apiUrl: ctx.apiUrl }, session });
+  if (H.netOn.has(session)) return;
+  H.netOn.add(session);
+  const ok = await chrome.send('Fetch.enable', { patterns: NET_PATTERNS() }, session).then(() => true, () => false);
+  if (!ok) H.netOn.delete(session);
+}
+const NET_PATTERNS = () => [...NET_TYPES].map(resourceType => ({ urlPattern: '*', resourceType, requestStage: 'Request' }));
+// Only the __predev_* flags and the tab travel to the handler; never a signal or other live objects.
+function pickPredevArgs(args) {
+  const out = { tab: args.tab };
+  for (const k of Object.keys(args)) if (k.startsWith('__')) out[k] = args[k];
+  return out;
+}
+// The event listener (registered once, like the dialog one). frameRequestedNavigation says a navigation was the
+// page's own (and why); the paused request is then judged. Runs its own async work and never blocks the socket.
+function netEvent(targetId, method, params = {}) {
+  if (!targetId) return;
+  if (method === 'Page.frameRequestedNavigation') {
+    H.netAsked.set(`${targetId}:${params.frameId}`, { reason: params.reason, url: params.url, at: Date.now() });
+    return;
+  }
+  if (method !== 'Fetch.requestPaused') return;
+  void netDecide(targetId, params).catch(() => {});
+}
+async function netDecide(targetId, params) {
+  const stored = H.netArgs.get(targetId);
+  const session = chrome.sessions.get(targetId) || stored?.session;
+  const requestId = params.requestId;
+  const cont = () => chrome.send('Fetch.continueRequest', { requestId }, session).catch(() => {});
+  // A refused navigation is cancelled (Aborted), so the page the person is on stays as it was; Chrome would put
+  // its own error page there for BlockedByClient. A refused fetch/XHR fails as blocked.
+  const errorReason = params.resourceType === 'Document' ? 'Aborted' : 'BlockedByClient';
+  const fail = () => chrome.send('Fetch.failRequest', { requestId, errorReason }, session).catch(() => {});
+  try {
+    if (!session) return void cont();
+    // The person has the tab (a handoff): everything they do goes through.
+    if (H.handoff.get(targetId)?.waiting) return void cont();
+    if (!stored) return void cont();
+    const refusal = await Promise.race([
+      netVerdict(targetId, session, params, stored).catch(() => null),
+      sleep(25000).then(() => 'timeout'),
+    ]);
+    if (refusal === 'timeout') return void fail();           // a check that never came back blocks rather than allows
+    if (!refusal) return void cont();
+    H.netRefused.set(targetId, { refusal, at: Date.now() });
+    return void fail();
+  } catch { return void cont(); }
+}
+// The refusal for this paused request, or null to let it through.
+async function netVerdict(targetId, session, params, stored) {
+  const { args, ctx } = stored;
+  const method = String(params.request?.method || 'GET');
+  const url = String(params.request?.url || '');
+  const type = params.resourceType;
+  const isDoc = type === 'Document';
+  const isRedirect = !!params.redirectedRequestId;
+  if (!isDoc && NET_PASS_METHOD.test(method)) return null;    // a GET subresource is not watched
+  if (!NET_TYPES.has(type)) return null;
+  if (isDoc) {
+    // A navigation the page started (a script, a form, a link), or a redirect of one; Chrome's own
+    // Page.navigate / reload (the agent's chrome_navigate, which the element path handles) sends no
+    // frameRequestedNavigation, so it is not page-started and passes here.
+    const key = `${targetId}:${params.frameId}`;
+    const asked = H.netAsked.get(key);
+    if (asked && !isRedirect) H.netAsked.delete(key);  // one request per page-started navigation
+    const pageStarted = isRedirect || (asked && Date.now() - asked.at < 15000 && NET_NAV_REASONS.has(asked.reason));
+    if (!pageStarted) return null;
+  }
+  // Whose activation is latest in the tab: the agent's while one of its actions runs, otherwise what the reporter
+  // last told (nothing can be asked of the page while its navigation is pending). A short settle lets a report
+  // sent just before the request land first. None known counts as the agent's.
+  let owner = H.marked.get(session) ? 'agent' : null;
+  if (!owner) { await sleep(30); owner = H.marked.get(session) || H.actAt.get(targetId)?.who !== 'person' ? 'agent' : 'person'; }
+  if (owner === 'person') return null;                        // the person's own click: untouched
+  const pageUrl = chrome.targets.get(targetId)?.url || url;
+  if (!keepsSignIn(args, pageUrl) && !keepsSignIn(args, url)) return null;
+  const post = !NET_PASS_METHOD.test(method);
+  const action = isDoc ? (post ? 'Submitting a form (POST) to' : 'Going to') : 'Sending a POST request to';
+  const target = `${url} (the page did it on its own after the agent's last action)`;
+  // A pending navigation holds every command to its page, so a navigation's check can't read the page.
+  const readable = isDoc ? null : session;
+  const keep = await keepRefusal(args, readable, action, target, pageUrl, url, ctx);
+  if (keep) return keep;
+  const appr = await approvalRefusal(args, readable, `the request the page sent to ${url}`, { isSubmit: post, formMethod: method }, url, ctx, 'Sending');
+  return appr || null;
+}
 
 const KEYS = {
   enter: ['Enter', 'Enter', 13, '\r'], return: ['Enter', 'Enter', 13, '\r'], tab: ['Tab', 'Tab', 9],
@@ -1179,18 +2134,9 @@ const MODIFIERS = { alt: 1, option: 1, ctrl: 2, control: 2, cmd: 4, meta: 4, com
 const MAC_COMMANDS = { a: 'selectAll', c: 'copy', v: 'paste', x: 'cut', z: 'undo' };
 
 // With handoffs on, an agent tab notes the user's own clicks and keys (INPUT_WATCH); the agent's
-// input is flagged around each dispatch so it never counts as the user's.
-async function markActing(session, on) {
-  let tid = null;
-  for (const [targetId, sid] of chrome.sessions) if (sid === session) tid = targetId;
-  if (!tid || !chrome.__predevHandoff?.watched?.has(tid)) return;
-  // A click/key handler can start a WebAuthn ceremony a tick after the input dispatch returns, so a short grace
-  // keeps it counted as the agent's (WEBAUTHN_WATCH declines only while the agent is acting).
-  const expr = on
-    ? 'window.__predevAgentActing = true; window.__predevActingGraceUntil = Date.now() + 1200'
-    : 'window.__predevAgentActing = false';
-  await evaluate(session, expr, 3000).catch(() => {});
-}
+// input is flagged around each dispatch so it never counts as the user's, and the passkey watch counts it
+// as the agent's (agentMark).
+const markActing = (session, on) => agentMark(session, on, `window.__predevAgentActing = ${on ? 'true' : 'false'}`);
 
 async function pressKeys(session, combos) {
   await markActing(session, true);
@@ -1223,10 +2169,10 @@ async function pressKeysInner(session, combos) {
     const { keyName, key, code, keyCode, text, modifiers } = comboKey(combo);
     const command = modifiers & 4 ? MAC_COMMANDS[keyName.toLowerCase()] : undefined;
     const base = { key, code, windowsVirtualKeyCode: keyCode, modifiers };
-    await chrome.send('Input.dispatchKeyEvent', {
+    await sendInput('Input.dispatchKeyEvent', {
       ...base, type: text ? 'keyDown' : 'rawKeyDown', ...(text ? { text } : {}), ...(command ? { commands: [command] } : {}),
-    }, session);
-    await chrome.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, session);
+    }, session, undefined, true);
+    await sendInput('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, session);
   }
 }
 
@@ -1236,10 +2182,10 @@ async function click(session, x, y, count = 1) {
 }
 
 async function clickInner(session, x, y, count) {
-  await chrome.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, session);
+  await sendInput('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, session);
   for (let i = 1; i <= count; i++) {
-    await chrome.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session);
-    await chrome.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: i }, session);
+    await sendInput('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: i }, session, undefined, true);
+    await sendInput('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: i }, session);
   }
 }
 
@@ -1263,14 +2209,18 @@ const FRAMED_FOCUS = '(() => { const el = document.activeElement; return !!el &&
 // The probe is the agent's own input, so the watcher never counts it as the user's.
 const PROBE_START = `(${INPUT_WATCH}, window.__predevAgentActing = true, [Number(window.__predevSeen || 0), ${FRAMED_FOCUS}])`;
 async function inputReaches(session) {
+  await agentMark(session, true);
+  try { return await probeInput(session); } finally { await agentMark(session, false); }
+}
+async function probeInput(session) {
   const start = await evaluate(session, PROBE_START, 3000).catch(() => null);
   const done = () => evaluate(session, 'window.__predevAgentActing = false', 3000).catch(() => {});
   if (!Array.isArray(start)) return null;
   if (start[1]) { await done(); return null; }
   let out = false;
   try {
-    await chrome.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
-    await chrome.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
+    await sendInput('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16, modifiers: 8 }, session, 3000);
+    await sendInput('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Shift', code: 'ShiftLeft', windowsVirtualKeyCode: 16 }, session, 3000);
     for (let i = 0; i < 6; i++) {
       const now = await seenCount(session);
       if (now === null) { out = null; break; }
@@ -1502,10 +2452,21 @@ function sandboxWrap(js, href) {
 }
 
 const SANDBOX_CSP = "sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline' data:; img-src data:; font-src data:; form-action 'none'";
+// No peer connections in the copy: request interception, the offline emulation and the CSP don't cover WebRTC, so the
+// sandbox target drops its constructors from every frame before any script runs. Registered on the sandbox target's own
+// session only: nothing outside its throwaway context changes.
+const NO_WEBRTC_SOURCE = `(() => {
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
+    try { delete globalThis[name]; } catch {}
+    try { if (name in globalThis) Object.defineProperty(globalThis, name, { value: undefined }); } catch {}
+  }
+})();`;
+// chrome_eval's result on a non-local page says once where it ran.
+const COPY_LINE = 'Ran on a copy of the page: forms, navigation and network do nothing here; use chrome_click / chrome_type to act on the real page.';
 const sandboxUnavailable = site => `Refused: on ${site} chrome_eval runs your script against a read-only copy of the page (no page session, storage or network), and this Chrome could not open the hidden sandbox it needs. Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`;
 
 // Serve the copy to a hidden target in a throwaway context on a side connection, run the script
-// there, and tear the context down. The side connection keeps the sandbox target's events off the
+// there (no WebRTC in that target), and tear the context down. The side connection keeps the sandbox target's events off the
 // daemon's own bridge (its dialog follower never sees it); the id and context are hidden from every
 // tab listing meanwhile. Returns the script's JSON value.
 async function sandboxEval(liveSession, info, js, href) {
@@ -1554,6 +2515,7 @@ async function sandboxEval(liveSession, info, js, href) {
     await send('Network.enable', {}, sessionId).catch(() => {});
     await send('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }, sessionId).catch(() => {});
     await send('Page.enable', {}, sessionId);
+    await send('Page.addScriptToEvaluateOnNewDocument', { source: NO_WEBRTC_SOURCE }, sessionId);
     await send('Page.navigate', { url: SENTINEL }, sessionId);
     const loadEnd = Date.now() + 8000;
     for (;;) {
@@ -1579,31 +2541,6 @@ async function sandboxEval(liveSession, info, js, href) {
   }
 }
 
-// A chrome_eval script, run so that while it runs it can't write a password, one-time code or
-// card field (structure: input type or autocomplete token), click, or submit a form.
-function guardedEval(js, args = {}) {
-  return `(async () => {
-  const SECRET = new Set(['current-password','new-password','one-time-code','cc-name','cc-number','cc-csc','cc-exp','cc-exp-month','cc-exp-year','cc-type','cc-given-name','cc-family-name','cc-additional-name']);
-  const isSecret = el => !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (String(el.type || '').toLowerCase() === 'password' || String(el.getAttribute('autocomplete') || '').toLowerCase().split(/\\s+/).some(t => SECRET.has(t)));
-  const refuse = what => { throw new Error('Refused by pre.dev: ' + what); };
-  const secretWhy = 'scripts never write passwords, one-time codes or card details; hand the step to the user with ${toHandOff(args) ? 'hand_off_to_user and this tab' : 'chrome_handoff'}.';
-  const clickWhy = "in the user's Chrome, clicks and submits go through chrome_click (it asks the user first where it must), not scripts.";
-  const restore = [];
-  const patch = (obj, key, make) => { const d = Object.getOwnPropertyDescriptor(obj, key); if (!d) return; Object.defineProperty(obj, key, make(d)); restore.push(() => Object.defineProperty(obj, key, d)); };
-  for (const P of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
-    patch(P, 'value', d => ({ ...d, set(v) { if (isSecret(this)) refuse(secretWhy); return d.set.call(this, v); } }));
-    patch(P, 'setRangeText', d => ({ ...d, value: function (...a) { if (isSecret(this)) refuse(secretWhy); return d.value.apply(this, a); } }));
-  }
-  patch(Element.prototype, 'setAttribute', d => ({ ...d, value: function (n, v) { if (String(n).toLowerCase() === 'value' && isSecret(this)) refuse(secretWhy); return d.value.call(this, n, v); } }));
-  patch(Document.prototype, 'execCommand', d => ({ ...d, value: function (cmd, ...a) { if (['inserttext', 'paste', 'inserthtml'].includes(String(cmd).toLowerCase()) && isSecret(document.activeElement)) refuse(secretWhy); return d.value.call(this, cmd, ...a); } }));
-  patch(HTMLElement.prototype, 'click', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(HTMLFormElement.prototype, 'submit', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(HTMLFormElement.prototype, 'requestSubmit', d => ({ ...d, value: function () { refuse(clickWhy); } }));
-  patch(EventTarget.prototype, 'dispatchEvent', d => ({ ...d, value: function (e) { if (e && ['click', 'submit', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'keydown', 'keypress'].includes(e.type)) refuse(clickWhy); return d.value.call(this, e); } }));
-  try { return await (${js}\n); } finally { for (const r of restore.reverse()) { try { r(); } catch (e) {} } }
-})()`;
-}
-
 // The done check, from the URL and the page's structure only (never its text or field values).
 function doneExpression(done, startUrl) {
   const kind = done?.kind || 'url_changes';
@@ -1618,8 +2555,10 @@ function doneExpression(done, startUrl) {
 
 // macOS: is this Chrome the app in front? Then the handoff tab can come forward without taking
 // the keyboard from whatever the user is typing in (the notification comes first).
+// The extension knows from Chrome itself (core.chromeInFront).
 let browserPid = 0;
 async function chromeInFront() {
+  if (core.chromeInFront) return core.chromeInFront();
   if (process.platform !== 'darwin') return true;
   try {
     if (!browserPid) {
@@ -1730,7 +2669,11 @@ const TOOLS = [
       if (context) info = await createTab(context, 'about:blank', { background: !foreground }).catch(() => null);
       if (!info) info = await openTaggedTab(p.dir);
       const session = await chrome.session(info.targetId);
+      ctx.dialogCall?.setTab(info.targetId);
+      await pageOn(session);
       if (handoffOn(rest)) ownedBy(agentOf(rest)).add(info.targetId);
+      // Watched before the page loads, so its own scripts (a passkey request on load) run after the watch.
+      if (handoffOn(rest)) await watchInput(info, session);
       if (foreground) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
       let loaded;
       try {
@@ -1738,7 +2681,6 @@ const TOOLS = [
       } catch (error) {
         throw new Error(`${error.message} (tab ${tabId(info)} in ${p.name})`);
       }
-      if (handoffOn(rest)) await watchInput(info, session);
       return `Opened in ${p.name}\n${await pageLine(info, session)}\n${loaded ? LOADED : STILL_LOADING}`;
     },
   },
@@ -1749,6 +2691,8 @@ const TOOLS = [
     async run({ tab, url, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
+      // Chrome already took the tab off a non-web page to this address, its checks done (navigateOffWeb): wait for it.
+      if (ctx[OFF_WEB]) return `${await pageLine(info, session)}\n${(await waitForLoad(session, 20000)) ? LOADED : STILL_LOADING}`;
       if (handoffOn(rest) && url !== 'reload') {
         let dest = url;
         if (url === 'back' || url === 'forward') {
@@ -1784,10 +2728,16 @@ const TOOLS = [
       type: 'object', required: ['tab'],
       properties: { tab: { type: 'string' }, max: { type: 'number', description: 'Max elements (default 200).' } },
     },
-    async run({ tab, max = 200 }) {
+    async run(args) {
+      const { tab, max = 200 } = args;
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      return `${await pageLine(info, session)}\n${await inPage(session, `snapshot(${Math.min(Math.max(Number(max) || 200, 20), 1000)})`, 20000)}`;
+      const n = Math.min(Math.max(Number(max) || 200, 20), 1000);
+      if (!fromWeb(args)) return `${await pageLine(info, session)}\n${await inPage(session, `snapshot(${n})`, 20000)}`;
+      // pre.dev's runs also get each input's structure, by ref, next to the text (a run that does not read it
+      // sees the same text as before).
+      const snap = await inPage(session, `snapshotWithInputs(${n})`, 20000);
+      return { content: [{ type: 'text', text: `${await pageLine(info, session)}\n${snap.text}` }], inputs: snap.inputs || {} };
     },
   },
   {
@@ -1803,16 +2753,19 @@ const TOOLS = [
     async run(args, ctx = {}) {
       const info = findTab(args.tab);
       const session = await chrome.session(info.targetId);
-      await pageMustAnswer(args, session, info, 'this click');
+      await pageMustAnswer(args, session, info);
       const before = await docState(session, info.url);
       let what = `(${args.x}, ${args.y})`, note = '';
       let { x, y } = args;
-      if (handoffOn(args) && x !== undefined && y !== undefined && (keepsSignIn(args, before[0]) || signOutAsked(args, before[0]))) {
-        // A click by position: the control under that point.
+      if (handoffOn(args) && x !== undefined && y !== undefined) {
+        // A click by position: the control under that point, checked as a click on it by ref is (a
+        // submit control there submits its form, to its own formaction if it has one).
         const f = await inPage(session, `factsAt(${Number(x)}, ${Number(y)})`).catch(() => null);
         if (f && !f.error) {
-          const keep = await accountRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], ctx);
+          const keep = await keepRefusal(args, session, 'Clicking', `${f.desc}${linkTarget(f)}`, before[0], goesTo(f), ctx);
           if (keep) throw keep;
+          const ask = await approvalRefusal(args, session, f.desc, f, before[0], ctx);
+          if (ask) throw ask;
         }
       }
       if (x === undefined || y === undefined) {
@@ -1820,7 +2773,8 @@ const TOOLS = [
         if (hit.error) throw new Error(hit.error);
         if (handoffOn(args)) {
           const facts = await inPage(session, `fieldFacts(${target(args)})`).catch(() => null);
-          const keep = await accountRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(facts && !facts.error ? facts : null)}`, before[0], ctx);
+          const f = facts && !facts.error ? facts : null;
+          const keep = await keepRefusal(args, session, 'Clicking', `${hit.desc}${linkTarget(f)}`, before[0], goesTo(f), ctx);
           if (keep) throw keep;
           const ask = await approvalRefusal(args, session, hit.desc, facts && !facts.error ? facts : null, before[0], ctx);
           if (ask) throw ask;
@@ -1835,12 +2789,12 @@ const TOOLS = [
         // A click only opens a dropdown's list; arrow keys and option clicks don't reach it in every Chrome.
         if (hit.select) note += `\nNote: this is a dropdown. To pick an option, call chrome_type with this element and the option's text.`;
       }
-      const pkAt = Date.now();
       const seen0 = handoffOn(args) ? await seenCount(session) : null;
+      planInput(session, args.double ? 2 : 1);
       await click(session, x, y, args.double ? 2 : 1);
       if (await inputBlocked(session, seen0, before, FRAMED_AT(x, y))) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
       await settle(session, before);
-      const pk = await passkeyRefusal(args, session, pkAt);
+      const pk = await passkeyRefusal(args, info, session);
       if (pk) throw pk;
       return `Clicked ${what}${note}\n${await pageLine(info, session)}`;
     },
@@ -1860,13 +2814,20 @@ const TOOLS = [
       const session = await chrome.session(info.targetId);
       const q = target(args.ref || args.selector ? args : { ...args, text: undefined });
       if (q === '{}') throw new Error('Pass ref (from chrome_snapshot) or selector for the field.');
-      await pageMustAnswer(args, session, info, 'typing here');
+      await pageMustAnswer(args, session, info);
       const before = await docState(session, info.url);
       if (handoffOn(args)) {
         const secret = await secretRefusal(args, session, q, before[0], ctx);
         if (secret) throw secret;
         if (args.submit) {
+          // Its Enter is chrome_press Enter in that field: the keep-sign-in check on the page and on
+          // where the field's form submits, then ask first. Both before anything is typed.
           const facts = await inPage(session, `fieldFacts(${q})`).catch(() => null);
+          if (facts && !facts.error) {
+            const to = goesTo(facts, true);
+            const keep = await keepRefusal(args, session, 'Pressing Enter in', `${facts.desc}${to ? ` (it submits to ${to})` : ''}`, before[0], to, ctx);
+            if (keep) throw keep;
+          }
           if (facts && !facts.error && facts.inForm) {
             const ask = await approvalRefusal(args, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form)` : 'submitting this form', facts.submitDesc ? { ...facts, isSubmit: true } : facts, before[0], ctx);
             if (ask) throw ask;
@@ -1876,7 +2837,7 @@ const TOOLS = [
         const recent = Number(await evaluate(session, 'window.__predevUserAt || 0', 3000).catch(() => 0)) || 0;
         if (recent && Date.now() - recent < 2000 && recent > (H.ackAt.get(info.targetId) || 0)) {
           if (!H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: recent });
-          await pauseHeld(info, session);
+          await pauseHeld(info, session, args);
           throw refused(`The user is typing in this tab right now; the agent never types over them. ${keepGoing(args)}`, { kind: 'user_control' });
         }
       }
@@ -1889,20 +2850,21 @@ const TOOLS = [
       }
       if (field.isPassword && !isLocalDev(before[0])) throw refused('Refusing to type into a password field outside local dev sites; the user should enter it.', { kind: 'secret', field: 'password' });
       const seen0 = handoffOn(args) && (args.text || args.clear !== false) ? await seenCount(session) : null;
+      // The text (or the clearing key) is one piece, its Enter another.
+      planInput(session, (args.text || args.clear !== false ? 1 : 0) + (args.submit ? 1 : 0), 'field');
       if (args.text) {
         await markActing(session, true);
-        try { await chrome.send('Input.insertText', { text: args.text }, session); } finally { await markActing(session, false); }
+        try { await sendInput('Input.insertText', { text: args.text }, session, undefined, true); } finally { await markActing(session, false); }
       } else if (args.clear !== false) await pressKeys(session, 'Backspace');
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args), { kind: CHROME_DIALOG });
-      let pkAt = 0;
       if (args.submit) {
         const seen1 = handoffOn(args) ? await seenCount(session) : null;
-        pkAt = Date.now();
         await pressKeys(session, 'Enter');
         if (await inputBlocked(session, seen1, before, FRAMED_FOCUS)) throw refused(dialogRefusal(args, "the text went in, but this call's Enter didn't"), { kind: CHROME_DIALOG });
         await settle(session, before);
       }
-      if (pkAt) { const pk = await passkeyRefusal(args, session, pkAt); if (pk) throw pk; }
+      const pk = await passkeyRefusal(args, info, session);
+      if (pk) throw pk;
       const value = args.submit ? null : await inPage(session, `valueOf(${q})`).catch(() => null);
       return `Typed into ${field.desc}${value !== null ? `; value is now ${JSON.stringify(value)}` : ' and pressed Enter'}\n${await pageLine(info, session)}`;
     },
@@ -1940,10 +2902,10 @@ const TOOLS = [
     async run({ tab, keys, ...rest }, ctx = {}) {
       const info = findTab(tab);
       const session = await chrome.session(info.targetId);
-      await pageMustAnswer(rest, session, info, `pressing ${String(keys)}`);
+      await pageMustAnswer(rest, session, info);
       const before = await docState(session, info.url);
-      const pkAt = Date.now();
       const seen0 = handoffOn(rest) ? await seenCount(session) : null;
+      planInput(session, keyCombos(keys).length, 'focused field or the tab');
       // One key at a time: Tab, shift+Tab or an arrow key can move the focus, so each Enter or Space
       // is checked on the element focused when it fires (it activates that element, like a click).
       const withTab = { ...rest, tab }; // so a refusal that hands the step over names this tab
@@ -1952,28 +2914,29 @@ const TOOLS = [
         if (handoffOn(rest) && k.activates) {
           const { submits } = k;
           // An earlier key may have opened a dialog: then this one would wait in Chrome, past the checks.
-          await pageMustAnswer(rest, session, info, `pressing ${combo}`);
+          await pageMustAnswer(rest, session, info);
           const url = (await docState(session, before[0]))[0] || before[0];
-          if (keepsSignIn(rest, url) || signOutAsked(rest, url)) {
-            const facts = await inPage(session, 'activeFacts()').catch(() => null);
-            if (facts && !facts.error) {
-              const keep = await accountRefusal(withTab, session, `Pressing ${k.code} on`, `${facts.desc}${linkTarget(facts)}`, url, ctx);
-              if (keep) throw keep;
-            }
+          const facts = await inPage(session, 'activeFacts()').catch(() => null);
+          const f = facts && !facts.error ? facts : null;
+          // Enter in a field submits its form; Enter or Space on a submit control submits through it
+          // (to its own formaction if it has one). Each is checked where it goes, and on the page.
+          const sends = !!f && (f.isSubmit || (submits && f.inForm && !f.href));
+          if (f) {
+            const to = sends ? f.formAction || '' : submits ? f.href : '';
+            const keep = await keepRefusal(withTab, session, `Pressing ${k.code} on`, `${f.desc}${to ? (sends ? ` (it submits to ${to})` : ` (it goes to ${to})`) : ''}`, url, to, ctx);
+            if (keep) throw keep;
           }
-          if (submits) {
-            const facts = await inPage(session, 'activeFacts()').catch(() => null);
-            if (facts && !facts.error && (facts.inForm || facts.isSubmit)) {
-              const ask = await approvalRefusal(withTab, session, facts.submitDesc ? `${facts.submitDesc} (submitting the form with Enter)` : `${facts.desc} (Enter)`, facts.submitDesc ? { ...facts, isSubmit: true } : facts, url, ctx);
-              if (ask) throw ask;
-            }
+          if (sends) {
+            const desc = f.isSubmit ? `${f.desc} (submitting the form with ${k.code})` : f.submitDesc ? `${f.submitDesc} (submitting the form with Enter)` : `${f.desc} (Enter)`;
+            const ask = await approvalRefusal(withTab, session, desc, f.isSubmit || !f.submitDesc ? f : { ...f, isSubmit: true }, url, ctx);
+            if (ask) throw ask;
           }
         }
         await pressKeys(session, combo);
       }
       if (await inputBlocked(session, seen0, before, FRAMED_FOCUS)) throw refused(dialogRefusal(rest), { kind: CHROME_DIALOG });
       await settle(session, before);
-      const pk = await passkeyRefusal(rest, session, pkAt);
+      const pk = await passkeyRefusal(rest, info, session);
       if (pk) throw pk;
       return `Pressed ${keys}\n${await pageLine(info, session)}`;
     },
@@ -2000,8 +2963,9 @@ const TOOLS = [
       const step = Number(amount) || 1;
       const deltaY = direction === 'down' ? height * 0.85 * step : direction === 'up' ? -height * 0.85 * step : 0;
       const deltaX = direction === 'right' ? width * 0.85 * step : direction === 'left' ? -width * 0.85 * step : 0;
+      planInput(session, 1);
       await markActing(session, true);
-      try { await chrome.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session); } finally { await markActing(session, false); }
+      try { await sendInput('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width / 2, y: height / 2, deltaX, deltaY }, session, undefined, true); } finally { await markActing(session, false); }
       await sleep(350);
       const [top, max] = await evaluate(session, '(r => [Math.round(r.scrollTop), Math.max(0, r.scrollHeight - innerHeight)])(document.scrollingElement || document.documentElement)');
       return `Scrolled ${direction}. Page scroll: ${top}/${max}px`;
@@ -2132,17 +3096,19 @@ const TOOLS = [
         const site = keepsSignIn(rest, href) ? hostOf(href) : '';
         if (site)
           throw refused(`Refused: the agent runs no scripts on this tab. ${KEEP_SIGNIN(site)} Read the page with chrome_read, chrome_snapshot or chrome_screenshot, and use chrome_click or chrome_type for actions; they check each one.`, { kind: 'keep_signin', site });
-        if (!answers) throw refused(pageBusy(hostOf(info.url), 'this script'), { kind: 'page_busy' });
+        if (!answers) throw dialogRefused(rest, info, liveDialog(info.targetId));
         // On any site that is not local dev, the script never runs in the live page: it runs against
         // a read-only copy in a hidden, throwaway Chrome context with no session and no network
         // (sandboxEval). Local-dev pages still run in the page, as before.
         if (!isLocalDev(href)) {
           const value = await sandboxEval(session, info, js, href);
           const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
-          return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
+          return `${out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out}\n${COPY_LINE}`;
         }
       }
-      const value = await evaluate(session, expression, 30000);
+      if (handoffOn(rest)) await agentMark(session, true);
+      let value;
+      try { value = await evaluate(session, expression, 30000); } finally { if (handoffOn(rest)) await agentMark(session, false); }
       const out = value === undefined ? 'undefined' : JSON.stringify(value, null, 2);
       return out.length > 20000 ? `${out.slice(0, 20000)}\n… truncated (${out.length} chars)` : out;
     },
@@ -2184,6 +3150,7 @@ const TOOLS = [
         } else if (args.ref || args.selector || args.text) {
           const hit = await inPage(session, `point(${target(args)})`);
           if (hit.error) throw new Error(hit.error);
+          planInput(session, 1);
           await click(session, hit.x, hit.y);
           await sleep(600);
         }
@@ -2192,7 +3159,9 @@ const TOOLS = [
         }, session, 5000);
         const objectId = found.result?.objectId;
         if (!objectId) throw new Error('No file input found. Pass the ref of the button that opens the file picker (chrome_snapshot), or a selector for the <input type=file>.');
-        await chrome.send('DOM.setFileInputFiles', { files, objectId }, session, 15000);
+        // Setting the files fires trusted input/change events: they are the agent's, not the user's.
+        await markActing(session, true);
+        try { await chrome.send('DOM.setFileInputFiles', { files, objectId }, session, 15000); } finally { await markActing(session, false); }
         const count = await chrome.send('Runtime.callFunctionOn', {
           objectId, functionDeclaration: 'function () { return this.files ? this.files.length : -1; }', returnByValue: true,
         }, session, 5000).then(r => r.result?.value).catch(() => '?');
@@ -2236,6 +3205,7 @@ const TOOLS = [
     },
     async run(args = {}, ctx = {}) {
       if (!handoffOn(args)) throw new Error('chrome_handoff needs handoffs turned on (PREDEV_HANDOFF=1 for this MCP server).');
+      const calledAt = Date.now(); // handoffs take turns by when their calls came in
       const agent = agentOf(args);
       // After Chrome quit and came back (a caller that saw chrome_gone): the handoff's page
       // is open again in a new tab with a new id. Take it up by the page's address.
@@ -2266,7 +3236,13 @@ const TOOLS = [
         H.handoff.delete(id);
         if (H.active === id) H.active = null;
         H.ackAt.set(id, Date.now());
-        if (status === 'done' || status === 'released' || status === 'resumed') H.reread.add(id);
+        if (status === 'done' || status === 'released' || status === 'resumed') {
+          H.reread.add(id);
+          // A tab a handoff signed in to or handed back: its URLs are masked for secret-keyed values too.
+          const u = chrome.targets.get(id)?.url || h?.startUrl;
+          const k = u && siteKey(u);
+          if (k) H.handedSites.add(k);
+        }
         return h;
       };
       if (args.peek) {
@@ -2296,20 +3272,23 @@ const TOOLS = [
         return handoffLines(args.cancel ? 'cancelled' : 'released', info, info.url);
       }
       if (reason === 'user_control' && args.resume) {
-        // Only the user ends a takeover pause: their click on the bar, or their answer on pre.dev's CLI card.
+        // Only the user ends a takeover pause: their click on the bar, their answer on pre.dev's CLI card, or their
+        // Done on a handed cloud run's card (that run's hand-back).
         const s0 = await chrome.session(info.targetId);
         await notePause(info, s0);
-        if (cliSaidGo(args) && H.paused.has(info.targetId)) await liftPause(info, s0);
+        if ((cliSaidGo(args) || cardSaidGo(args)) && H.paused.has(info.targetId)) await liftPause(info, s0);
         if (args.wait === true) {
           const until = Date.now() + RESUME_WAIT_MS;
           while (Date.now() < until && !ctx.signal?.aborted && await pauseHeld(info, s0)) await sleep(500);
           if (H.paused.has(info.targetId)) return handoffLines('waiting', info, info.url, 'They haven\'t clicked "Let the agent continue" yet. Keep waiting for them (call this again), or ask them in a message; don\'t act in this tab meanwhile.');
         }
-        if (await pauseHeld(info, s0)) throw refused(`The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
+        if (await pauseHeld(info, s0, args)) throw refused(handedRun(args) ? `The tab stays the user's. ${keepGoing(args)}` : `The tab stays the user's until they click "Let the agent continue" at the top of it themselves. ${keepGoing(args)}`, { kind: 'user_control' });
         end(info.targetId, 'resumed');
         return handoffLines('resumed', info, info.url, 'The tab is the agent\'s again: read it before acting.');
       }
       let session = await chrome.session(info.targetId);
+      // The person's own input counts as theirs from here on, even if a dialog kept the agent's last mark from clearing.
+      if (H.watched.has(info.targetId)) await watchInput(info, session);
       const [startHref] = await docState(session);
       const startUrl = String(args.start_url || startHref || info.url);
       H.cancel.delete(info.targetId);
@@ -2319,6 +3298,9 @@ const TOOLS = [
       if (reason === 'user_control' && !H.paused.has(info.targetId)) H.paused.set(info.targetId, { at: Date.now() });
       if (reason === 'user_control') await pauseHeld(info, session);
       H.handoff.set(info.targetId, { agent, reason, waiting: true, since: Date.now(), startUrl, done: args.done });
+      // While the person has the tab, the reporter tells the values they type into secret fields as each is done,
+      // so the done line and everything after can be masked.
+      await reporterOn(info.targetId, session);
       if (args.wait === false) {
         // Another agent's handoff is the user's now: this tab waits its turn (a wait: true call on it comes
         // forward when that one ends) and never comes forward over it.
@@ -2326,17 +3308,34 @@ const TOOLS = [
         if (!busy && await chromeInFront()) await chrome.send('Target.activateTarget', { targetId: info.targetId }).catch(() => {});
         return handoffLines('started', info, startUrl, busy ? 'Another agent\'s handoff is open on this computer: wait with wait: true, and this tab comes forward when that one ends.' : '');
       }
-      // One handoff at a time on this bridge: wait for another agent's to end first.
+      // One handoff at a time on this bridge, in the order the calls came in: wait for the ones before this to end.
       const id0 = info.targetId;
       H.queue.push(id0);
+      H.queuedAt.set(id0, calledAt);
       const limit = Number(args.timeout) > 0 ? Date.now() + Number(args.timeout) * 1000 : Infinity;
       const cancelled = () => H.cancel.has(info.targetId) || H.cancel.has(id0);
+      const inLine = id => !!H.handoff.get(id)?.waiting && chrome.targets.has(id);
+      const firstInLine = () => H.queue.filter(inLine).sort((a, b) => (H.queuedAt.get(a) || 0) - (H.queuedAt.get(b) || 0))[0];
+      const othersFirst = () => (H.active && H.active !== id0 && chrome.targets.has(H.active) && H.handoff.has(H.active)) || (firstInLine() || id0) !== id0;
       try {
-        while (H.active && H.active !== id0 && chrome.targets.has(H.active)) {
+        while (othersFirst()) {
           if (ctx.signal?.aborted || cancelled()) { end(id0, 'cancelled'); return handoffLines('cancelled', info, startUrl); }
           if (Date.now() > limit) { end(id0, 'timeout'); return handoffLines('timeout', info, startUrl); }
           // Its own tab closed while it waited its turn (Chrome quitting is told after the wait, as chrome_gone).
           if (chrome.connected && await tabClosed(id0)) { end(id0, 'tab_closed'); return handoffLines('tab_closed', null, startUrl, TAB_CLOSED_NOTE); }
+          // The user already did this step in its tab while it waited its turn: done now, out of turn (the same
+          // done check as below).
+          if (reason !== 'user_control' && !waitsForInput(reason, args.done)) {
+            const s1 = await chrome.session(id0).catch(() => null);
+            const v = s1 && await evaluate(s1, doneExpression(args.done, startUrl), 5000).catch(() => null);
+            if (v?.ok) {
+              await noteSecrets(id0, s1);
+              noteSignedIn(reason, v.url || info.url);
+              end(id0, 'done');
+              await waitForLoad(s1, 10000).catch(() => {});
+              return `${handoffLines('done', info, v.url)}${await pageLine(info, s1)}\nThe user finished. Read the page again (chrome_snapshot or chrome_read) before your next action.`;
+            }
+          }
           await sleep(500);
         }
         H.active = id0;
@@ -2397,6 +3396,7 @@ const TOOLS = [
             if (v) misses = 0;
             if (v?.url) lastUrl = v.url;
             if (v?.ok) {
+              await noteSecrets(info.targetId, session);
               noteSignedIn(reason, v.url || info.url);
               end(info.targetId, 'done');
               await waitForLoad(session, 10000).catch(() => {});
@@ -2407,6 +3407,7 @@ const TOOLS = [
         }
       } finally {
         H.queue = H.queue.filter(t => t !== id0 && t !== info.targetId);
+        H.queuedAt.delete(id0);
         if (H.active === id0 || H.active === info.targetId) {
           if (!H.handoff.has(H.active)) H.active = null;
         }
@@ -2415,7 +3416,7 @@ const TOOLS = [
   },
   {
     name: 'chrome_handed_off',
-    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish on my computer" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. pre.dev\'s cloud may already be carrying it on in that tab by itself; the list says so. Pass task to take that tab and carry on with the other chrome_* tools from where it is (this stops pre.dev\'s cloud run of it: one of you drives at a time); pass task and done: true once it is finished.',
+    description: 'Tasks pre.dev\'s cloud Browser Agents handed to this computer to finish in this Chrome (the user chose "Finish in my Chrome" on a paused cloud run): the instruction, the steps already done and the page it stopped on, already open in a tab. pre.dev\'s cloud may already be carrying it on in that tab by itself; the list says so. Pass task to take that tab and carry on with the other chrome_* tools from where it is (this stops pre.dev\'s cloud run of it: one of you drives at a time); pass task and done: true once it is finished.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2430,7 +3431,7 @@ const TOOLS = [
       let tasks = read();
       const save = list => { const tmp = `${file}.${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ tasks: list }, null, 2), { mode: 0o600 }); fs.renameSync(tmp, file); };
       const tabOf = t => (t?.tab ? [...chrome.targets.values()].find(x => isTab(x) && x.targetId.toUpperCase().startsWith(String(t.tab).toUpperCase())) : null);
-      // A cloud run carrying a task on in this Chrome (channel.mjs, "Finish on my computer"): its calls in flight.
+      // A cloud run carrying a task on in this Chrome (channel.mjs, "Finish in my Chrome"): its calls in flight.
       const RUNS = chrome.__predevHandedRuns || (chrome.__predevHandedRuns = { inflight: new Map() });
       if (!args.task) {
         if (!tasks.length) return 'No tasks were handed to this computer.';
@@ -2505,6 +3506,8 @@ const TOOLS = [
 
 // With handoffs on, every tool that acts on a tab first passes the handoff gate: the agent's own
 // tabs only, nothing while the user holds or is using the tab, and a read after they did.
+// chrome_eval marks its own run: only on a local dev page does it run in the page.
+const MARKED_ACTIONS = new Set(['chrome_navigate', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press', 'chrome_upload', 'chrome_scroll']);
 const GATED = new Set(['chrome_navigate', 'chrome_snapshot', 'chrome_click', 'chrome_type', 'chrome_act', 'chrome_press',
   'chrome_scroll', 'chrome_read', 'chrome_screenshot', 'chrome_wait', 'chrome_eval', 'chrome_upload', 'chrome_show', 'chrome_close']);
 for (const tool of TOOLS) {
@@ -2512,13 +3515,42 @@ for (const tool of TOOLS) {
   const run = tool.run;
   tool.run = async (args = {}, ctx = {}) => {
     if (args.tab && PRIVATE.size && PRIVATE.has(findTab(args.tab).targetId)) throw refused(PRIVATE_REFUSAL, { kind: 'scope' });
-    if (handoffOn(args) && args.tab) {
-      const info = findTab(args.tab);
-      const session = await chrome.session(info.targetId);
-      await handoffGate(tool.name, args, info, session);
-    }
-    return run.call(tool, args, ctx);
+    const info = args.tab ? findTab(args.tab) : null;
+    // Another agent's tab, or the user's own, says nothing about its dialogs.
+    if (info && handoffOn(args) && !mayUse(agentOf(args), info)) throw refused(SCOPE_REFUSAL, { kind: 'scope' });
+    return dialogCall(args, info, async () => {
+      if (info) {
+        // A navigate to a web page from a tab on a non-web page goes there first (navigateOffWeb), then attaches.
+        const movedTo = tool.name === 'chrome_navigate' ? await navigateOffWeb(args, info, ctx) : '';
+        if (movedTo) ctx = { ...ctx, [OFF_WEB]: movedTo };
+        const session = await chrome.session(info.targetId);
+        await pageOn(session);
+        if (handoffOn(args)) await handoffGate(tool.name, args, info, session, ctx);
+        // An action's input and whatever the page does about it are the agent's (the passkey watch).
+        if (handoffOn(args) && MARKED_ACTIONS.has(tool.name)) {
+          const at = Date.now();
+          let result, failed;
+          await agentMark(session, true);
+          try { result = await run.call(tool, args, ctx); } catch (error) { failed = error; } finally { await agentMark(session, false); }
+          // A request the page started during this very action (a select onchange, a form.submit()) that the
+          // network guard failed: refuse this call. A request that lands after it returns is told on the next call
+          // (handoffGate). A short settle gives a just-fired one time to be judged before this returns.
+          await sleep(120);
+          const nr = H.netRefused.get(info.targetId);
+          if (nr && nr.at >= at) { H.netRefused.delete(info.targetId); throw nr.refusal; }
+          if (failed) throw failed;
+          return result;
+        }
+      }
+      return run.call(tool, args, ctx);
+    });
   };
+}
+// chrome_open's new tab is its call's from the moment it exists (its page can open a dialog as it loads).
+{
+  const tool = TOOLS.find(t => t.name === 'chrome_open');
+  const run = tool.run;
+  tool.run = (args = {}, ctx = {}) => dialogCall(args, null, call => run.call(tool, args, { ...ctx, dialogCall: call }));
 }
 
 // A sign-out the user asked for (rule 3 let it through) that went through: the agent no longer
@@ -2534,6 +3566,31 @@ for (const tool of TOOLS) {
     H.signedIn.delete(siteKey(note.host));
     const out = typeof result === 'string' ? { content: [{ type: 'text', text: result }] } : result;
     return out?.isError ? out : { ...out, signedOut: { site: note.host } };
+  };
+}
+
+// Outermost (so it covers every inner wrapper): with handoffs on, the person's secrets captured during a
+// handoff, and secret-keyed query/fragment values on kept sites, are masked out of everything the agent is
+// handed back: tool text, {content:[...]} items, and a refusal's message and string fields.
+for (const tool of TOOLS) {
+  const run = tool.run;
+  tool.run = async (args = {}, ctx = {}) => {
+    if (!handoffOn(args)) return run.call(tool, args, ctx);
+    const mask = text => maskSecrets(text, args);
+    try {
+      const result = await run.call(tool, args, ctx);
+      if (typeof result === 'string') return mask(result);
+      if (result && Array.isArray(result.content)) {
+        return { ...result, content: result.content.map(c => (c && typeof c.text === 'string' ? { ...c, text: mask(c.text) } : c)) };
+      }
+      return result;
+    } catch (error) {
+      if (error && typeof error.message === 'string') { try { error.message = mask(error.message); } catch (e) {} }
+      if (error && error.refusal && typeof error.refusal === 'object') {
+        for (const k of Object.keys(error.refusal)) if (typeof error.refusal[k] === 'string') { try { error.refusal[k] = mask(error.refusal[k]); } catch (e) {} }
+      }
+      throw error;
+    }
   };
 }
 
@@ -2578,5 +3635,5 @@ function toolList(ctx = {}) {
   }));
 }
 
-return { TOOLS, instructions, toolList, chromeInFront };
+return { TOOLS, instructions, toolList, chromeInFront, busyOf };
 }
