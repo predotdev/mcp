@@ -1569,20 +1569,24 @@ async function navigateOffWeb(args, info, ctx) {
   return dest;
 }
 
-// The guard's model check (pre.dev's /browser/check on the user's key), cached per page + element.
-async function judged(ctx, session, key, condition) {
-  if (H.checks.has(key)) return H.checks.get(key);
+// The guard's model check (pre.dev's /browser/check on the user's key), cached per mode + page + element.
+// kind 'action' asks what the step would do (keep sign-in, ask first); the default asks what the page shows.
+async function judged(ctx, session, key, condition, kind = 'page') {
+  const cacheKey = `${kind}|${key}`;
+  if (H.checks.has(cacheKey)) return H.checks.get(cacheKey);
   if (!ctx?.apiKey) return null;
   let p = null;
   try {
     // No session: the page can't be read now (a navigation of it is pending), so the check goes by the condition.
     const page = session ? await pageState(session).catch(() => '') || '(empty page)' : '(the page is navigating; its content is not available)';
-    const r = await predev(ctx, '/browser/check', { condition, page });
+    const r = await predev(ctx, '/browser/check', kind === 'action' ? { condition, page, kind } : { condition, page });
     p = Number(r?.probability);
   } catch (error) { log('handoff check failed', error.message); return null; }
-  if (Number.isFinite(p)) { H.checks.set(key, p); if (H.checks.size > 2000) H.checks.delete(H.checks.keys().next().value); }
+  if (Number.isFinite(p)) { H.checks.set(cacheKey, p); if (H.checks.size > 2000) H.checks.delete(H.checks.keys().next().value); }
   return Number.isFinite(p) ? p : null;
 }
+// Action checks refuse from 0.6: real sign-out steps on a sign-in page score as low as 0.70 (C.20 probe), so 0.7 has no margin.
+const ACTION_REFUSE_AT = 0.6;
 const pagePath = href => { try { const u = new URL(href); return u.origin + u.pathname; } catch { return String(href || ''); } };
 
 // Rule 1: never type into a password, one-time code or card field (structure first, then the check).
@@ -1613,10 +1617,10 @@ async function approvalRefusal(args, session, desc, facts, url, ctx, action = 'C
     return '';
   }
   let p = await judged(ctx, session, `act|${pagePath(url)}|${desc}`,
-    `${action} ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`);
+    `${action} ${desc} on this page sends a message or invitation, publishes or posts something, places an order or payment, or deletes something.`, 'action');
   // No verdict (no pre.dev key, or pre.dev unreachable): a form submit sent with POST asks first.
   if (p === null) p = facts?.isSubmit && /^post$/i.test(facts.formMethod || '') ? 1 : 0;
-  if (p < 0.7) return '';
+  if (p < ACTION_REFUSE_AT) return '';
   const askFirst = { kind: 'approval', desc, page: pagePath(url) };
   return toHandOff(args)
     ? refused(`Ask first: this would send, post, buy or delete something as the user (${desc}). Don't click it. Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"send|post|buy|delete|other","summary":"what it does"} and doneCheck {"kind":"element_gone","value":"<a selector for that control>"}; they review it and click it themselves in their Chrome, and the run resumes once it's done.`, askFirst)
@@ -1985,8 +1989,8 @@ async function accountRefusal(args, session, action, target, url, ctx) {
   const site = hostOf(url);
   const keyless = !ctx?.apiKey;
   const p = await judged(ctx, session, `acct|${pagePath(url)}|${action}|${target}`,
-    `${action} ${target} signs the person out of this site (log out, sign out, switch account) or opens the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`);
-  if (asked) { if (p !== null && p >= 0.7 && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
+    `${action} ${target} would sign the person out of this site (log out, sign out, switch account) or open the account's security settings (password, two-factor, passkeys, sessions or devices, connected apps, account recovery).`, 'action');
+  if (asked) { if (p !== null && p >= ACTION_REFUSE_AT && ctx?.[SIGNED_OUT]) ctx[SIGNED_OUT].host = hostOf(url); return ''; }
   if (p === null) {
     log(keyless ? 'keep sign-in: no pre.dev key, not done' : 'keep sign-in: no verdict, not done', target);
     const unchecked = keyless
@@ -1998,7 +2002,7 @@ async function accountRefusal(args, session, action, target, url, ctx) {
       ? refused(`${unchecked} Hand it to the user: call hand_off_to_user with tab "${String(args?.tab || '')}", reason "approval", approval {"action":"other","summary":"what it does"} and doneCheck {"kind":"url_changes"}; they decide and do it themselves in their Chrome, and the run resumes once it's done.`, why)
       : refused(`${unchecked} Hand it to the user: call chrome_handoff with this tab, reason "approval" and done {"kind":"url_changes"}; they decide and do it in the tab themselves, and you carry on after.`, why);
   }
-  if (p < 0.7) return '';
+  if (p < ACTION_REFUSE_AT) return '';
   return refused(`Refused: ${action.toLowerCase()} ${target} would sign the user out of ${site} or open its account security settings. ${KEEP_SIGNIN(site)}`, { kind: 'keep_signin', site });
 }
 const linkTarget = f => (f?.href ? ` (it goes to ${f.href})` : f?.isSubmit && f?.formAction ? ` (it submits to ${f.formAction})` : '');
